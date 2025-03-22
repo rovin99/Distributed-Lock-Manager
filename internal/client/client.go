@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"time"
 
 	pb "Distributed-Lock-Manager/proto"
 
@@ -37,7 +38,10 @@ func NewLockClient(serverAddr string, clientID int32) (*LockClient, error) {
 
 // Initialize initializes the client with the server
 func (c *LockClient) Initialize() error {
-	_, err := c.client.ClientInit(context.Background(), &pb.Int{Rc: 0})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := c.client.ClientInit(ctx, &pb.Int{Rc: c.id})
 	if err != nil {
 		return fmt.Errorf("ClientInit failed: %v", err)
 	}
@@ -46,8 +50,11 @@ func (c *LockClient) Initialize() error {
 
 // AcquireLock attempts to acquire the lock
 func (c *LockClient) AcquireLock() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	lockArgs := &pb.LockArgs{ClientId: c.id}
-	resp, err := c.client.LockAcquire(context.Background(), lockArgs)
+	resp, err := c.client.LockAcquire(ctx, lockArgs)
 	if err != nil {
 		return fmt.Errorf("LockAcquire failed: %v", err)
 	}
@@ -57,14 +64,52 @@ func (c *LockClient) AcquireLock() error {
 	return nil
 }
 
+// AcquireLockWithRetry attempts to acquire the lock with exponential backoff
+func (c *LockClient) AcquireLockWithRetry(maxAttempts int) error {
+	var lastErr error
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Create context with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+		// Attempt to acquire lock
+		lockArgs := &pb.LockArgs{ClientId: c.id}
+		resp, err := c.client.LockAcquire(ctx, lockArgs)
+		cancel()
+
+		if err == nil && resp.Status == pb.Status_SUCCESS {
+			return nil
+		}
+
+		// Save error for return if all attempts fail
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("failed with status: %v", resp.Status)
+		}
+
+		// Exponential backoff with jitter
+		backoffTime := time.Duration(1<<uint(attempt)) * 100 * time.Millisecond
+		if backoffTime > 5*time.Second {
+			backoffTime = 5 * time.Second
+		}
+		time.Sleep(backoffTime)
+	}
+
+	return fmt.Errorf("failed to acquire lock after %d attempts: %v", maxAttempts, lastErr)
+}
+
 // AppendFile appends data to a file
 func (c *LockClient) AppendFile(filename string, content []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	fileArgs := &pb.FileArgs{
 		Filename: filename,
 		Content:  content,
 		ClientId: c.id,
 	}
-	resp, err := c.client.FileAppend(context.Background(), fileArgs)
+	resp, err := c.client.FileAppend(ctx, fileArgs)
 	if err != nil {
 		return fmt.Errorf("FileAppend failed: %v", err)
 	}
@@ -76,8 +121,11 @@ func (c *LockClient) AppendFile(filename string, content []byte) error {
 
 // ReleaseLock releases the lock
 func (c *LockClient) ReleaseLock() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	lockArgs := &pb.LockArgs{ClientId: c.id}
-	resp, err := c.client.LockRelease(context.Background(), lockArgs)
+	resp, err := c.client.LockRelease(ctx, lockArgs)
 	if err != nil {
 		return fmt.Errorf("LockRelease failed: %v", err)
 	}
@@ -89,7 +137,10 @@ func (c *LockClient) ReleaseLock() error {
 
 // Close closes the client connection
 func (c *LockClient) Close() error {
-	_, err := c.client.ClientClose(context.Background(), &pb.Int{Rc: 0})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := c.client.ClientClose(ctx, &pb.Int{Rc: c.id})
 	if err != nil {
 		return fmt.Errorf("ClientClose failed: %v", err)
 	}
