@@ -30,10 +30,10 @@ func NewLockServer() *LockServer {
 }
 
 // ClientInit handles the client initialization RPC
-func (s *LockServer) ClientInit(ctx context.Context, args *pb.Int) (*pb.Int, error) {
+func (s *LockServer) ClientInit(ctx context.Context, args *pb.Int) (*pb.StatusMsg, error) {
 	s.logger.Printf("Client %d initialized", args.Rc)
-	// Simple handshake: return 0 to acknowledge
-	return &pb.Int{Rc: 0}, nil
+	// Return both code and message
+	return &pb.StatusMsg{Rc: 0, Message: "Connected!"}, nil
 }
 
 // LockAcquire handles the lock acquisition RPC
@@ -69,11 +69,13 @@ func (s *LockServer) LockRelease(ctx context.Context, args *pb.LockArgs) (*pb.Re
 func (s *LockServer) FileAppend(ctx context.Context, args *pb.FileArgs) (*pb.Response, error) {
 	clientID := args.ClientId
 
+
 	// Check if this client holds the lock
 	if !s.lockManager.HasLock(clientID) {
 		s.logger.Printf("File append failed: client %d doesn't hold the lock", clientID)
 		return &pb.Response{Status: pb.Status_PERMISSION_DENIED}, nil
 	}
+
 
 	err := s.fileManager.AppendToFile(args.Filename, args.Content)
 	if err != nil {
@@ -81,19 +83,21 @@ func (s *LockServer) FileAppend(ctx context.Context, args *pb.FileArgs) (*pb.Res
 		return &pb.Response{Status: pb.Status_FILE_ERROR}, nil
 	}
 
+
 	return &pb.Response{Status: pb.Status_SUCCESS}, nil
 }
 
 // ClientClose handles the client close RPC
-func (s *LockServer) ClientClose(ctx context.Context, args *pb.Int) (*pb.Int, error) {
+func (s *LockServer) ClientClose(ctx context.Context, args *pb.Int) (*pb.StatusMsg, error) {
 	clientID := args.Rc
 	s.logger.Printf("Client %d closing connection", clientID)
+
 
 	// If this client holds the lock, release it
 	s.lockManager.ReleaseLockIfHeld(clientID)
 
-	// Simple acknowledgment: return 0
-	return &pb.Int{Rc: 0}, nil
+	// Return both code and message
+	return &pb.StatusMsg{Rc: 0, Message: "Disconnected!"}, nil
 }
 
 // CreateFiles ensures the 100 files exist - now delegates to file manager
@@ -107,3 +111,4 @@ func (s *LockServer) Cleanup() {
 	s.fileManager.Cleanup()
 	s.logger.Println("Server cleanup complete")
 }
+

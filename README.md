@@ -91,12 +91,12 @@ The server will start listening on port 50051 and create 100 files (file_0 to fi
 
 3. Run a Client:
 ```bash
-make run-client PORT=50051
+make run-client PORT=50052
 ```
 
 Or with specific parameters:
 ```bash
-go run cmd/client/main.go -port 50051 1 "This is client 1's message"
+go run cmd/client/main.go -port 50052 1 "This is client 1's message"
 ```
 
 Parameters:

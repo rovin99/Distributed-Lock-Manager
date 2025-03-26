@@ -41,10 +41,11 @@ func (c *LockClient) Initialize() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := c.client.ClientInit(ctx, &pb.Int{Rc: c.id})
+	resp, err := c.client.ClientInit(ctx, &pb.Int{Rc: c.id})
 	if err != nil {
 		return fmt.Errorf("ClientInit failed: %v", err)
 	}
+	fmt.Printf("Server response: %s\n", resp.Message)
 	return nil
 }
 
@@ -140,9 +141,10 @@ func (c *LockClient) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := c.client.ClientClose(ctx, &pb.Int{Rc: c.id})
+	resp, err := c.client.ClientClose(ctx, &pb.Int{Rc: c.id})
 	if err != nil {
 		return fmt.Errorf("ClientClose failed: %v", err)
 	}
+	fmt.Printf("Server response: %s\n", resp.Message)
 	return c.conn.Close()
 }

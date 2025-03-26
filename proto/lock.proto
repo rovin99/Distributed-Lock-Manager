@@ -35,10 +35,16 @@ message Int {
     int32 rc = 1;
 }
 
+// Add a new message type for init/close responses
+message StatusMsg {
+    int32 rc = 1;
+    string message = 2;
+}
+
 service LockService {
-    rpc client_init(Int) returns (Int);
+    rpc client_init(Int) returns (StatusMsg);
     rpc lock_acquire(lock_args) returns (Response);
     rpc lock_release(lock_args) returns (Response);
     rpc file_append(file_args) returns (Response);
-    rpc client_close(Int) returns (Int);
+    rpc client_close(Int) returns (StatusMsg);
 }
