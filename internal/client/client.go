@@ -11,6 +11,13 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+// Constants for retry mechanism
+const (
+	initialTimeout = 2 * time.Second // Initial timeout per attempt
+	initialBackoff = 2 * time.Second // Initial backoff delay
+	maxRetries     = 5               // Maximum retry attempts
+)
+
 // LockClient wraps the gRPC client functionality
 type LockClient struct {
 	conn   *grpc.ClientConn
@@ -36,115 +43,140 @@ func NewLockClient(serverAddr string, clientID int32) (*LockClient, error) {
 	}, nil
 }
 
-// Initialize initializes the client with the server
-func (c *LockClient) Initialize() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, err := c.client.ClientInit(ctx, &pb.Int{Rc: c.id})
-	if err != nil {
-		return fmt.Errorf("ClientInit failed: %v", err)
-	}
-	fmt.Printf("Server response: %s\n", resp.Message)
-	return nil
-}
-
-// AcquireLock attempts to acquire the lock
-func (c *LockClient) AcquireLock() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	lockArgs := &pb.LockArgs{ClientId: c.id}
-	resp, err := c.client.LockAcquire(ctx, lockArgs)
-	if err != nil {
-		return fmt.Errorf("LockAcquire failed: %v", err)
-	}
-	if resp.Status != pb.Status_SUCCESS {
-		return fmt.Errorf("LockAcquire failed with status: %v", resp.Status)
-	}
-	return nil
-}
-
-// AcquireLockWithRetry attempts to acquire the lock with exponential backoff
-func (c *LockClient) AcquireLockWithRetry(maxAttempts int) error {
+// retryRPC is a generic function that executes an RPC with retries and exponential backoff
+func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*pb.Response, error)) (*pb.Response, error) {
 	var lastErr error
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		// Create context with timeout
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Create a context with timeout for this attempt
+		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
 
-		// Attempt to acquire lock
-		lockArgs := &pb.LockArgs{ClientId: c.id}
-		resp, err := c.client.LockAcquire(ctx, lockArgs)
-		cancel()
+		// Execute the RPC
+		resp, err := rpcFunc(ctx)
 
+		// Check for success
 		if err == nil && resp.Status == pb.Status_SUCCESS {
-			return nil
+			cancel() // Remember to cancel the context on success
+			return resp, nil
 		}
 
 		// Save error for return if all attempts fail
 		if err != nil {
-			lastErr = err
+			lastErr = fmt.Errorf("%s failed: %v", operation, err)
 		} else {
-			lastErr = fmt.Errorf("failed with status: %v", resp.Status)
+			lastErr = fmt.Errorf("%s failed with status: %v", operation, resp.Status)
 		}
 
-		// Exponential backoff with jitter
-		backoffTime := time.Duration(1<<uint(attempt)) * 100 * time.Millisecond
-		if backoffTime > 5*time.Second {
-			backoffTime = 5 * time.Second
+		// Cancel the context for this attempt
+		cancel()
+
+		// Calculate backoff (2^attempt * initialBackoff)
+		backoff := initialBackoff * time.Duration(1<<uint(attempt))
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second // Cap the maximum backoff
 		}
-		time.Sleep(backoffTime)
+
+		fmt.Printf("Retry %d for %s after %v delay\n", attempt+1, operation, backoff)
+		time.Sleep(backoff)
 	}
 
-	return fmt.Errorf("failed to acquire lock after %d attempts: %v", maxAttempts, lastErr)
+	return nil, fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
 }
 
-// AppendFile appends data to a file
-func (c *LockClient) AppendFile(filename string, content []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+// retryInitClose is a specialized version for init/close operations that return StatusMsg
+func (c *LockClient) retryInitClose(operation string, rpcFunc func(context.Context) (*pb.StatusMsg, error)) (*pb.StatusMsg, error) {
+	var lastErr error
 
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
+
+		resp, err := rpcFunc(ctx)
+		if err == nil {
+			cancel()
+			return resp, nil
+		}
+
+		lastErr = fmt.Errorf("%s failed: %v", operation, err)
+		cancel()
+
+		backoff := initialBackoff * time.Duration(1<<uint(attempt))
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+
+		fmt.Printf("Retry %d for %s after %v delay\n", attempt+1, operation, backoff)
+		time.Sleep(backoff)
+	}
+
+	return nil, fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
+}
+
+// Initialize initializes the client with the server (with retry)
+func (c *LockClient) Initialize() error {
+	resp, err := c.retryInitClose("ClientInit", func(ctx context.Context) (*pb.StatusMsg, error) {
+		return c.client.ClientInit(ctx, &pb.Int{Rc: c.id})
+	})
+
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Server response: %s\n", resp.Message)
+	return nil
+}
+
+// AcquireLock attempts to acquire the lock (with retry)
+func (c *LockClient) AcquireLock() error {
+	lockArgs := &pb.LockArgs{ClientId: c.id}
+
+	_, err := c.retryRPC("LockAcquire", func(ctx context.Context) (*pb.Response, error) {
+		return c.client.LockAcquire(ctx, lockArgs)
+	})
+
+	return err
+}
+
+// AppendFile appends data to a file (with retry)
+func (c *LockClient) AppendFile(filename string, content []byte) error {
 	fileArgs := &pb.FileArgs{
 		Filename: filename,
 		Content:  content,
 		ClientId: c.id,
 	}
-	resp, err := c.client.FileAppend(ctx, fileArgs)
-	if err != nil {
-		return fmt.Errorf("FileAppend failed: %v", err)
-	}
-	if resp.Status != pb.Status_SUCCESS {
-		return fmt.Errorf("FileAppend failed with status: %v", resp.Status)
-	}
-	return nil
+
+	_, err := c.retryRPC("FileAppend", func(ctx context.Context) (*pb.Response, error) {
+		return c.client.FileAppend(ctx, fileArgs)
+	})
+
+	return err
 }
 
-// ReleaseLock releases the lock
+// ReleaseLock releases the lock (with retry)
 func (c *LockClient) ReleaseLock() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
 	lockArgs := &pb.LockArgs{ClientId: c.id}
-	resp, err := c.client.LockRelease(ctx, lockArgs)
-	if err != nil {
-		return fmt.Errorf("LockRelease failed: %v", err)
-	}
-	if resp.Status != pb.Status_SUCCESS {
-		return fmt.Errorf("LockRelease failed with status: %v", resp.Status)
-	}
-	return nil
+
+	_, err := c.retryRPC("LockRelease", func(ctx context.Context) (*pb.Response, error) {
+		return c.client.LockRelease(ctx, lockArgs)
+	})
+
+	return err
 }
 
-// Close closes the client connection
+// Close closes the client connection (with retry)
 func (c *LockClient) Close() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	resp, err := c.retryInitClose("ClientClose", func(ctx context.Context) (*pb.StatusMsg, error) {
+		return c.client.ClientClose(ctx, &pb.Int{Rc: c.id})
+	})
 
-	resp, err := c.client.ClientClose(ctx, &pb.Int{Rc: c.id})
 	if err != nil {
-		return fmt.Errorf("ClientClose failed: %v", err)
+		return err
 	}
+
 	fmt.Printf("Server response: %s\n", resp.Message)
 	return c.conn.Close()
+}
+
+// AcquireLockWithRetry is kept for backward compatibility
+func (c *LockClient) AcquireLockWithRetry(maxAttempts int) error {
+	return c.AcquireLock()
 }

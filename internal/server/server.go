@@ -31,7 +31,9 @@ func NewLockServer() *LockServer {
 
 // ClientInit handles the client initialization RPC
 func (s *LockServer) ClientInit(ctx context.Context, args *pb.Int) (*pb.StatusMsg, error) {
-	s.logger.Printf("Client %d initialized", args.Rc)
+	clientID := args.Rc
+	s.logger.Printf("Client %d initialized or reconnected", clientID)
+
 	// Return both code and message
 	return &pb.StatusMsg{Rc: 0, Message: "Connected!"}, nil
 }
@@ -40,7 +42,13 @@ func (s *LockServer) ClientInit(ctx context.Context, args *pb.Int) (*pb.StatusMs
 func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.Response, error) {
 	clientID := args.ClientId
 
-	s.logger.Printf("Client %d attempting to acquire lock with timeout", clientID)
+	s.logger.Printf("Client %d attempting to acquire lock", clientID)
+
+	// Check if client already holds the lock (for handling retries)
+	if s.lockManager.HasLock(clientID) {
+		s.logger.Printf("Client %d already holds the lock - handling retry", clientID)
+		return &pb.Response{Status: pb.Status_SUCCESS}, nil
+	}
 
 	// Use the context-aware acquire method with timeout
 	success := s.lockManager.AcquireWithTimeout(clientID, ctx)
@@ -57,6 +65,15 @@ func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.Re
 func (s *LockServer) LockRelease(ctx context.Context, args *pb.LockArgs) (*pb.Response, error) {
 	clientID := args.ClientId
 
+	s.logger.Printf("Client %d attempting to release lock", clientID)
+
+	// If client doesn't hold the lock, this might be a retry after a successful release
+	// where the response was lost. In this case, just return success.
+	if !s.lockManager.HasLock(clientID) {
+		s.logger.Printf("Client %d doesn't hold the lock - might be a retry after successful release", clientID)
+		return &pb.Response{Status: pb.Status_SUCCESS}, nil
+	}
+
 	success := s.lockManager.Release(clientID)
 	if success {
 		return &pb.Response{Status: pb.Status_SUCCESS}, nil
@@ -69,21 +86,21 @@ func (s *LockServer) LockRelease(ctx context.Context, args *pb.LockArgs) (*pb.Re
 func (s *LockServer) FileAppend(ctx context.Context, args *pb.FileArgs) (*pb.Response, error) {
 	clientID := args.ClientId
 
-
 	// Check if this client holds the lock
 	if !s.lockManager.HasLock(clientID) {
 		s.logger.Printf("File append failed: client %d doesn't hold the lock", clientID)
 		return &pb.Response{Status: pb.Status_PERMISSION_DENIED}, nil
 	}
 
-
+	// Note: For Goal 1 (handling packet loss), we don't need to handle duplicate appends
+	// That's part of Goal 2 (idempotency). For now, we'll just append the data.
 	err := s.fileManager.AppendToFile(args.Filename, args.Content)
 	if err != nil {
 		s.logger.Printf("File append error: %v", err)
 		return &pb.Response{Status: pb.Status_FILE_ERROR}, nil
 	}
 
-
+	s.logger.Printf("File append successful for client %d", clientID)
 	return &pb.Response{Status: pb.Status_SUCCESS}, nil
 }
 
@@ -91,7 +108,6 @@ func (s *LockServer) FileAppend(ctx context.Context, args *pb.FileArgs) (*pb.Res
 func (s *LockServer) ClientClose(ctx context.Context, args *pb.Int) (*pb.StatusMsg, error) {
 	clientID := args.Rc
 	s.logger.Printf("Client %d closing connection", clientID)
-
 
 	// If this client holds the lock, release it
 	s.lockManager.ReleaseLockIfHeld(clientID)
@@ -111,4 +127,3 @@ func (s *LockServer) Cleanup() {
 	s.fileManager.Cleanup()
 	s.logger.Println("Server cleanup complete")
 }
-

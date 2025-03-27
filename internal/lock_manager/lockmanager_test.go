@@ -422,3 +422,283 @@ func BenchmarkConcurrentLockOperations(b *testing.B) {
 
 	wg.Wait()
 }
+
+func TestLongRunningLockHolder(t *testing.T) {
+	lm := NewLockManager(nil)
+
+	// Client 1 acquires the lock
+	if !lm.Acquire(1) {
+		t.Fatal("Client 1 failed to acquire lock")
+	}
+
+	// Start a goroutine for Client 2 attempting to acquire the lock
+	lockAcquired := make(chan bool)
+	go func() {
+		lm.Acquire(2)
+		lockAcquired <- true
+	}()
+
+	// Wait for 30 seconds to simulate long-running lock holder
+	time.Sleep(30 * time.Second)
+
+	// Release lock from Client 1
+	lm.Release(1)
+
+	// Verify Client 2 acquires the lock after release
+	select {
+	case <-lockAcquired:
+		// Success
+	case <-time.After(5 * time.Second):
+		t.Error("Client 2 did not acquire lock after long wait")
+	}
+}
+
+func TestClientDisconnection(t *testing.T) {
+	lm := NewLockManager(nil)
+
+	// Client 1 acquires the lock
+	if !lm.Acquire(1) {
+		t.Fatal("Client 1 failed to acquire lock")
+	}
+
+	// Simulate client 1 disconnection without releasing the lock
+	lm.ReleaseLockIfHeld(1)
+
+	// Client 2 attempts to acquire the lock
+	lockAcquired := make(chan bool)
+	go func() {
+		lm.Acquire(2)
+		lockAcquired <- true
+	}()
+
+	// Verify Client 2 acquires the lock after Client 1 disconnection
+	select {
+	case <-lockAcquired:
+		// Success
+	case <-time.After(5 * time.Second):
+		t.Error("Client 2 did not acquire lock after Client 1 disconnection")
+	}
+}
+
+func TestMultipleTimeoutClients(t *testing.T) {
+	lm := NewLockManager(nil)
+
+	// Client 1 acquires the lock
+	if !lm.Acquire(1) {
+		t.Fatal("Client 1 failed to acquire lock")
+	}
+
+	// Client 2 attempts to acquire the lock with a 5-second timeout
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	client2Acquired := make(chan bool)
+	go func() {
+		client2Acquired <- lm.AcquireWithTimeout(2, ctx2)
+	}()
+
+	// Client 3 attempts to acquire the lock with a 10-second timeout
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel3()
+	client3Acquired := make(chan bool)
+	go func() {
+		client3Acquired <- lm.AcquireWithTimeout(3, ctx3)
+	}()
+
+	// Wait for 6 seconds and verify Client 2 times out
+	select {
+	case success := <-client2Acquired:
+		if success {
+			t.Error("Client 2 should have timed out but acquired the lock")
+		}
+	case <-time.After(6 * time.Second):
+		t.Error("Client 2 did not timeout as expected")
+	}
+
+	// Release lock from Client 1
+	lm.Release(1)
+
+	// Verify Client 3 acquires the lock
+	select {
+	case success := <-client3Acquired:
+		if !success {
+			t.Error("Client 3 should have acquired the lock but did not")
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("Client 3 did not acquire lock after Client 1 released it")
+	}
+}
+
+func TestMixedOperation(t *testing.T) {
+	lm := NewLockManager(nil)
+	var wg sync.WaitGroup
+
+	// Client 1 acquires and releases lock repeatedly
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			lm.Acquire(1)
+			time.Sleep(10 * time.Millisecond)
+			lm.Release(1)
+		}
+	}()
+
+	// Client 2 attempts file operations without lock
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			if lm.HasLock(2) {
+				t.Error("Client 2 should not have lock")
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+
+	// Client 3 disconnects during operation
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		lm.Acquire(3)
+		lm.ReleaseLockIfHeld(3)
+	}()
+
+	// Client 4 attempts to acquire lock with timeout
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		if lm.AcquireWithTimeout(4, ctx) {
+			lm.Release(4)
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestPacketLossRetryMechanism tests the scenario where a response packet is lost
+// and verifies that the retry mechanism ensures liveness
+func TestPacketLossRetryMechanism(t *testing.T) {
+	lm := NewLockManager(nil)
+
+	// Create a channel to simulate packet loss
+	responseLost := make(chan struct{})
+
+	// Create a channel to track steps in the process
+	events := make(chan string, 10)
+
+	// Set up Node 1 to acquire the lock
+	go func() {
+		// First attempt - simulate that server responds, but response is lost
+		// We don't call lm.Acquire directly here to avoid blocking
+
+		events <- "Node1-Starting"
+
+		// Check that the lock is free initially
+		if lm.HasLock(1) {
+			t.Error("Node 1 should not have the lock initially")
+		}
+
+		// Notify that lock is being acquired (response lost)
+		events <- "Node1-FirstAttempt"
+
+		// Background goroutine to grant the lock while simulating lost response
+		go func() {
+			// Get the lock for Node 1, but don't let Node 1 know yet
+			lm.mu.Lock()
+			lm.lockHolder = 1 // Directly assign to simulate server granting but client not knowing
+			lm.mu.Unlock()
+
+			events <- "Server-GrantedLock-ResponseLost"
+			responseLost <- struct{}{} // Signal that the response was "lost"
+		}()
+
+		// Wait for the "packet loss" to be simulated
+		<-responseLost
+
+		// After timeout (simulated), Node 1 retries
+		events <- "Node1-RetryingAfterTimeout"
+
+		// This retry should succeed immediately since Node 1 already holds the lock
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		success := lm.AcquireWithTimeout(1, ctx)
+
+		if !success {
+			t.Error("Node 1 retry should succeed because it already holds the lock")
+		}
+
+		events <- "Node1-RetrySucceeded"
+
+		// Simulate Node 1 doing work with the lock
+		time.Sleep(100 * time.Millisecond)
+
+		// Node 1 releases the lock
+		if !lm.Release(1) {
+			t.Error("Node 1 should be able to release the lock")
+		}
+
+		events <- "Node1-ReleasedLock"
+	}()
+
+	// Wait for Node 1 to start and the server to "lose" the response
+	expectEvent(t, events, "Node1-Starting", 1*time.Second)
+	expectEvent(t, events, "Node1-FirstAttempt", 1*time.Second)
+	expectEvent(t, events, "Server-GrantedLock-ResponseLost", 1*time.Second)
+
+	// Wait a bit to ensure Node 1 has time to prepare for retry
+	time.Sleep(50 * time.Millisecond)
+
+	// Set up Node 2 to wait for the lock
+	node2Acquired := make(chan bool)
+	go func() {
+		events <- "Node2-WaitingForLock"
+
+		// Try to acquire the lock - should block until Node 1 releases it
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		success := lm.AcquireWithTimeout(2, ctx)
+
+		if !success {
+			t.Error("Node 2 should eventually acquire the lock")
+		}
+
+		events <- "Node2-AcquiredLock"
+		node2Acquired <- true
+
+		// Release the lock
+		lm.Release(2)
+		events <- "Node2-ReleasedLock"
+	}()
+
+	// Now wait for Node 1's retry and release
+	expectEvent(t, events, "Node1-RetryingAfterTimeout", 1*time.Second)
+	expectEvent(t, events, "Node1-RetrySucceeded", 1*time.Second)
+	expectEvent(t, events, "Node2-WaitingForLock", 1*time.Second)
+	expectEvent(t, events, "Node1-ReleasedLock", 1*time.Second)
+
+	// Verify Node 2 acquires the lock after Node 1 releases it
+	select {
+	case <-node2Acquired:
+		// This is expected - Node 2 got the lock after Node 1 released it
+	case <-time.After(1 * time.Second):
+		t.Error("Node 2 should have acquired the lock after Node 1 released it")
+	}
+
+	// Verify final events
+	expectEvent(t, events, "Node2-AcquiredLock", 1*time.Second)
+	expectEvent(t, events, "Node2-ReleasedLock", 1*time.Second)
+}
+
+// Helper function to verify events occur in expected order with a specific timeout
+func expectEvent(t *testing.T, events chan string, expected string, timeout time.Duration) {
+	select {
+	case event := <-events:
+		if event != expected {
+			t.Errorf("Expected event %s, got %s", expected, event)
+		}
+	case <-time.After(timeout):
+		t.Errorf("Timed out waiting for event: %s", expected)
+	}
+}

@@ -13,7 +13,8 @@ type LockManager struct {
 	cond       *sync.Cond // Condition variable for lock waiting
 	lockHolder int32      // ID of the client holding the lock, -1 if free
 	logger     *log.Logger
-	queue      []int32 // FIFO queue for fairness
+	queue      []int32        // FIFO queue for fairness
+	waitingSet map[int32]bool // Map for tracking clients in queue
 }
 
 // NewLockManager initializes a new lock manager
@@ -26,6 +27,7 @@ func NewLockManager(logger *log.Logger) *LockManager {
 		lockHolder: -1, // No client holds the lock initially
 		logger:     logger,
 		queue:      make([]int32, 0),
+		waitingSet: make(map[int32]bool),
 	}
 	lm.cond = sync.NewCond(&lm.mu)
 	return lm
@@ -38,8 +40,17 @@ func (lm *LockManager) Acquire(clientID int32) bool {
 
 	lm.logger.Printf("Client %d attempting to acquire lock", clientID)
 
-	// Add client to queue for fairness
-	lm.queue = append(lm.queue, clientID)
+	// Check if client already holds the lock (idempotence for retries)
+	if lm.lockHolder == clientID {
+		lm.logger.Printf("Client %d already holds the lock - handling retry", clientID)
+		return true
+	}
+
+	// Add client to queue if not already in the queue
+	if !lm.waitingSet[clientID] {
+		lm.queue = append(lm.queue, clientID)
+		lm.waitingSet[clientID] = true
+	}
 
 	// Wait until the lock is free AND this client is at the front of the queue
 	for lm.lockHolder != -1 || (len(lm.queue) > 0 && lm.queue[0] != clientID) {
@@ -47,8 +58,9 @@ func (lm *LockManager) Acquire(clientID int32) bool {
 		lm.cond.Wait() // Unlocks mu, waits, then relocks mu when woken
 	}
 
-	// Remove client from queue
+	// Remove client from queue and waiting set
 	lm.queue = lm.queue[1:]
+	delete(lm.waitingSet, clientID)
 
 	// Assign the lock to this client
 	lm.lockHolder = clientID
@@ -63,8 +75,18 @@ func (lm *LockManager) AcquireWithTimeout(clientID int32, ctx context.Context) b
 
 	lm.logger.Printf("Client %d attempting to acquire lock with timeout", clientID)
 
-	// Add client to queue for fairness
-	lm.queue = append(lm.queue, clientID)
+	// Check if client already holds the lock (idempotence for retries)
+	if lm.lockHolder == clientID {
+		lm.logger.Printf("Client %d already holds the lock - handling retry", clientID)
+		lm.mu.Unlock()
+		return true
+	}
+
+	// Add client to queue if not already waiting
+	if !lm.waitingSet[clientID] {
+		lm.queue = append(lm.queue, clientID)
+		lm.waitingSet[clientID] = true
+	}
 
 	for lm.lockHolder != -1 || (len(lm.queue) > 0 && lm.queue[0] != clientID) {
 		// Set up a channel to signal when cond.Wait() returns
@@ -88,13 +110,14 @@ func (lm *LockManager) AcquireWithTimeout(clientID int32, ctx context.Context) b
 			// Timeout occurred, reacquire lock to clean up
 			lm.mu.Lock()
 
-			// Remove client from queue
+			// Remove client from queue and waiting set
 			for i, id := range lm.queue {
 				if id == clientID {
 					lm.queue = append(lm.queue[:i], lm.queue[i+1:]...)
 					break
 				}
 			}
+			delete(lm.waitingSet, clientID)
 
 			lm.logger.Printf("Client %d timed out waiting for lock", clientID)
 			lm.mu.Unlock()
@@ -102,8 +125,9 @@ func (lm *LockManager) AcquireWithTimeout(clientID int32, ctx context.Context) b
 		}
 	}
 
-	// Remove client from queue
+	// Remove client from queue and waiting set
 	lm.queue = lm.queue[1:]
+	delete(lm.waitingSet, clientID)
 
 	// Assign the lock to this client
 	lm.lockHolder = clientID
@@ -152,6 +176,18 @@ func (lm *LockManager) ReleaseLockIfHeld(clientID int32) {
 		lm.logger.Printf("Lock released due to client %d closing", clientID)
 		lm.cond.Broadcast()
 	}
+
+	// Also remove client from queue if they're waiting
+	if lm.waitingSet[clientID] {
+		for i, id := range lm.queue {
+			if id == clientID {
+				lm.queue = append(lm.queue[:i], lm.queue[i+1:]...)
+				break
+			}
+		}
+		delete(lm.waitingSet, clientID)
+		lm.logger.Printf("Client %d removed from queue due to closing", clientID)
+	}
 }
 
 // IsLocked returns true if the lock is currently held
@@ -166,4 +202,14 @@ func (lm *LockManager) CurrentHolder() int32 {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 	return lm.lockHolder
+}
+
+// ForceSetLockHolder directly sets the lock holder to the given client ID.
+// This method is intended for TESTING ONLY to help simulate packet loss scenarios.
+func (lm *LockManager) ForceSetLockHolder(clientID int32) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	lm.lockHolder = clientID
+	lm.logger.Printf("TESTING: Forcibly set lock holder to client %d", clientID)
 }
