@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	pb "Distributed-Lock-Manager/proto"
@@ -20,9 +21,11 @@ const (
 
 // LockClient wraps the gRPC client functionality
 type LockClient struct {
-	conn   *grpc.ClientConn
-	client pb.LockServiceClient
-	id     int32
+	conn           *grpc.ClientConn
+	client         pb.LockServiceClient
+	id             int32
+	sequenceNumber uint64     // Added for request IDs
+	mu             sync.Mutex // Protects sequenceNumber
 }
 
 // NewLockClient creates a new client connected to the server
@@ -37,10 +40,19 @@ func NewLockClient(serverAddr string, clientID int32) (*LockClient, error) {
 	client := pb.NewLockServiceClient(conn)
 
 	return &LockClient{
-		conn:   conn,
-		client: client,
-		id:     clientID,
+		conn:           conn,
+		client:         client,
+		id:             clientID,
+		sequenceNumber: 0, // Initialize sequence number
 	}, nil
+}
+
+// GenerateRequestID creates a unique request ID
+func (c *LockClient) GenerateRequestID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sequenceNumber++
+	return fmt.Sprintf("%d-%d", c.id, c.sequenceNumber)
 }
 
 // retryRPC is a generic function that executes an RPC with retries and exponential backoff
@@ -127,7 +139,13 @@ func (c *LockClient) Initialize() error {
 
 // AcquireLock attempts to acquire the lock (with retry)
 func (c *LockClient) AcquireLock() error {
-	lockArgs := &pb.LockArgs{ClientId: c.id}
+	requestId := c.GenerateRequestID()
+	lockArgs := &pb.LockArgs{
+		ClientId:  c.id,
+		RequestId: requestId,
+	}
+
+	fmt.Printf("Sending lock_acquire request (ID: %s)\n", requestId)
 
 	_, err := c.retryRPC("LockAcquire", func(ctx context.Context) (*pb.Response, error) {
 		return c.client.LockAcquire(ctx, lockArgs)
@@ -138,11 +156,15 @@ func (c *LockClient) AcquireLock() error {
 
 // AppendFile appends data to a file (with retry)
 func (c *LockClient) AppendFile(filename string, content []byte) error {
+	requestId := c.GenerateRequestID()
 	fileArgs := &pb.FileArgs{
-		Filename: filename,
-		Content:  content,
-		ClientId: c.id,
+		Filename:  filename,
+		Content:   content,
+		ClientId:  c.id,
+		RequestId: requestId,
 	}
+
+	fmt.Printf("Sending file_append request (ID: %s)\n", requestId)
 
 	_, err := c.retryRPC("FileAppend", func(ctx context.Context) (*pb.Response, error) {
 		return c.client.FileAppend(ctx, fileArgs)
@@ -153,7 +175,13 @@ func (c *LockClient) AppendFile(filename string, content []byte) error {
 
 // ReleaseLock releases the lock (with retry)
 func (c *LockClient) ReleaseLock() error {
-	lockArgs := &pb.LockArgs{ClientId: c.id}
+	requestId := c.GenerateRequestID()
+	lockArgs := &pb.LockArgs{
+		ClientId:  c.id,
+		RequestId: requestId,
+	}
+
+	fmt.Printf("Sending lock_release request (ID: %s)\n", requestId)
 
 	_, err := c.retryRPC("LockRelease", func(ctx context.Context) (*pb.Response, error) {
 		return c.client.LockRelease(ctx, lockArgs)

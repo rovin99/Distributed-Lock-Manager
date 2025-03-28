@@ -21,37 +21,6 @@ This project implements a distributed lock manager with the following components
 - Modular code organization for maintainability
 - Extensive test suite including stress tests and benchmarks
 
-## Project Structure
-
-```
-├── cmd
-│   ├── client
-│   │   └── main.go
-│   └── server
-│       └── main.go
-├── data
-├── go.mod
-├── go.sum
-├── internal
-│   ├── client
-│   │   └── client.go
-│   ├── file_manager
-│   │   ├── file_manager.go
-│   │   └── file_manager_test.go
-│   ├── lock_manager
-│   │   ├── lock_manager.go
-│   │   └── lock_manager_test.go
-│   └── server
-│       └── server.go
-├── logs
-├── Makefile
-├── proto
-│   ├── lock_grpc.pb.go
-│   ├── lock.pb.go
-│   └── lock.proto
-└── README.md
-```
-
 ## Prerequisites
 
 - Go 1.16 or higher
@@ -113,6 +82,11 @@ go test -v ./internal/lock_manager
 
 # Test the file manager
 go test -v ./internal/file_manager
+
+# Test Retry Mech.
+
+go test -v ./internal
+
 
 ```
 

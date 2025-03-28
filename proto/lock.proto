@@ -7,7 +7,7 @@ option go_package = "./proto";
 // lock acquire/release arguments, add any fields you want
 message lock_args {
     int32 client_id = 1;
-    
+    string request_id = 2;
 }
 
 // server return Status, we will add more in the future
@@ -28,6 +28,7 @@ message file_args {
     string filename = 1;
     bytes content = 2;
     int32 client_id = 3;
+    string request_id = 4;
 }
 
 // field to hold an int, because the arguments and return values should be "message" type
