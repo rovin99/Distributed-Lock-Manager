@@ -24,6 +24,7 @@ const (
 	LockService_LockRelease_FullMethodName = "/lock_service.LockService/lock_release"
 	LockService_FileAppend_FullMethodName  = "/lock_service.LockService/file_append"
 	LockService_ClientClose_FullMethodName = "/lock_service.LockService/client_close"
+	LockService_RenewLease_FullMethodName  = "/lock_service.LockService/renew_lease"
 )
 
 // LockServiceClient is the client API for LockService service.
@@ -31,10 +32,11 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type LockServiceClient interface {
 	ClientInit(ctx context.Context, in *Int, opts ...grpc.CallOption) (*StatusMsg, error)
-	LockAcquire(ctx context.Context, in *LockArgs, opts ...grpc.CallOption) (*Response, error)
+	LockAcquire(ctx context.Context, in *LockArgs, opts ...grpc.CallOption) (*LockResponse, error)
 	LockRelease(ctx context.Context, in *LockArgs, opts ...grpc.CallOption) (*Response, error)
 	FileAppend(ctx context.Context, in *FileArgs, opts ...grpc.CallOption) (*Response, error)
 	ClientClose(ctx context.Context, in *Int, opts ...grpc.CallOption) (*StatusMsg, error)
+	RenewLease(ctx context.Context, in *LeaseArgs, opts ...grpc.CallOption) (*Response, error)
 }
 
 type lockServiceClient struct {
@@ -55,9 +57,9 @@ func (c *lockServiceClient) ClientInit(ctx context.Context, in *Int, opts ...grp
 	return out, nil
 }
 
-func (c *lockServiceClient) LockAcquire(ctx context.Context, in *LockArgs, opts ...grpc.CallOption) (*Response, error) {
+func (c *lockServiceClient) LockAcquire(ctx context.Context, in *LockArgs, opts ...grpc.CallOption) (*LockResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(Response)
+	out := new(LockResponse)
 	err := c.cc.Invoke(ctx, LockService_LockAcquire_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -95,15 +97,26 @@ func (c *lockServiceClient) ClientClose(ctx context.Context, in *Int, opts ...gr
 	return out, nil
 }
 
+func (c *lockServiceClient) RenewLease(ctx context.Context, in *LeaseArgs, opts ...grpc.CallOption) (*Response, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Response)
+	err := c.cc.Invoke(ctx, LockService_RenewLease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LockServiceServer is the server API for LockService service.
 // All implementations must embed UnimplementedLockServiceServer
 // for forward compatibility.
 type LockServiceServer interface {
 	ClientInit(context.Context, *Int) (*StatusMsg, error)
-	LockAcquire(context.Context, *LockArgs) (*Response, error)
+	LockAcquire(context.Context, *LockArgs) (*LockResponse, error)
 	LockRelease(context.Context, *LockArgs) (*Response, error)
 	FileAppend(context.Context, *FileArgs) (*Response, error)
 	ClientClose(context.Context, *Int) (*StatusMsg, error)
+	RenewLease(context.Context, *LeaseArgs) (*Response, error)
 	mustEmbedUnimplementedLockServiceServer()
 }
 
@@ -117,7 +130,7 @@ type UnimplementedLockServiceServer struct{}
 func (UnimplementedLockServiceServer) ClientInit(context.Context, *Int) (*StatusMsg, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ClientInit not implemented")
 }
-func (UnimplementedLockServiceServer) LockAcquire(context.Context, *LockArgs) (*Response, error) {
+func (UnimplementedLockServiceServer) LockAcquire(context.Context, *LockArgs) (*LockResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method LockAcquire not implemented")
 }
 func (UnimplementedLockServiceServer) LockRelease(context.Context, *LockArgs) (*Response, error) {
@@ -128,6 +141,9 @@ func (UnimplementedLockServiceServer) FileAppend(context.Context, *FileArgs) (*R
 }
 func (UnimplementedLockServiceServer) ClientClose(context.Context, *Int) (*StatusMsg, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ClientClose not implemented")
+}
+func (UnimplementedLockServiceServer) RenewLease(context.Context, *LeaseArgs) (*Response, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RenewLease not implemented")
 }
 func (UnimplementedLockServiceServer) mustEmbedUnimplementedLockServiceServer() {}
 func (UnimplementedLockServiceServer) testEmbeddedByValue()                     {}
@@ -240,6 +256,24 @@ func _LockService_ClientClose_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LockService_RenewLease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LeaseArgs)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LockServiceServer).RenewLease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LockService_RenewLease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LockServiceServer).RenewLease(ctx, req.(*LeaseArgs))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LockService_ServiceDesc is the grpc.ServiceDesc for LockService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -266,6 +300,10 @@ var LockService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "client_close",
 			Handler:    _LockService_ClientClose_Handler,
+		},
+		{
+			MethodName: "renew_lease",
+			Handler:    _LockService_RenewLease_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

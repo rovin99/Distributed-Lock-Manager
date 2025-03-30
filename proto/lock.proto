@@ -8,6 +8,7 @@ option go_package = "./proto";
 message lock_args {
     int32 client_id = 1;
     string request_id = 2;
+    string token = 3;      // Added for lock token validation
 }
 
 // server return Status, we will add more in the future
@@ -16,11 +17,18 @@ enum Status {
     FILE_ERROR = 1;
     PERMISSION_DENIED = 2;
     TIMEOUT = 3;    
+    LEASE_EXPIRED = 4;     // Added for lease expiration
 }
 
 // response struct, adjust or add any fields you want
 message Response {
     Status status = 1;
+}
+
+// Add a lock response that includes the token
+message lock_response {
+    Response response = 1;
+    string token = 2;      // Token returned on successful lock acquisition
 }
 
 // file append arguments, add any fields you want
@@ -29,6 +37,14 @@ message file_args {
     bytes content = 2;
     int32 client_id = 3;
     string request_id = 4;
+    string token = 5;      // Added for lock token validation
+}
+
+// lease renewal arguments
+message lease_args {
+    int32 client_id = 1;
+    string request_id = 2;
+    string token = 3;
 }
 
 // field to hold an int, because the arguments and return values should be "message" type
@@ -44,8 +60,9 @@ message StatusMsg {
 
 service LockService {
     rpc client_init(Int) returns (StatusMsg);
-    rpc lock_acquire(lock_args) returns (Response);
+    rpc lock_acquire(lock_args) returns (lock_response);
     rpc lock_release(lock_args) returns (Response);
     rpc file_append(file_args) returns (Response);
     rpc client_close(Int) returns (StatusMsg);
+    rpc renew_lease(lease_args) returns (Response);  // Added for lease renewal
 }

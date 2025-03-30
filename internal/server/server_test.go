@@ -38,9 +38,11 @@ func TestDuplicateFileAppend(t *testing.T) {
 		RequestId: requestID1,
 	}
 
-	resp, err := s.LockAcquire(ctx, lockArgs)
+	lockResp, err := s.LockAcquire(ctx, lockArgs)
 	assert.NoError(t, err)
-	assert.Equal(t, pb.Status_SUCCESS, resp.Status)
+	assert.Equal(t, pb.Status_SUCCESS, lockResp.Response.Status)
+	token := lockResp.Token
+	assert.NotEmpty(t, token)
 
 	// Now append to a file
 	fileRequestID := "1-2"
@@ -49,6 +51,7 @@ func TestDuplicateFileAppend(t *testing.T) {
 		Content:   []byte("test data"),
 		ClientId:  clientID,
 		RequestId: fileRequestID,
+		Token:     token,
 	}
 
 	// First request
@@ -81,12 +84,14 @@ func TestDuplicateLockAcquire(t *testing.T) {
 	// First request
 	resp1, err := s.LockAcquire(ctx, lockArgs)
 	assert.NoError(t, err)
-	assert.Equal(t, pb.Status_SUCCESS, resp1.Status)
+	assert.Equal(t, pb.Status_SUCCESS, resp1.Response.Status)
+	assert.NotEmpty(t, resp1.Token)
 
 	// Duplicate request with same request ID
 	resp2, err := s.LockAcquire(ctx, lockArgs)
 	assert.NoError(t, err)
-	assert.Equal(t, pb.Status_SUCCESS, resp2.Status)
+	assert.Equal(t, pb.Status_SUCCESS, resp2.Response.Status)
+	assert.NotEmpty(t, resp2.Token)
 
 	// The response should be cached, so both should be identical
 	assert.Equal(t, resp1, resp2)
@@ -101,7 +106,8 @@ func TestDuplicateLockAcquire(t *testing.T) {
 
 	resp3, err := s.LockAcquire(ctx, lockArgs2)
 	assert.NoError(t, err)
-	assert.Equal(t, pb.Status_SUCCESS, resp3.Status)
+	assert.Equal(t, pb.Status_SUCCESS, resp3.Response.Status)
+	assert.NotEmpty(t, resp3.Token)
 }
 
 // TestDuplicateLockRelease verifies that duplicate lock release requests are idempotent
@@ -119,15 +125,18 @@ func TestDuplicateLockRelease(t *testing.T) {
 		RequestId: acquireRequestID,
 	}
 
-	resp, err := s.LockAcquire(ctx, lockArgs)
+	lockResp, err := s.LockAcquire(ctx, lockArgs)
 	assert.NoError(t, err)
-	assert.Equal(t, pb.Status_SUCCESS, resp.Status)
+	assert.Equal(t, pb.Status_SUCCESS, lockResp.Response.Status)
+	token := lockResp.Token
+	assert.NotEmpty(t, token)
 
 	// Now release the lock
 	releaseRequestID := "1-2"
 	releaseArgs := &pb.LockArgs{
 		ClientId:  clientID,
 		RequestId: releaseRequestID,
+		Token:     token,
 	}
 
 	// First release request

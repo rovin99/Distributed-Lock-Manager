@@ -16,23 +16,115 @@ type FileManager struct {
 	fileLocks   map[string]*sync.Mutex // Per-file mutexes for concurrency
 	mu          sync.Mutex             // Protects maps
 	logger      *log.Logger
-	syncEnabled bool // Toggle for fsync after writes
+	syncEnabled bool           // Toggle for fsync after writes
+	wal         *WriteAheadLog // Write-ahead log for crash recovery
 }
 
 // NewFileManager initializes a new file manager
 func NewFileManager(syncEnabled bool) *FileManager {
-	return &FileManager{
-		openFiles:   make(map[string]*os.File),
-		fileLocks:   make(map[string]*sync.Mutex),
-		logger:      log.New(os.Stdout, "[FileManager] ", log.LstdFlags),
-		syncEnabled: syncEnabled,
-	}
+	return NewFileManagerWithWAL(syncEnabled, false)
 }
 
-// AppendToFile appends content to a file
-func (fm *FileManager) AppendToFile(filename string, content []byte) error {
-	fm.logger.Printf("Attempting to append to %s", filename)
+// NewFileManagerWithWAL initializes a new file manager with optional write-ahead logging
+func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool) *FileManager {
+	logger := log.New(os.Stdout, "[FileManager] ", log.LstdFlags)
 
+	// Initialize the write-ahead log
+	wal, err := NewWriteAheadLog(walEnabled)
+	if err != nil {
+		logger.Printf("Warning: Failed to initialize write-ahead log: %v", err)
+		logger.Printf("Continuing without write-ahead logging")
+	}
+
+	fm := &FileManager{
+		openFiles:   make(map[string]*os.File),
+		fileLocks:   make(map[string]*sync.Mutex),
+		logger:      logger,
+		syncEnabled: syncEnabled,
+		wal:         wal,
+	}
+
+	// If WAL is enabled, perform recovery on startup
+	if walEnabled && wal != nil {
+		if err := fm.recoverFromWAL(); err != nil {
+			logger.Printf("Warning: Error recovering from write-ahead log: %v", err)
+		}
+	}
+
+	return fm
+}
+
+// recoverFromWAL attempts to recover any uncommitted operations from the write-ahead log
+func (fm *FileManager) recoverFromWAL() error {
+	fm.logger.Printf("Attempting to recover from write-ahead log")
+
+	// Find uncommitted operations
+	uncommitted, err := RecoverUncommittedOperations("logs")
+	if err != nil {
+		return fmt.Errorf("failed to recover operations: %v", err)
+	}
+
+	fm.logger.Printf("Found %d uncommitted operations", len(uncommitted))
+
+	// Replay each uncommitted operation
+	for _, entry := range uncommitted {
+		fm.logger.Printf("Replaying operation: request=%s, file=%s", entry.RequestID, entry.Filename)
+
+		// Replay the file append operation
+		// Note: We're not logging this operation to the WAL to avoid duplicates
+		if err := fm.appendToFileInternal(entry.Filename, entry.Content, false); err != nil {
+			fm.logger.Printf("Error replaying operation: %v", err)
+			// Continue with other operations even if one fails
+			continue
+		}
+
+		// Mark the operation as committed
+		if fm.wal != nil {
+			if err := fm.wal.MarkCommitted(entry.RequestID); err != nil {
+				fm.logger.Printf("Warning: Failed to mark operation as committed: %v", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// AppendToFile appends content to a file, with optional WAL logging
+func (fm *FileManager) AppendToFile(filename string, content []byte) error {
+	return fm.AppendToFileWithRequestID(filename, content, "")
+}
+
+// AppendToFileWithRequestID appends content to a file with request ID tracking
+func (fm *FileManager) AppendToFileWithRequestID(filename string, content []byte, requestID string) error {
+	fm.logger.Printf("Attempting to append to %s (request ID: %s)", filename, requestID)
+
+	// If WAL is enabled and we have a request ID, log the operation
+	if fm.wal != nil && requestID != "" {
+		if err := fm.wal.LogOperation(requestID, filename, content); err != nil {
+			fm.logger.Printf("Warning: Failed to log operation to WAL: %v", err)
+			// Continue with the operation even if logging fails
+		}
+	}
+
+	// Perform the actual file append
+	if err := fm.appendToFileInternal(filename, content, true); err != nil {
+		return err
+	}
+
+	// If WAL is enabled and we have a request ID, mark the operation as committed
+	if fm.wal != nil && requestID != "" {
+		if err := fm.wal.MarkCommitted(requestID); err != nil {
+			fm.logger.Printf("Warning: Failed to mark operation as committed: %v", err)
+			// Operation was successful, so return success even if commit marker fails
+		}
+	}
+
+	return nil
+}
+
+// appendToFileInternal is the internal implementation of file append
+// The logOperation flag controls whether the operation should be logged to the WAL
+func (fm *FileManager) appendToFileInternal(filename string, content []byte, forceSync bool) error {
 	// Validate filename (must be "file_0" to "file_99")
 	if !strings.HasPrefix(filename, "file_") {
 		fm.logger.Printf("File append failed: invalid filename format %s", filename)
@@ -101,8 +193,8 @@ func (fm *FileManager) AppendToFile(filename string, content []byte) error {
 		return err
 	}
 
-	// Ensure data is written to disk if enabled
-	if fm.syncEnabled {
+	// Ensure data is written to disk if enabled or forced
+	if fm.syncEnabled || forceSync {
 		if err := f.Sync(); err != nil {
 			fm.logger.Printf("File append warning: couldn't sync file: %v", err)
 		}
@@ -146,6 +238,13 @@ func (fm *FileManager) Cleanup() {
 			fm.logger.Printf("Error closing file %s: %v", name, err)
 		}
 		delete(fm.openFiles, name)
+	}
+
+	// Close the write-ahead log if it exists
+	if fm.wal != nil {
+		if err := fm.wal.Close(); err != nil {
+			fm.logger.Printf("Error closing write-ahead log: %v", err)
+		}
 	}
 
 	fm.logger.Println("File manager cleanup complete")

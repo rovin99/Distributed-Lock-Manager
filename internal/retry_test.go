@@ -46,7 +46,7 @@ func TestPacketLossRetryScenario(t *testing.T) {
 		simulateLock.Unlock()
 
 		// This should succeed immediately since Node 1 already holds the lock
-		success := lm.AcquireWithTimeout(1, context.Background())
+		success, token := lm.AcquireWithTimeout(1, context.Background())
 		if !success {
 			t.Error("Node 1 retry should succeed because it already holds the lock")
 		}
@@ -56,7 +56,7 @@ func TestPacketLossRetryScenario(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 
 		// Release the lock
-		if !lm.Release(1) {
+		if !lm.Release(1, token) {
 			t.Error("Node 1 should be able to release the lock")
 		}
 		events <- "Node1-ReleasedLock"
@@ -74,7 +74,7 @@ func TestPacketLossRetryScenario(t *testing.T) {
 		// Try to acquire the lock - should block until Node 1 releases it
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		success := lm.AcquireWithTimeout(2, ctx)
+		success, token := lm.AcquireWithTimeout(2, ctx)
 
 		if !success {
 			t.Error("Node 2 should eventually acquire the lock")
@@ -87,7 +87,7 @@ func TestPacketLossRetryScenario(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 
 		// Release the lock
-		lm.Release(2)
+		lm.Release(2, token)
 		events <- "Node2-ReleasedLock"
 	}()
 
