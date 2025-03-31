@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"Distributed-Lock-Manager/internal/lock_manager"
 )
 
 func init() {
@@ -64,8 +66,11 @@ func setupTestEnvironment(t *testing.T) (string, func()) {
 }
 
 func TestNewFileManager(t *testing.T) {
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+
 	// Test with sync disabled
-	fm1 := NewFileManager(false)
+	fm1 := NewFileManager(false, lm)
 	if fm1 == nil {
 		t.Fatal("NewFileManager returned nil")
 	}
@@ -83,7 +88,7 @@ func TestNewFileManager(t *testing.T) {
 	}
 
 	// Test with sync enabled
-	fm2 := NewFileManager(true)
+	fm2 := NewFileManager(true, lm)
 	if fm2.syncEnabled != true {
 		t.Error("syncEnabled should be true")
 	}
@@ -93,11 +98,24 @@ func TestBasicFileOperations(t *testing.T) {
 	_, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	fm := NewFileManager(true) // Enable sync for testing
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(true, lm) // Enable sync for testing
 
 	// Test valid filename and content
 	testContent := []byte("test content")
-	err := fm.AppendToFile("file_0", testContent)
+	clientID := int32(1)
+
+	// Acquire lock for the client and get the token
+	success, token := lm.Acquire(clientID)
+	if !success {
+		t.Fatal("Failed to acquire lock")
+	}
+
+	// Ensure lock is released in all cases
+	defer lm.Release(clientID, token)
+
+	err := fm.AppendToFile("file_0", testContent, clientID, token)
 	if err != nil {
 		t.Errorf("AppendToFile failed with valid input: %v", err)
 	}
@@ -113,7 +131,7 @@ func TestBasicFileOperations(t *testing.T) {
 
 	// Test appending more content
 	moreContent := []byte(" additional content")
-	err = fm.AppendToFile("file_0", moreContent)
+	err = fm.AppendToFile("file_0", moreContent, clientID, token)
 	if err != nil {
 		t.Errorf("Failed to append more content: %v", err)
 	}
@@ -133,8 +151,20 @@ func TestFilenameValidation(t *testing.T) {
 	_, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	fm := NewFileManager(false)
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
 	testContent := []byte("test content")
+	clientID := int32(1)
+
+	// Acquire lock for the client and get the token
+	success, token := lm.Acquire(clientID)
+	if !success {
+		t.Fatal("Failed to acquire lock")
+	}
+
+	// Ensure lock is released in all cases
+	defer lm.Release(clientID, token)
 
 	// Test cases for invalid filenames
 	invalidFilenames := []struct {
@@ -150,7 +180,7 @@ func TestFilenameValidation(t *testing.T) {
 
 	for _, tc := range invalidFilenames {
 		t.Run(tc.name, func(t *testing.T) {
-			err := fm.AppendToFile(tc.input, testContent)
+			err := fm.AppendToFile(tc.input, testContent, clientID, token)
 			if err == nil {
 				t.Errorf("AppendToFile should fail with %s", tc.input)
 			}
@@ -160,7 +190,7 @@ func TestFilenameValidation(t *testing.T) {
 	// Test all valid filenames
 	for i := 0; i < 100; i++ {
 		filename := fmt.Sprintf("file_%d", i)
-		err := fm.AppendToFile(filename, testContent)
+		err := fm.AppendToFile(filename, testContent, clientID, token)
 		if err != nil {
 			t.Errorf("AppendToFile failed with valid filename %s: %v", filename, err)
 		}
@@ -171,7 +201,9 @@ func TestConcurrentSameFileAppends(t *testing.T) {
 	_, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	fm := NewFileManager(false)
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
 	filename := "file_0"
 
 	// Number of goroutines and writes per goroutine
@@ -187,9 +219,22 @@ func TestConcurrentSameFileAppends(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 
+			clientID := int32(id + 1)
+			token := fmt.Sprintf("test-token-%d", id+1)
+
+			// Acquire lock for this client
+			success, token := lm.Acquire(clientID)
+			if !success {
+				t.Errorf("Goroutine %d failed to acquire lock", id)
+				return
+			}
+
+			// Ensure lock is released in all cases
+			defer lm.Release(clientID, token)
+
 			for j := 0; j < writesPerGoroutine; j++ {
 				content := fmt.Sprintf("G%d-%d\n", id, j)
-				err := fm.AppendToFile(filename, []byte(content))
+				err := fm.AppendToFile(filename, []byte(content), clientID, token)
 				if err != nil {
 					t.Errorf("Goroutine %d failed to append: %v", id, err)
 					return
@@ -218,7 +263,9 @@ func TestConcurrentMultiFileAppends(t *testing.T) {
 	_, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	fm := NewFileManager(false)
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
 
 	// Number of goroutines and files
 	numGoroutines := 20
@@ -238,6 +285,19 @@ func TestConcurrentMultiFileAppends(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 
+			clientID := int32(id + 1)
+			token := fmt.Sprintf("test-token-%d", id+1)
+
+			// Acquire lock for this client
+			success, token := lm.Acquire(clientID)
+			if !success {
+				t.Errorf("Goroutine %d failed to acquire lock", id)
+				return
+			}
+
+			// Ensure lock is released in all cases
+			defer lm.Release(clientID, token)
+
 			// Create a random number generator with a unique seed
 			r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
 
@@ -248,7 +308,7 @@ func TestConcurrentMultiFileAppends(t *testing.T) {
 
 				// Write to the file
 				content := fmt.Sprintf("G%d-%d\n", id, j)
-				err := fm.AppendToFile(filename, []byte(content))
+				err := fm.AppendToFile(filename, []byte(content), clientID, token)
 				if err != nil {
 					t.Errorf("Goroutine %d failed to append to %s: %v", id, filename, err)
 					return
@@ -295,7 +355,9 @@ func TestStressTest(t *testing.T) {
 	_, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	fm := NewFileManager(false)
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
 
 	// Configuration
 	numGoroutines := 100
@@ -320,6 +382,19 @@ func TestStressTest(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 
+			clientID := int32(id + 1)
+			token := fmt.Sprintf("test-token-%d", id+1)
+
+			// Acquire lock for this client
+			success, token := lm.Acquire(clientID)
+			if !success {
+				t.Errorf("Goroutine %d failed to acquire lock", id)
+				return
+			}
+
+			// Ensure lock is released in all cases
+			defer lm.Release(clientID, token)
+
 			// Create a random number generator with a unique seed
 			r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
 
@@ -329,7 +404,7 @@ func TestStressTest(t *testing.T) {
 				filename := fmt.Sprintf("file_%d", fileNum)
 
 				// Write to the file
-				err := fm.AppendToFile(filename, randomData)
+				err := fm.AppendToFile(filename, randomData, clientID, token)
 				if err != nil {
 					t.Errorf("Goroutine %d failed to append to %s: %v", id, filename, err)
 					return
@@ -375,17 +450,30 @@ func TestResourceLeaks(t *testing.T) {
 	_, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	fm := NewFileManager(false)
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
 
 	// Record initial number of goroutines
 	initialGoroutines := runtime.NumGoroutine()
 
 	// Perform a series of operations
+	clientID := int32(1)
+
+	// Acquire lock for the client and get the token
+	success, token := lm.Acquire(clientID)
+	if !success {
+		t.Fatal("Failed to acquire lock")
+	}
+
+	// Ensure lock is released in all cases
+	defer lm.Release(clientID, token)
+
 	for i := 0; i < 10; i++ {
 		for j := 0; j < 10; j++ {
 			filename := fmt.Sprintf("file_%d", j)
 			content := []byte(fmt.Sprintf("test content %d-%d", i, j))
-			err := fm.AppendToFile(filename, content)
+			err := fm.AppendToFile(filename, content, clientID, token)
 			if err != nil {
 				t.Fatalf("Failed to append to file: %v", err)
 			}
@@ -417,7 +505,9 @@ func TestCreateFiles(t *testing.T) {
 	_, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	fm := NewFileManager(false)
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
 	fm.CreateFiles()
 
 	// Verify all 100 files were created
@@ -433,12 +523,25 @@ func TestCleanup(t *testing.T) {
 	_, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	fm := NewFileManager(false)
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
 
 	// Create and open files
+	clientID := int32(1)
+
+	// Acquire lock for the client and get the token
+	success, token := lm.Acquire(clientID)
+	if !success {
+		t.Fatal("Failed to acquire lock")
+	}
+
+	// Ensure lock is released in all cases
+	defer lm.Release(clientID, token)
+
 	for i := 0; i < 10; i++ {
 		filename := fmt.Sprintf("file_%d", i)
-		err := fm.AppendToFile(filename, []byte("test"))
+		err := fm.AppendToFile(filename, []byte("test"), clientID, token)
 		if err != nil {
 			t.Fatalf("Failed to append to file: %v", err)
 		}
@@ -470,7 +573,9 @@ func TestErrorHandling(t *testing.T) {
 	_, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	fm := NewFileManager(false)
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
 
 	// Test with read-only directory
 	if runtime.GOOS != "windows" { // Skip on Windows as permissions work differently
@@ -480,8 +585,19 @@ func TestErrorHandling(t *testing.T) {
 			t.Fatalf("Failed to change directory permissions: %v", err)
 		}
 
+		clientID := int32(1)
+
+		// Acquire lock for the client and get the token
+		success, token := lm.Acquire(clientID)
+		if !success {
+			t.Fatal("Failed to acquire lock")
+		}
+
+		// Ensure lock is released in all cases
+		defer lm.Release(clientID, token)
+
 		// Try to write to a file
-		err = fm.AppendToFile("file_0", []byte("test"))
+		err = fm.AppendToFile("file_0", []byte("test"), clientID, token)
 		if err == nil {
 			t.Error("Expected error when writing to read-only directory")
 		}
@@ -515,14 +631,26 @@ func BenchmarkAppendToFile(b *testing.B) {
 		}
 	}()
 
-	fm := NewFileManager(false)
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
 	data := []byte("benchmark test data")
+	clientID := int32(1)
+
+	// Acquire lock for the client and get the token
+	success, token := lm.Acquire(clientID)
+	if !success {
+		b.Fatal("Failed to acquire lock")
+	}
+
+	// Ensure lock is released in all cases
+	defer lm.Release(clientID, token)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		fileNum := i % 100
 		filename := fmt.Sprintf("file_%d", fileNum)
-		err := fm.AppendToFile(filename, data)
+		err := fm.AppendToFile(filename, data, clientID, token)
 		if err != nil {
 			b.Fatalf("Failed to append to file: %v", err)
 		}
@@ -556,7 +684,9 @@ func BenchmarkConcurrentAppends(b *testing.B) {
 		}
 	}()
 
-	fm := NewFileManager(false)
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
 	data := []byte("benchmark test data")
 
 	// Number of concurrent goroutines
@@ -571,9 +701,21 @@ func BenchmarkConcurrentAppends(b *testing.B) {
 		for g := 0; g < numGoroutines; g++ {
 			go func(id int) {
 				defer wg.Done()
+				clientID := int32(id + 1)
+
+				// Acquire lock for this client and get the token
+				success, token := lm.Acquire(clientID)
+				if !success {
+					b.Errorf("Goroutine %d failed to acquire lock", id)
+					return
+				}
+
+				// Ensure lock is released in all cases
+				defer lm.Release(clientID, token)
+
 				fileNum := id % 100
 				filename := fmt.Sprintf("file_%d", fileNum)
-				err := fm.AppendToFile(filename, data)
+				err := fm.AppendToFile(filename, data, clientID, token)
 				if err != nil {
 					b.Errorf("Failed to append to file: %v", err)
 				}
@@ -585,4 +727,197 @@ func BenchmarkConcurrentAppends(b *testing.B) {
 
 	b.StopTimer()
 	fm.Cleanup()
+}
+
+// TestFileManager_AppendToFile tests the AppendToFile method
+func TestFileManager_AppendToFile(t *testing.T) {
+	_, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
+
+	// Test case 1: Append to a new file
+	t.Run("Append to new file", func(t *testing.T) {
+		filename := "file_0"
+		content := []byte("Hello, World!")
+		clientID := int32(1)
+
+		// Acquire lock for the client and get the token
+		success, token := lm.Acquire(clientID)
+		if !success {
+			t.Fatal("Failed to acquire lock")
+		}
+
+		// Ensure lock is released in all cases
+		defer lm.Release(clientID, token)
+
+		err := fm.AppendToFile(filename, content, clientID, token)
+		if err != nil {
+			t.Errorf("AppendToFile failed: %v", err)
+		}
+
+		// Verify file contents
+		fileContent, err := os.ReadFile(filepath.Join("data", filename))
+		if err != nil {
+			t.Errorf("Failed to read file: %v", err)
+		}
+		if string(fileContent) != string(content) {
+			t.Errorf("File content mismatch. Expected: %s, Got: %s", content, fileContent)
+		}
+	})
+
+	// Test case 2: Append to existing file
+	t.Run("Append to existing file", func(t *testing.T) {
+		filename := "file_1"
+		content1 := []byte("First line\n")
+		content2 := []byte("Second line\n")
+		clientID := int32(2)
+
+		// Acquire lock for the client and get the token
+		success, token := lm.Acquire(clientID)
+		if !success {
+			t.Fatal("Failed to acquire lock")
+		}
+
+		// Ensure lock is released in all cases
+		defer lm.Release(clientID, token)
+
+		// First append
+		err := fm.AppendToFile(filename, content1, clientID, token)
+		if err != nil {
+			t.Errorf("First AppendToFile failed: %v", err)
+		}
+
+		// Second append
+		err = fm.AppendToFile(filename, content2, clientID, token)
+		if err != nil {
+			t.Errorf("Second AppendToFile failed: %v", err)
+		}
+
+		// Verify file contents
+		fileContent, err := os.ReadFile(filepath.Join("data", filename))
+		if err != nil {
+			t.Errorf("Failed to read file: %v", err)
+		}
+		expectedContent := string(content1) + string(content2)
+		if string(fileContent) != expectedContent {
+			t.Errorf("File content mismatch. Expected: %s, Got: %s", expectedContent, fileContent)
+		}
+	})
+
+	// Test case 3: Append without lock
+	t.Run("Append without lock", func(t *testing.T) {
+		filename := "file_2"
+		content := []byte("Should fail")
+		clientID := int32(3)
+		token := "invalid-token"
+
+		err := fm.AppendToFile(filename, content, clientID, token)
+		if err == nil {
+			t.Error("AppendToFile should fail without lock")
+		}
+	})
+
+	// Test case 4: Append with invalid token
+	t.Run("Append with invalid token", func(t *testing.T) {
+		filename := "file_3"
+		content := []byte("Should fail")
+		clientID := int32(4)
+
+		// Acquire lock for the client and get the token
+		success, token := lm.Acquire(clientID)
+		if !success {
+			t.Fatal("Failed to acquire lock")
+		}
+
+		// Ensure lock is released in all cases
+		defer lm.Release(clientID, token)
+
+		// Try to append with invalid token
+		invalidToken := "invalid-token"
+		err := fm.AppendToFile(filename, content, clientID, invalidToken)
+		if err == nil {
+			t.Error("AppendToFile should fail with invalid token")
+		}
+	})
+}
+
+// TestFileManager_CreateFiles tests the CreateFiles method
+func TestFileManager_CreateFiles(t *testing.T) {
+	// Create a temporary directory for test files
+	tmpDir, err := os.MkdirTemp("", "file_manager_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
+
+	// Create files
+	fm.CreateFiles()
+
+	// Verify that all files exist
+	for i := 0; i < 100; i++ {
+		filename := fmt.Sprintf("file_%d", i)
+		_, err := os.Stat(filepath.Join("data", filename))
+		if err != nil {
+			t.Errorf("File %s should exist: %v", filename, err)
+		}
+	}
+}
+
+// TestFileManager_Cleanup tests the Cleanup method
+func TestFileManager_Cleanup(t *testing.T) {
+	_, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+	fm := NewFileManager(false, lm)
+
+	// Create and open files
+	clientID := int32(1)
+
+	// Acquire lock for the client and get the token
+	success, token := lm.Acquire(clientID)
+	if !success {
+		t.Fatal("Failed to acquire lock")
+	}
+
+	// Ensure lock is released in all cases
+	defer lm.Release(clientID, token)
+
+	// Open some files by appending to them
+	for i := 0; i < 10; i++ {
+		filename := fmt.Sprintf("file_%d", i)
+		err := fm.AppendToFile(filename, []byte("test"), clientID, token)
+		if err != nil {
+			t.Fatalf("Failed to append to file: %v", err)
+		}
+	}
+
+	// Verify files are in openFiles map
+	fm.mu.Lock()
+	initialOpenFiles := len(fm.openFiles)
+	fm.mu.Unlock()
+
+	if initialOpenFiles == 0 {
+		t.Error("No files in openFiles map")
+	}
+
+	// Test cleanup
+	fm.Cleanup()
+
+	// Verify openFiles map is empty
+	fm.mu.Lock()
+	finalOpenFiles := len(fm.openFiles)
+	fm.mu.Unlock()
+
+	if finalOpenFiles != 0 {
+		t.Errorf("openFiles map should be empty after cleanup, but has %d entries", finalOpenFiles)
+	}
 }

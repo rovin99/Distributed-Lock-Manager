@@ -1,68 +1,83 @@
 syntax = "proto3";
 
-package lock_service;
-// A simpler approach
-option go_package = "./proto";
+package lock;
 
-// lock acquire/release arguments, add any fields you want
-message lock_args {
-    int32 client_id = 1;
-    string request_id = 2;
-    string token = 3;      // Added for lock token validation
-}
+option go_package = "Distributed-Lock-Manager/proto";
 
-// server return Status, we will add more in the future
-enum Status {
-    SUCCESS = 0;   
-    FILE_ERROR = 1;
-    PERMISSION_DENIED = 2;
-    TIMEOUT = 3;    
-    LEASE_EXPIRED = 4;     // Added for lease expiration
-}
-
-// response struct, adjust or add any fields you want
-message Response {
-    Status status = 1;
-}
-
-// Add a lock response that includes the token
-message lock_response {
-    Response response = 1;
-    string token = 2;      // Token returned on successful lock acquisition
-}
-
-// file append arguments, add any fields you want
-message file_args {
-    string filename = 1;
-    bytes content = 2;
-    int32 client_id = 3;
-    string request_id = 4;
-    string token = 5;      // Added for lock token validation
-}
-
-// lease renewal arguments
-message lease_args {
-    int32 client_id = 1;
-    string request_id = 2;
-    string token = 3;
-}
-
-// field to hold an int, because the arguments and return values should be "message" type
-message Int {
-    int32 rc = 1;
-}
-
-// Add a new message type for init/close responses
-message StatusMsg {
-    int32 rc = 1;
-    string message = 2;
-}
-
+// The lock service definition
 service LockService {
-    rpc client_init(Int) returns (StatusMsg);
-    rpc lock_acquire(lock_args) returns (lock_response);
-    rpc lock_release(lock_args) returns (Response);
-    rpc file_append(file_args) returns (Response);
-    rpc client_close(Int) returns (StatusMsg);
-    rpc renew_lease(lease_args) returns (Response);  // Added for lease renewal
+  // Initialize a new client
+  rpc ClientInit (client_init_args) returns (client_init_response) {}
+  
+  // Acquire a lock
+  rpc LockAcquire (lock_args) returns (lock_response) {}
+  
+  // Release a lock
+  rpc LockRelease (lock_args) returns (lock_response) {}
+  
+  // Append to a file
+  rpc FileAppend (file_args) returns (file_response) {}
+  
+  // Renew lease for a lock
+  rpc RenewLease (lease_args) returns (lease_response) {}
+}
+
+// Client initialization arguments
+message client_init_args {
+  int32 client_id = 1;
+}
+
+// Client initialization response
+message client_init_response {
+  Status status = 1;
+  string error_message = 2;
+}
+
+// Lock operation arguments
+message lock_args {
+  int32 client_id = 1;
+  string token = 2;  // Token for lock validation
+}
+
+// Lock operation response
+message lock_response {
+  Status status = 1;
+  string error_message = 2;
+  string token = 3;  // Token for future operations
+}
+
+// File operation arguments
+message file_args {
+  int32 client_id = 1;
+  string filename = 2;
+  bytes content = 3;
+  string token = 4;  // Token for permission validation
+}
+
+// File operation response
+message file_response {
+  Status status = 1;
+  string error_message = 2;
+}
+
+// Lease renewal arguments
+message lease_args {
+  int32 client_id = 1;
+  string token = 2;  // Token for lease validation
+}
+
+// Lease renewal response
+message lease_response {
+  Status status = 1;
+  string error_message = 2;
+}
+
+// Status codes for responses
+enum Status {
+  OK = 0;
+  ERROR = 1;
+  LOCK_HELD = 2;
+  LOCK_NOT_HELD = 3;
+  INVALID_TOKEN = 4;  // New status for token validation failures
+  PERMISSION_DENIED = 5;  // New status for permission-related errors
 }

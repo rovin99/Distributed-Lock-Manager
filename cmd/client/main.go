@@ -41,26 +41,26 @@ func main() {
 	defer c.Close()
 
 	// Step 1: Initialize the client
-	if err := c.Initialize(); err != nil {
+	if err := c.ClientInit(); err != nil {
 		log.Fatalf("Failed to initialize client: %v", err)
 	}
 	fmt.Printf("Client %d initialized successfully\n", clientID)
 
 	// Step 2: Acquire the lock
-	if err := c.AcquireLock(); err != nil {
+	if err := c.LockAcquire(); err != nil {
 		log.Fatalf("Failed to acquire lock: %v", err)
 	}
 	fmt.Printf("Client %d acquired lock successfully\n", clientID)
 
 	// Step 3: Append data to a file
 	content := fmt.Sprintf("%s from client %d\n", message, clientID)
-	if err := c.AppendFile("file_0", []byte(content)); err != nil {
+	if err := c.FileAppend("file_0", []byte(content)); err != nil {
 		log.Fatalf("Failed to append to file: %v", err)
 	}
 	fmt.Printf("Client %d appended to file successfully\n", clientID)
 
 	// Step 4: Release the lock
-	if err := c.ReleaseLock(); err != nil {
+	if err := c.LockRelease(); err != nil {
 		log.Fatalf("Failed to release lock: %v", err)
 	}
 	fmt.Printf("Client %d released lock successfully\n", clientID)

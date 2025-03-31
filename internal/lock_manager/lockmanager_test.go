@@ -780,3 +780,169 @@ func expectEvent(t *testing.T, events chan string, expected string, timeout ...t
 		t.Errorf("Timed out waiting for event: %s", expected)
 	}
 }
+
+func TestLeaseExpiration(t *testing.T) {
+	// Create a lock manager with a short lease duration for testing
+	lm := NewLockManagerWithLeaseDuration(nil, 2*time.Second)
+
+	// Test 1: Basic lease expiration
+	t.Run("Basic lease expiration", func(t *testing.T) {
+		// Acquire lock for client 1
+		success, token := lm.Acquire(1)
+		if !success {
+			t.Fatal("Failed to acquire lock")
+		}
+
+		// Verify lock is held
+		if !lm.HasLockWithToken(1, token) {
+			t.Fatal("Lock should be held by client 1")
+		}
+
+		// Wait for lease to expire
+		time.Sleep(3 * time.Second)
+
+		// Verify lock is released
+		if lm.HasLockWithToken(1, token) {
+			t.Fatal("Lock should be released after lease expiration")
+		}
+	})
+
+	// Test 2: Multiple clients with lease expiration
+	t.Run("Multiple clients with lease expiration", func(t *testing.T) {
+		// Client 1 acquires lock
+		success1, token1 := lm.Acquire(1)
+		if !success1 {
+			t.Fatal("Failed to acquire lock for client 1")
+		}
+
+		// Client 2 tries to acquire lock (should wait)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		success2, _ := lm.AcquireWithTimeout(2, ctx)
+		cancel()
+		if success2 {
+			t.Fatal("Client 2 should not acquire lock while client 1 holds it")
+		}
+
+		// Wait for client 1's lease to expire
+		time.Sleep(3 * time.Second)
+
+		// Client 2 should now be able to acquire the lock
+		success2, token2 := lm.Acquire(2)
+		if !success2 {
+			t.Fatal("Client 2 should acquire lock after client 1's lease expires")
+		}
+
+		// Verify client 1's token is no longer valid
+		if lm.HasLockWithToken(1, token1) {
+			t.Fatal("Client 1's lock should be invalid after lease expiration")
+		}
+
+		// Verify client 2's token is valid
+		if !lm.HasLockWithToken(2, token2) {
+			t.Fatal("Client 2's lock should be valid")
+		}
+
+		// Clean up
+		lm.Release(2, token2)
+	})
+
+	// Test 3: Lease renewal
+	t.Run("Lease renewal", func(t *testing.T) {
+		// Client 1 acquires lock
+		success, token := lm.Acquire(1)
+		if !success {
+			t.Fatal("Failed to acquire lock")
+		}
+
+		// Wait half the lease duration
+		time.Sleep(1 * time.Second)
+
+		// Renew the lease
+		if !lm.RenewLease(1, token) {
+			t.Fatal("Failed to renew lease")
+		}
+
+		// Wait for a short time (less than the lease duration)
+		time.Sleep(500 * time.Millisecond)
+
+		// Lock should still be valid due to renewal
+		if !lm.HasLockWithToken(1, token) {
+			t.Fatal("Lock should still be valid after lease renewal")
+		}
+
+		// Clean up - explicitly release the lock
+		if !lm.Release(1, token) {
+			t.Fatal("Failed to release lock during cleanup")
+		}
+
+		// Verify lock is actually released
+		if lm.HasLockWithToken(1, token) {
+			t.Fatal("Lock should be released after cleanup")
+		}
+	})
+
+	// Test 4: Client crash simulation
+	t.Run("Client crash simulation", func(t *testing.T) {
+		// Client 1 acquires lock
+		success, token := lm.Acquire(1)
+		if !success {
+			t.Fatal("Failed to acquire lock")
+		}
+
+		// Simulate client crash by not renewing lease
+		// Wait for lease to expire
+		time.Sleep(3 * time.Second)
+
+		// Verify lock is released
+		if lm.HasLockWithToken(1, token) {
+			t.Fatal("Lock should be released after client crash")
+		}
+
+		// Another client should be able to acquire the lock
+		success2, token2 := lm.Acquire(2)
+		if !success2 {
+			t.Fatal("Client 2 should be able to acquire lock after client 1 crashes")
+		}
+
+		// Verify client 2's lock is valid
+		if !lm.HasLockWithToken(2, token2) {
+			t.Fatal("Client 2's lock should be valid")
+		}
+
+		// Clean up
+		lm.Release(2, token2)
+	})
+}
+
+func TestLeaseExpirationWithFileOperations(t *testing.T) {
+	// Create a lock manager with a short lease duration
+	lm := NewLockManagerWithLeaseDuration(nil, 2*time.Second)
+
+	// Test: File operations after lease expiration
+	t.Run("File operations after lease expiration", func(t *testing.T) {
+		// Client 1 acquires lock
+		success, token := lm.Acquire(1)
+		if !success {
+			t.Fatal("Failed to acquire lock")
+		}
+
+		// Wait for lease to expire
+		time.Sleep(3 * time.Second)
+
+		// Try to perform file operation with expired lease
+		if lm.HasLockWithToken(1, token) {
+			t.Fatal("File operations should not be allowed with expired lease")
+		}
+
+		// Another client should be able to acquire the lock
+		success2, token2 := lm.Acquire(2)
+		if !success2 {
+			t.Fatal("Client 2 should be able to acquire lock after client 1's lease expires")
+		}
+
+		// Verify client 2 can perform file operations
+		if !lm.HasLockWithToken(2, token2) {
+			t.Fatal("Client 2 should be able to perform file operations with valid lease")
+		}
+	})
+}

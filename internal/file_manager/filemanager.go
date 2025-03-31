@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"Distributed-Lock-Manager/internal/lock_manager"
 )
 
 // FileManager handles all file-related operations
@@ -16,17 +18,18 @@ type FileManager struct {
 	fileLocks   map[string]*sync.Mutex // Per-file mutexes for concurrency
 	mu          sync.Mutex             // Protects maps
 	logger      *log.Logger
-	syncEnabled bool           // Toggle for fsync after writes
-	wal         *WriteAheadLog // Write-ahead log for crash recovery
+	syncEnabled bool                      // Toggle for fsync after writes
+	wal         *WriteAheadLog            // Write-ahead log for crash recovery
+	lockManager *lock_manager.LockManager // Reference to lock manager for token validation
 }
 
 // NewFileManager initializes a new file manager
-func NewFileManager(syncEnabled bool) *FileManager {
-	return NewFileManagerWithWAL(syncEnabled, false)
+func NewFileManager(syncEnabled bool, lockManager *lock_manager.LockManager) *FileManager {
+	return NewFileManagerWithWAL(syncEnabled, false, lockManager)
 }
 
 // NewFileManagerWithWAL initializes a new file manager with optional write-ahead logging
-func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool) *FileManager {
+func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool, lockManager *lock_manager.LockManager) *FileManager {
 	logger := log.New(os.Stdout, "[FileManager] ", log.LstdFlags)
 
 	// Initialize the write-ahead log
@@ -42,6 +45,7 @@ func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool) *FileManager {
 		logger:      logger,
 		syncEnabled: syncEnabled,
 		wal:         wal,
+		lockManager: lockManager,
 	}
 
 	// If WAL is enabled, perform recovery on startup
@@ -52,6 +56,19 @@ func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool) *FileManager {
 	}
 
 	return fm
+}
+
+// validateToken checks if the client has permission to modify files
+func (fm *FileManager) validateToken(clientID int32, token string) error {
+	if fm.lockManager == nil {
+		return fmt.Errorf("lock manager not initialized")
+	}
+
+	if !fm.lockManager.HasLockWithToken(clientID, token) {
+		return fmt.Errorf("unauthorized access: client %d does not have a valid token", clientID)
+	}
+
+	return nil
 }
 
 // recoverFromWAL attempts to recover any uncommitted operations from the write-ahead log
@@ -70,8 +87,9 @@ func (fm *FileManager) recoverFromWAL() error {
 	for _, entry := range uncommitted {
 		fm.logger.Printf("Replaying operation: request=%s, file=%s", entry.RequestID, entry.Filename)
 
-		// Replay the file append operation
-		// Note: We're not logging this operation to the WAL to avoid duplicates
+		// During recovery, we don't validate tokens since the lock state
+		// might not be fully recovered yet. The lock manager will handle
+		// any inconsistencies when it recovers its own state.
 		if err := fm.appendToFileInternal(entry.Filename, entry.Content, false); err != nil {
 			fm.logger.Printf("Error replaying operation: %v", err)
 			// Continue with other operations even if one fails
@@ -90,13 +108,19 @@ func (fm *FileManager) recoverFromWAL() error {
 }
 
 // AppendToFile appends content to a file, with optional WAL logging
-func (fm *FileManager) AppendToFile(filename string, content []byte) error {
-	return fm.AppendToFileWithRequestID(filename, content, "")
+func (fm *FileManager) AppendToFile(filename string, content []byte, clientID int32, token string) error {
+	return fm.AppendToFileWithRequestID(filename, content, "", clientID, token)
 }
 
 // AppendToFileWithRequestID appends content to a file with request ID tracking
-func (fm *FileManager) AppendToFileWithRequestID(filename string, content []byte, requestID string) error {
-	fm.logger.Printf("Attempting to append to %s (request ID: %s)", filename, requestID)
+func (fm *FileManager) AppendToFileWithRequestID(filename string, content []byte, requestID string, clientID int32, token string) error {
+	fm.logger.Printf("Attempting to append to %s (request ID: %s, client: %d)", filename, requestID, clientID)
+
+	// Validate token and permissions
+	if err := fm.validateToken(clientID, token); err != nil {
+		fm.logger.Printf("File append failed: %v", err)
+		return err
+	}
 
 	// If WAL is enabled and we have a request ID, log the operation
 	if fm.wal != nil && requestID != "" {

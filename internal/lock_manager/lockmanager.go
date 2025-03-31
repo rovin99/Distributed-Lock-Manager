@@ -183,6 +183,11 @@ func (lm *LockManager) AcquireWithTimeout(clientID int32, ctx context.Context) (
 			}
 			delete(lm.waitingSet, clientID)
 
+			// If this client was at the front of the queue, wake up the next client
+			if len(lm.queue) > 0 {
+				lm.cond.Broadcast()
+			}
+
 			lm.logger.Printf("Client %d timed out waiting for lock", clientID)
 			lm.mu.Unlock()
 			return false, ""
@@ -212,15 +217,29 @@ func (lm *LockManager) Release(clientID int32, token string) bool {
 
 	lm.logger.Printf("Client %d attempting to release lock with token %s", clientID, token)
 
-	// Check if this client holds the lock with the correct token
-	if lm.lockHolder == clientID && lm.lockToken == token {
-		lm.releaseLock() // Free the lock
+	// Check if this client owns the lock
+	if lm.lockHolder != clientID {
+		lm.logger.Printf("Lock release failed: client %d doesn't hold the lock", clientID)
+		return false
+	}
+
+	// If the lease has expired, we should still allow the client to release the lock
+	// This helps prevent deadlocks where a client can't release a lock because its lease expired
+	if !lm.leaseExpires.IsZero() && time.Now().After(lm.leaseExpires) {
+		lm.logger.Printf("Lease has expired, but allowing client %d to release lock", clientID)
+		lm.releaseLock()
 		return true
 	}
 
-	// Client doesn't hold the lock or token is invalid
-	lm.logger.Printf("Lock release failed: client %d doesn't hold the lock or token is invalid", clientID)
-	return false
+	// Check if the token is valid
+	if lm.lockToken != token {
+		lm.logger.Printf("Lock release failed: token %s is invalid", token)
+		return false
+	}
+
+	// Token is valid and client owns the lock, release it
+	lm.releaseLock()
+	return true
 }
 
 // RenewLease renews the lease for a client if they hold the lock with the correct token
@@ -228,16 +247,22 @@ func (lm *LockManager) RenewLease(clientID int32, token string) bool {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	// Check if client holds the lock with the correct token and the lease hasn't expired
-	if lm.lockHolder == clientID && lm.lockToken == token && !lm.leaseExpires.IsZero() && time.Now().Before(lm.leaseExpires) {
-		// Extend the lease
-		lm.leaseExpires = time.Now().Add(lm.leaseDuration)
-		lm.logger.Printf("Lease renewed for client %d until %v", clientID, lm.leaseExpires)
-		return true
+	// Check if this client owns the lock
+	if lm.lockHolder != clientID {
+		lm.logger.Printf("Lease renewal failed: client %d doesn't hold the lock", clientID)
+		return false
 	}
 
-	lm.logger.Printf("Lease renewal failed for client %d: either doesn't hold the lock, token is invalid, or lease expired", clientID)
-	return false
+	// Check if the token is valid and lease hasn't expired
+	if lm.lockToken != token || lm.leaseExpires.IsZero() || time.Now().After(lm.leaseExpires) {
+		lm.logger.Printf("Lease renewal failed: token %s is invalid or expired", token)
+		return false
+	}
+
+	// Token is valid and client owns the lock, extend the lease
+	lm.leaseExpires = time.Now().Add(lm.leaseDuration)
+	lm.logger.Printf("Lease renewed for client %d until %v", clientID, lm.leaseExpires)
+	return true
 }
 
 // HasLock checks if the given client holds the lock with a valid token and lease
@@ -259,6 +284,24 @@ func (lm *LockManager) HasLockWithToken(clientID int32, token string) bool {
 		lm.lockToken == token &&
 		!lm.leaseExpires.IsZero() &&
 		time.Now().Before(lm.leaseExpires)
+}
+
+// IsTokenValid checks if a token is valid for any client
+func (lm *LockManager) IsTokenValid(token string) bool {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	// Check if token matches current lock token and lease hasn't expired
+	return lm.lockToken == token &&
+		!lm.leaseExpires.IsZero() &&
+		time.Now().Before(lm.leaseExpires)
+}
+
+// GetTokenExpiration returns the expiration time of the current token
+func (lm *LockManager) GetTokenExpiration() time.Time {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return lm.leaseExpires
 }
 
 // ReleaseLockIfHeld releases the lock if the given client holds it

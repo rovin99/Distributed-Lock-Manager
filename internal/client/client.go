@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -145,26 +146,8 @@ func (c *LockClient) stopLeaseRenewal() {
 	c.mu.Unlock()
 }
 
-// renewLease sends a lease renewal request to the server
-func (c *LockClient) renewLease(token string) error {
-	requestId := c.GenerateRequestID()
-	leaseArgs := &pb.LeaseArgs{
-		ClientId:  c.id,
-		RequestId: requestId,
-		Token:     token,
-	}
-
-	fmt.Printf("Sending renew_lease request (ID: %s)\n", requestId)
-
-	_, err := c.retryRPC("RenewLease", func(ctx context.Context) (*pb.Response, error) {
-		return c.client.RenewLease(ctx, leaseArgs)
-	})
-
-	return err
-}
-
 // retryRPC is a generic function that executes an RPC with retries and exponential backoff
-func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*pb.Response, error)) (*pb.Response, error) {
+func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*pb.LockResponse, error)) (*pb.LockResponse, error) {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -175,9 +158,34 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 		resp, err := rpcFunc(ctx)
 
 		// Check for success
-		if err == nil && resp.Status == pb.Status_SUCCESS {
+		if err == nil && resp.Status == pb.Status_OK {
 			cancel() // Remember to cancel the context on success
 			return resp, nil
+		}
+
+		// Handle DeadlineExceeded error specially
+		if err != nil && strings.Contains(err.Error(), "DeadlineExceeded") {
+			// For lock release, if we get a DeadlineExceeded, we should verify the lock was released
+			if operation == "LockRelease" {
+				// Try one more time with a fresh context to verify the lock was released
+				verifyCtx, verifyCancel := context.WithTimeout(context.Background(), initialTimeout)
+				verifyResp, verifyErr := rpcFunc(verifyCtx)
+				verifyCancel()
+
+				// If the verification succeeds or we get a specific error indicating the lock is not held,
+				// then we can assume the lock was released
+				if verifyErr == nil && verifyResp.Status == pb.Status_OK ||
+					(verifyErr == nil && verifyResp.Status == pb.Status_INVALID_TOKEN) {
+					// Update client state since the lock was released
+					c.mu.Lock()
+					c.hasLock = false
+					c.lockToken = ""
+					c.mu.Unlock()
+					c.stopLeaseRenewal()
+					cancel()
+					return &pb.LockResponse{Status: pb.Status_OK}, nil
+				}
+			}
 		}
 
 		// Save error for return if all attempts fail
@@ -186,14 +194,14 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 		} else {
 			lastErr = fmt.Errorf("%s failed with status: %v", operation, resp.Status)
 
-			// Special handling for lease expiration
-			if resp.Status == pb.Status_LEASE_EXPIRED {
+			// Special handling for token-related errors
+			if resp.Status == pb.Status_INVALID_TOKEN {
 				c.mu.Lock()
 				c.hasLock = false
 				c.lockToken = ""
 				c.mu.Unlock()
 				c.stopLeaseRenewal()
-				return nil, fmt.Errorf("lease expired, lock lost")
+				return nil, fmt.Errorf("invalid token, lock lost")
 			}
 		}
 
@@ -213,43 +221,15 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 	return nil, fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
 }
 
-// retryInitClose is a specialized version for init/close operations that return StatusMsg
-func (c *LockClient) retryInitClose(operation string, rpcFunc func(context.Context) (*pb.StatusMsg, error)) (*pb.StatusMsg, error) {
+// retryLeaseRenewal is a specialized version for lease renewal
+func (c *LockClient) retryLeaseRenewal(operation string, rpcFunc func(context.Context) (*pb.LeaseResponse, error)) (*pb.LeaseResponse, error) {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
 
 		resp, err := rpcFunc(ctx)
-		if err == nil {
-			cancel()
-			return resp, nil
-		}
-
-		lastErr = fmt.Errorf("%s failed: %v", operation, err)
-		cancel()
-
-		backoff := initialBackoff * time.Duration(1<<uint(attempt))
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
-		}
-
-		fmt.Printf("Retry %d for %s after %v delay\n", attempt+1, operation, backoff)
-		time.Sleep(backoff)
-	}
-
-	return nil, fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
-}
-
-// retryAcquire is a specialized version for lock_acquire that returns a token
-func (c *LockClient) retryAcquire(operation string, rpcFunc func(context.Context) (*pb.LockResponse, error)) (*pb.LockResponse, error) {
-	var lastErr error
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
-
-		resp, err := rpcFunc(ctx)
-		if err == nil && resp.Response.Status == pb.Status_SUCCESS {
+		if err == nil && resp.Status == pb.Status_OK {
 			cancel()
 			return resp, nil
 		}
@@ -257,7 +237,7 @@ func (c *LockClient) retryAcquire(operation string, rpcFunc func(context.Context
 		if err != nil {
 			lastErr = fmt.Errorf("%s failed: %v", operation, err)
 		} else {
-			lastErr = fmt.Errorf("%s failed with status: %v", operation, resp.Response.Status)
+			lastErr = fmt.Errorf("%s failed with status: %v", operation, resp.Status)
 		}
 
 		cancel()
@@ -274,45 +254,131 @@ func (c *LockClient) retryAcquire(operation string, rpcFunc func(context.Context
 	return nil, fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
 }
 
-// Initialize initializes the client with the server (with retry)
-func (c *LockClient) Initialize() error {
-	resp, err := c.retryInitClose("ClientInit", func(ctx context.Context) (*pb.StatusMsg, error) {
-		return c.client.ClientInit(ctx, &pb.Int{Rc: c.id})
+// retryFileAppend is a specialized version for file append
+func (c *LockClient) retryFileAppend(operation string, rpcFunc func(context.Context) (*pb.FileResponse, error)) (*pb.FileResponse, error) {
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
+
+		resp, err := rpcFunc(ctx)
+		if err == nil && resp.Status == pb.Status_OK {
+			cancel()
+			return resp, nil
+		}
+
+		if err != nil {
+			lastErr = fmt.Errorf("%s failed: %v", operation, err)
+		} else {
+			lastErr = fmt.Errorf("%s failed with status: %v", operation, resp.Status)
+		}
+
+		cancel()
+
+		backoff := initialBackoff * time.Duration(1<<uint(attempt))
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+
+		fmt.Printf("Retry %d for %s after %v delay\n", attempt+1, operation, backoff)
+		time.Sleep(backoff)
+	}
+
+	return nil, fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
+}
+
+// renewLease sends a lease renewal request to the server
+func (c *LockClient) renewLease(token string) error {
+	args := &pb.LeaseArgs{
+		ClientId: c.id,
+		Token:    token,
+	}
+
+	_, err := c.retryLeaseRenewal("RenewLease", func(ctx context.Context) (*pb.LeaseResponse, error) {
+		return c.client.RenewLease(ctx, args)
 	})
 
 	if err != nil {
-		return err
+		return fmt.Errorf("lease renewal failed: %v", err)
 	}
 
-	fmt.Printf("Server response: %s\n", resp.Message)
 	return nil
 }
 
-// AcquireLock attempts to acquire the lock (with retry)
-func (c *LockClient) AcquireLock() error {
-	// Stop any existing lease renewal
-	c.stopLeaseRenewal()
-
-	requestId := c.GenerateRequestID()
-	lockArgs := &pb.LockArgs{
-		ClientId:  c.id,
-		RequestId: requestId,
+// FileAppend attempts to append content to a file
+func (c *LockClient) FileAppend(filename string, content []byte) error {
+	args := &pb.FileArgs{
+		ClientId: c.id,
+		Filename: filename,
+		Content:  content,
+		Token:    c.lockToken,
 	}
 
-	fmt.Printf("Sending lock_acquire request (ID: %s)\n", requestId)
-
-	resp, err := c.retryAcquire("LockAcquire", func(ctx context.Context) (*pb.LockResponse, error) {
-		return c.client.LockAcquire(ctx, lockArgs)
+	_, err := c.retryFileAppend("FileAppend", func(ctx context.Context) (*pb.FileResponse, error) {
+		return c.client.FileAppend(ctx, args)
 	})
 
 	if err != nil {
-		return err
+		return fmt.Errorf("file append failed: %v", err)
 	}
 
-	// Store the token
+	return nil
+}
+
+// Close closes the client connection
+func (c *LockClient) Close() error {
+	// Stop any ongoing lease renewal
+	c.stopLeaseRenewal()
+
+	// Close the gRPC connection
+	if err := c.conn.Close(); err != nil {
+		return fmt.Errorf("failed to close connection: %v", err)
+	}
+
+	return nil
+}
+
+// ClientInit initializes the client with the server
+func (c *LockClient) ClientInit() error {
+	args := &pb.ClientInitArgs{
+		ClientId: c.id,
+	}
+
+	_, err := c.retryRPC("ClientInit", func(ctx context.Context) (*pb.LockResponse, error) {
+		initResp, err := c.client.ClientInit(ctx, args)
+		if err != nil {
+			return nil, err
+		}
+		return &pb.LockResponse{
+			Status: initResp.Status,
+		}, nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("client initialization failed: %v", err)
+	}
+
+	return nil
+}
+
+// LockAcquire attempts to acquire a lock
+func (c *LockClient) LockAcquire() error {
+	args := &pb.LockArgs{
+		ClientId: c.id,
+	}
+
+	resp, err := c.retryRPC("LockAcquire", func(ctx context.Context) (*pb.LockResponse, error) {
+		return c.client.LockAcquire(ctx, args)
+	})
+
+	if err != nil {
+		return fmt.Errorf("lock acquisition failed: %v", err)
+	}
+
+	// Update client state with the new token
 	c.mu.Lock()
-	c.lockToken = resp.Token
 	c.hasLock = true
+	c.lockToken = resp.Token
 	c.mu.Unlock()
 
 	// Start lease renewal
@@ -321,108 +387,34 @@ func (c *LockClient) AcquireLock() error {
 	return nil
 }
 
-// AppendFile appends data to a file (with retry)
-func (c *LockClient) AppendFile(filename string, content []byte) error {
-	c.mu.Lock()
-	if !c.hasLock || c.lockToken == "" {
-		c.mu.Unlock()
-		return fmt.Errorf("client does not hold a valid lock")
-	}
-	token := c.lockToken
-	c.mu.Unlock()
-
-	requestId := c.GenerateRequestID()
-	fileArgs := &pb.FileArgs{
-		Filename:  filename,
-		Content:   content,
-		ClientId:  c.id,
-		RequestId: requestId,
-		Token:     token,
+// LockRelease attempts to release the lock
+func (c *LockClient) LockRelease() error {
+	args := &pb.LockArgs{
+		ClientId: c.id,
+		Token:    c.lockToken,
 	}
 
-	fmt.Printf("Sending file_append request (ID: %s)\n", requestId)
-
-	resp, err := c.retryRPC("FileAppend", func(ctx context.Context) (*pb.Response, error) {
-		return c.client.FileAppend(ctx, fileArgs)
+	_, err := c.retryRPC("LockRelease", func(ctx context.Context) (*pb.LockResponse, error) {
+		return c.client.LockRelease(ctx, args)
 	})
 
 	if err != nil {
-		// If we get a PERMISSION_DENIED, our lock might have expired
-		if resp != nil && resp.Status == pb.Status_PERMISSION_DENIED {
-			c.mu.Lock()
-			c.hasLock = false
-			c.lockToken = ""
-			c.mu.Unlock()
-			c.stopLeaseRenewal()
-		}
-		return err
+		return fmt.Errorf("lock release failed: %v", err)
 	}
 
-	return nil
-}
-
-// ReleaseLock releases the lock (with retry)
-func (c *LockClient) ReleaseLock() error {
-	c.mu.Lock()
-	if !c.hasLock || c.lockToken == "" {
-		c.mu.Unlock()
-		return fmt.Errorf("client does not hold a valid lock")
-	}
-	token := c.lockToken
-	c.mu.Unlock()
-
-	// Stop lease renewal
-	c.stopLeaseRenewal()
-
-	requestId := c.GenerateRequestID()
-	lockArgs := &pb.LockArgs{
-		ClientId:  c.id,
-		RequestId: requestId,
-		Token:     token,
-	}
-
-	fmt.Printf("Sending lock_release request (ID: %s)\n", requestId)
-
-	_, err := c.retryRPC("LockRelease", func(ctx context.Context) (*pb.Response, error) {
-		return c.client.LockRelease(ctx, lockArgs)
-	})
-
-	// Even if there was an error, clear the lock state
+	// Update client state
 	c.mu.Lock()
 	c.hasLock = false
 	c.lockToken = ""
 	c.mu.Unlock()
 
-	return err
-}
-
-// Close closes the client connection (with retry)
-func (c *LockClient) Close() error {
 	// Stop lease renewal
 	c.stopLeaseRenewal()
 
-	// If we have a lock, try to release it
-	c.mu.Lock()
-	if c.hasLock && c.lockToken != "" {
-		c.mu.Unlock()
-		_ = c.ReleaseLock() // Ignore errors
-	} else {
-		c.mu.Unlock()
-	}
-
-	resp, err := c.retryInitClose("ClientClose", func(ctx context.Context) (*pb.StatusMsg, error) {
-		return c.client.ClientClose(ctx, &pb.Int{Rc: c.id})
-	})
-
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Server response: %s\n", resp.Message)
-	return c.conn.Close()
+	return nil
 }
 
 // AcquireLockWithRetry is kept for backward compatibility
-func (c *LockClient) AcquireLockWithRetry(maxAttempts int) error {
-	return c.AcquireLock()
+func (c *LockClient) AcquireLockWithRetry() error {
+	return c.LockAcquire()
 }
