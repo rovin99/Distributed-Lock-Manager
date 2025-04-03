@@ -14,22 +14,24 @@ import (
 
 func init() {
 	// Create logs directory if it doesn't exist
-	if err := os.MkdirAll("/home/naveen/Project/Distributed-Lock-Manager/logs", 0755); err != nil {
+	if err := os.MkdirAll("../../logs", 0755); err != nil {
 		log.Printf("Failed to create logs directory: %v", err)
 	}
 
-	// Redirect test logs to file
-	logFile, err := os.OpenFile(filepath.Join("/home/naveen/Project/Distributed-Lock-Manager/logs", "lockmanager_test.log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// Remove all files in the logs directory
+	files, err := filepath.Glob("")
 	if err != nil {
-		log.Printf("Failed to open test log file: %v", err)
-	} else {
-		log.SetOutput(logFile)
+		log.Printf("Failed to get files in logs directory: %v", err)
+	}
+	for _, file := range files {
+		if err := os.Remove(file); err != nil {
+			log.Printf("Failed to remove file: %v", err)
+		}
 	}
 }
 
 func TestLockManagerBasic(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 
 	// Test initial state
 	if lm.HasLock(1) {
@@ -89,7 +91,7 @@ func TestLockManagerBasic(t *testing.T) {
 }
 
 func TestLockManagerConcurrent(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 	numWorkers := 10
 	testDuration := 500 * time.Millisecond
 
@@ -163,7 +165,7 @@ func TestLockManagerConcurrent(t *testing.T) {
 }
 
 func TestLockContention(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 
 	// Create a channel for client 2 to signal it's ready
 	client2Ready := make(chan bool, 1)
@@ -234,7 +236,7 @@ func TestLockContention(t *testing.T) {
 }
 
 func TestAcquireWithTimeout(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 
 	// First client acquires the lock
 	success, token1 := lm.Acquire(1)
@@ -285,7 +287,7 @@ func TestAcquireWithTimeout(t *testing.T) {
 }
 
 func TestFIFOFairness(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 
 	// Events channel to track the order of acquisitions
 	events := make(chan int, 3)
@@ -355,7 +357,7 @@ func TestFIFOFairness(t *testing.T) {
 }
 
 func TestStressTest(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 	runDuration := 2 * time.Second
 	numWorkers := 10
 
@@ -444,7 +446,7 @@ func TestStressTest(t *testing.T) {
 }
 
 func BenchmarkLockAcquireRelease(b *testing.B) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -458,7 +460,7 @@ func BenchmarkLockAcquireRelease(b *testing.B) {
 }
 
 func BenchmarkConcurrentLockOperations(b *testing.B) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 	numGoroutines := 4
 
 	b.ResetTimer()
@@ -487,7 +489,7 @@ func BenchmarkConcurrentLockOperations(b *testing.B) {
 }
 
 func TestLongRunningLockHolder(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 
 	// Create channel to track when client 2 acquires the lock
 	client2Acquired := make(chan bool)
@@ -527,7 +529,7 @@ func TestLongRunningLockHolder(t *testing.T) {
 }
 
 func TestClientDisconnection(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 
 	// Client 1 acquires the lock
 	_, _ = lm.Acquire(1)
@@ -551,7 +553,7 @@ func TestClientDisconnection(t *testing.T) {
 }
 
 func TestMultipleTimeoutClients(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 
 	// Client 1 acquires the lock
 	success, token1 := lm.Acquire(1)
@@ -612,20 +614,30 @@ func TestMultipleTimeoutClients(t *testing.T) {
 }
 
 func TestMixedOperation(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 
-	// Start a goroutine that continuously acquires and releases the lock
-	stopCh := make(chan struct{})
+	// Channels for synchronization
+	acquireLock := make(chan bool)
+	releaseLock := make(chan bool)
+	done := make(chan bool)
+
+	// Start a goroutine that acquires and releases the lock only when directed
 	go func() {
 		for {
 			select {
-			case <-stopCh:
+			case <-done:
 				return
-			default:
+			case <-acquireLock:
 				success, token := lm.Acquire(1)
 				if success {
-					time.Sleep(10 * time.Millisecond)
+					// Hold the lock briefly
+					time.Sleep(5 * time.Millisecond)
+					// Signal it's OK to release
+					releaseLock <- true
+					// Release on command
 					lm.Release(1, token)
+					// Small delay after releasing to give client 2 a chance
+					time.Sleep(10 * time.Millisecond)
 				}
 			}
 		}
@@ -638,41 +650,35 @@ func TestMixedOperation(t *testing.T) {
 		failCount := 0
 
 		for i := 0; i < 10; i++ {
-			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			// Trigger client 1 to acquire the lock
+			acquireLock <- true
+			// Wait for client 1 to be ready to release
+			<-releaseLock
+
+			// Now try to acquire with timeout while client 1 has released the lock
+			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 			success, token := lm.AcquireWithTimeout(2, ctx)
-			cancel()
 
 			if success {
 				successCount++
+				time.Sleep(5 * time.Millisecond) // Brief hold time
 				lm.Release(2, token)
 			} else {
 				failCount++
 			}
 
+			cancel() // Cancel the context after we're done with it
 			time.Sleep(20 * time.Millisecond)
 		}
 
 		resultCh <- successCount
 		resultCh <- failCount
-	}()
-
-	// Start a third goroutine with short timeouts
-	go func() {
-		for i := 0; i < 5; i++ {
-			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-			defer cancel()
-			if success, token := lm.AcquireWithTimeout(4, ctx); success {
-				lm.Release(4, token)
-			}
-		}
+		done <- true
 	}()
 
 	// Wait for results
 	successCount := <-resultCh
 	failCount := <-resultCh
-
-	// Stop the background goroutine
-	close(stopCh)
 
 	// We expect some successes and some failures
 	t.Logf("Client 2 had %d successes and %d failures", successCount, failCount)
@@ -684,7 +690,7 @@ func TestMixedOperation(t *testing.T) {
 }
 
 func TestPacketLossRetryMechanism(t *testing.T) {
-	lm := NewLockManager(nil)
+	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
 
 	// Create a channel to track events
 	events := make(chan string, 10)

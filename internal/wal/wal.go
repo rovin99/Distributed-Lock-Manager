@@ -35,8 +35,8 @@ func NewWriteAheadLog(enabled bool) (*WriteAheadLog, error) {
 		return &WriteAheadLog{enabled: false}, nil
 	}
 
-	// Create logs directory with absolute path
-	logDir := "/home/naveen/Project/Distributed-Lock-Manager/logs"
+	// Create logs directory with relative path
+	logDir := "logs"
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create logs directory: %v", err)
 	}
@@ -157,10 +157,7 @@ func (wal *WriteAheadLog) Close() error {
 // RecoverUncommittedOperations processes the log file to find uncommitted operations
 // and returns a list of operations that need to be replayed
 func RecoverUncommittedOperations(logDir string) ([]LogEntry, error) {
-	// Use absolute path for log directory
-	logDir = "/home/naveen/Project/Distributed-Lock-Manager/logs"
-
-	// Find all log files
+	// Use the provided log directory path as is
 	matches, err := filepath.Glob(filepath.Join(logDir, "wal-*.log"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to find log files: %v", err)

@@ -8,6 +8,11 @@ import (
 )
 
 func TestWriteAheadLogging(t *testing.T) {
+	// First ensure logs directory exists
+	if err := os.MkdirAll("logs", 0755); err != nil {
+		t.Fatalf("Failed to create logs directory: %v", err)
+	}
+
 	// Create a test WAL
 	wal, err := NewWriteAheadLog(true)
 	if err != nil {
@@ -26,8 +31,8 @@ func TestWriteAheadLogging(t *testing.T) {
 			t.Fatalf("Failed to log operation: %v", err)
 		}
 
-		// Verify the log file exists
-		logFiles, err := filepath.Glob("/home/naveen/Project/Distributed-Lock-Manager/logs/wal-*.log")
+		// Verify the log file exists using OS-agnostic path
+		logFiles, err := filepath.Glob(filepath.Join("logs", "wal-*.log"))
 		if err != nil {
 			t.Fatalf("Failed to find log files: %v", err)
 		}
@@ -54,8 +59,8 @@ func TestWriteAheadLogging(t *testing.T) {
 
 	// Step 3: Test WAL cleanup
 	t.Run("WAL Cleanup", func(t *testing.T) {
-		// Create an old WAL file
-		oldLogPath := filepath.Join("/home/naveen/Project/Distributed-Lock-Manager/logs", "wal-old.log")
+		// Create an old WAL file using OS-agnostic path
+		oldLogPath := filepath.Join("logs", "wal-old.log")
 		oldFile, err := os.Create(oldLogPath)
 		if err != nil {
 			t.Fatalf("Failed to create old log file: %v", err)
@@ -83,6 +88,11 @@ func TestWriteAheadLogging(t *testing.T) {
 }
 
 func TestRecovery(t *testing.T) {
+	// First ensure logs directory exists
+	if err := os.MkdirAll("logs", 0755); err != nil {
+		t.Fatalf("Failed to create logs directory: %v", err)
+	}
+
 	// Create a test WAL
 	wal, err := NewWriteAheadLog(true)
 	if err != nil {

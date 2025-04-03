@@ -2,13 +2,25 @@ package lock_manager
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// PersistentLockState represents the lock state that needs to be persisted
+type PersistentLockState struct {
+	LockHolder   int32     `json:"lock_holder"`   // -1 if free
+	LockToken    string    `json:"lock_token"`    // Empty if free
+	LeaseExpires time.Time `json:"lease_expires"` // Zero if free or no lease
+	// Note: We are intentionally *not* persisting the queue or waitingSet
+	// to keep recovery simpler. Waiting clients will need to retry.
+}
 
 // LockManager handles all lock-related operations
 type LockManager struct {
@@ -21,31 +33,91 @@ type LockManager struct {
 	queue         []int32        // FIFO queue for fairness
 	waitingSet    map[int32]bool // Map for tracking clients in queue
 	leaseDuration time.Duration  // Duration of lease (e.g., 30 seconds)
+
+	// Field for persistence
+	stateFilePath string // Path to store the lock state
 }
+
+const defaultStateFilePath = "./data/lock_state.json"
 
 // NewLockManager initializes a new lock manager
 func NewLockManager(logger *log.Logger) *LockManager {
 	return NewLockManagerWithLeaseDuration(logger, 30*time.Second)
 }
 
-// NewLockManagerWithLeaseDuration initializes a new lock manager with a specified lease duration
+// NewLockManagerWithLeaseDuration creates a new lock manager with the specified lease duration
 func NewLockManagerWithLeaseDuration(logger *log.Logger, leaseDuration time.Duration) *LockManager {
 	if logger == nil {
 		logger = log.New(os.Stdout, "[LockManager] ", log.LstdFlags)
 	}
 
 	lm := &LockManager{
-		lockHolder:    -1, // No client holds the lock initially
+		lockHolder:    -1, // -1 means no one has the lock
 		lockToken:     "",
 		leaseExpires:  time.Time{},
+		leaseDuration: leaseDuration,
+		mu:            sync.Mutex{},
 		logger:        logger,
 		queue:         make([]int32, 0),
 		waitingSet:    make(map[int32]bool),
-		leaseDuration: leaseDuration,
+		stateFilePath: defaultStateFilePath,
 	}
 	lm.cond = sync.NewCond(&lm.mu)
 
-	// Start the lease monitor goroutine
+	// Ensure the state file directory exists if using the default path
+	dir := filepath.Dir(lm.stateFilePath)
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		logger.Fatalf("Failed to create directory for lock state file: %v", err)
+	}
+
+	// Load the persistent state before starting the lease monitor
+	if err := lm.loadState(); err != nil {
+		logger.Printf("WARNING: Failed to load or initialize state from '%s': %v", lm.stateFilePath, err)
+	}
+
+	// Start the lease monitor
+	go lm.monitorLeases()
+
+	return lm
+}
+
+// NewLockManagerWithStateFile creates a new lock manager with the specified lease duration and state file path
+func NewLockManagerWithStateFile(logger *log.Logger, leaseDuration time.Duration, stateFile string) *LockManager {
+	if logger == nil {
+		logger = log.New(os.Stdout, "[LockManager] ", log.LstdFlags)
+	}
+
+	lm := &LockManager{
+		lockHolder:    -1, // -1 means no one has the lock
+		lockToken:     "",
+		leaseExpires:  time.Time{},
+		leaseDuration: leaseDuration,
+		mu:            sync.Mutex{},
+		logger:        logger,
+		queue:         make([]int32, 0),
+		waitingSet:    make(map[int32]bool),
+		stateFilePath: stateFile,
+	}
+	lm.cond = sync.NewCond(&lm.mu)
+
+	// Ensure the state file directory exists
+	if stateFile != "" {
+		dir := filepath.Dir(stateFile)
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			logger.Fatalf("Failed to create directory for lock state file: %v", err)
+		}
+	}
+
+	// Load the persistent state before starting the lease monitor
+	if err := lm.loadState(); err != nil {
+		// Log errors during loading (e.g., permission denied, corrupted file), but don't make it fatal.
+		// A nil error means the file didn't exist (ok) or loaded successfully.
+		logger.Printf("WARNING: Failed to load or initialize state from '%s': %v", stateFile, err)
+		// Depending on requirements, might decide to panic or return error here.
+		// For now, we continue with the potentially uninitialized (but valid) in-memory state.
+	}
+
+	// Start the lease monitor
 	go lm.monitorLeases()
 
 	return lm
@@ -62,19 +134,11 @@ func (lm *LockManager) monitorLeases() {
 			// Lease has expired, release the lock
 			expiredHolder := lm.lockHolder
 			lm.logger.Printf("Lease expired for client %d, releasing lock", expiredHolder)
-			lm.releaseLock()
+			// Use the combined method which also saves state
+			lm.releaseLockAndSaveState()
 		}
 		lm.mu.Unlock()
 	}
-}
-
-// releaseLock is an internal helper to release the lock and notify waiting clients
-func (lm *LockManager) releaseLock() {
-	lm.lockHolder = -1
-	lm.lockToken = ""
-	lm.leaseExpires = time.Time{}
-	lm.logger.Printf("Lock released")
-	lm.cond.Broadcast() // Wake all waiting clients
 }
 
 // Acquire attempts to acquire the lock for the given client
@@ -88,7 +152,17 @@ func (lm *LockManager) Acquire(clientID int32) (bool, string) {
 	if lm.lockHolder == clientID {
 		lm.logger.Printf("Client %d already holds the lock - handling retry", clientID)
 		// Extend the lease on retry
+		originalLeaseExpires := lm.leaseExpires // For rollback
 		lm.leaseExpires = time.Now().Add(lm.leaseDuration)
+
+		// Save state after extending lease
+		if err := lm.saveState(); err != nil {
+			lm.logger.Printf("ERROR: Failed to save state on retry lease extension for client %d: %v", clientID, err)
+			// Rollback the change
+			lm.leaseExpires = originalLeaseExpires
+			return false, ""
+		}
+
 		return true, lm.lockToken
 	}
 
@@ -101,7 +175,8 @@ func (lm *LockManager) Acquire(clientID int32) (bool, string) {
 	// Check if the current lock has expired
 	if lm.lockHolder != -1 && !lm.leaseExpires.IsZero() && time.Now().After(lm.leaseExpires) {
 		lm.logger.Printf("Lock held by client %d has expired, releasing", lm.lockHolder)
-		lm.releaseLock()
+		// Use the combined method which also saves state
+		lm.releaseLockAndSaveState()
 	}
 
 	// Wait until the lock is free AND this client is at the front of the queue
@@ -114,10 +189,27 @@ func (lm *LockManager) Acquire(clientID int32) (bool, string) {
 	lm.queue = lm.queue[1:]
 	delete(lm.waitingSet, clientID)
 
-	// Assign the lock to this client with a new token and lease
+	// Prepare new lock state but save before committing
+	newToken := uuid.New().String()
+	newLeaseExpires := time.Now().Add(lm.leaseDuration)
+
+	// Update memory state so we can save it
 	lm.lockHolder = clientID
-	lm.lockToken = uuid.New().String()
-	lm.leaseExpires = time.Now().Add(lm.leaseDuration)
+	lm.lockToken = newToken
+	lm.leaseExpires = newLeaseExpires
+
+	// Persist the state change
+	if err := lm.saveState(); err != nil {
+		lm.logger.Printf("ERROR: Failed to save state on acquire for client %d: %v", clientID, err)
+		// Rollback the state change
+		lm.lockHolder = -1
+		lm.lockToken = ""
+		lm.leaseExpires = time.Time{}
+		// Wake others as acquire failed
+		lm.cond.Broadcast()
+		return false, ""
+	}
+
 	lm.logger.Printf("Lock acquired by client %d with token %s, expires at %v",
 		clientID, lm.lockToken, lm.leaseExpires)
 
@@ -134,7 +226,19 @@ func (lm *LockManager) AcquireWithTimeout(clientID int32, ctx context.Context) (
 	if lm.lockHolder == clientID {
 		lm.logger.Printf("Client %d already holds the lock - handling retry", clientID)
 		// Extend the lease on retry
+		originalLeaseExpires := lm.leaseExpires // For rollback
 		lm.leaseExpires = time.Now().Add(lm.leaseDuration)
+
+		// Save state after extending lease
+		if err := lm.saveState(); err != nil {
+			lm.logger.Printf("ERROR: Failed to save state on retry lease extension for client %d: %v", clientID, err)
+			// Rollback the change
+			lm.leaseExpires = originalLeaseExpires
+			token := ""
+			lm.mu.Unlock()
+			return false, token
+		}
+
 		token := lm.lockToken
 		lm.mu.Unlock()
 		return true, token
@@ -143,7 +247,8 @@ func (lm *LockManager) AcquireWithTimeout(clientID int32, ctx context.Context) (
 	// Check if the current lock has expired
 	if lm.lockHolder != -1 && !lm.leaseExpires.IsZero() && time.Now().After(lm.leaseExpires) {
 		lm.logger.Printf("Lock held by client %d has expired, releasing", lm.lockHolder)
-		lm.releaseLock()
+		// Use the combined method which also saves state
+		lm.releaseLockAndSaveState()
 	}
 
 	// Add client to queue if not already waiting
@@ -198,10 +303,28 @@ func (lm *LockManager) AcquireWithTimeout(clientID int32, ctx context.Context) (
 	lm.queue = lm.queue[1:]
 	delete(lm.waitingSet, clientID)
 
-	// Assign the lock to this client with a new token and lease
+	// Prepare new lock state but save before committing
+	newToken := uuid.New().String()
+	newLeaseExpires := time.Now().Add(lm.leaseDuration)
+
+	// Update memory state so we can save it
 	lm.lockHolder = clientID
-	lm.lockToken = uuid.New().String()
-	lm.leaseExpires = time.Now().Add(lm.leaseDuration)
+	lm.lockToken = newToken
+	lm.leaseExpires = newLeaseExpires
+
+	// Persist the state change
+	if err := lm.saveState(); err != nil {
+		lm.logger.Printf("ERROR: Failed to save state on acquire with timeout for client %d: %v", clientID, err)
+		// Rollback the state change
+		lm.lockHolder = -1
+		lm.lockToken = ""
+		lm.leaseExpires = time.Time{}
+		// Wake others as acquire failed
+		lm.cond.Broadcast()
+		lm.mu.Unlock()
+		return false, ""
+	}
+
 	lm.logger.Printf("Lock acquired by client %d with token %s, expires at %v",
 		clientID, lm.lockToken, lm.leaseExpires)
 
@@ -227,7 +350,8 @@ func (lm *LockManager) Release(clientID int32, token string) bool {
 	// This helps prevent deadlocks where a client can't release a lock because its lease expired
 	if !lm.leaseExpires.IsZero() && time.Now().After(lm.leaseExpires) {
 		lm.logger.Printf("Lease has expired, but allowing client %d to release lock", clientID)
-		lm.releaseLock()
+		// Use the combined method which also saves state
+		lm.releaseLockAndSaveState()
 		return true
 	}
 
@@ -237,8 +361,9 @@ func (lm *LockManager) Release(clientID int32, token string) bool {
 		return false
 	}
 
-	// Token is valid and client owns the lock, release it
-	lm.releaseLock()
+	// Token is valid and client owns the lock, release it with state persistence
+	// Use the combined method which handles clearing the state, saving, and broadcasting
+	lm.releaseLockAndSaveState()
 	return true
 }
 
@@ -259,8 +384,20 @@ func (lm *LockManager) RenewLease(clientID int32, token string) bool {
 		return false
 	}
 
-	// Token is valid and client owns the lock, extend the lease
+	// Token is valid and client owns the lock, store original lease for rollback
+	originalLeaseExpires := lm.leaseExpires
+
+	// Extend the lease
 	lm.leaseExpires = time.Now().Add(lm.leaseDuration)
+
+	// Persist the state change
+	if err := lm.saveState(); err != nil {
+		lm.logger.Printf("ERROR: Failed to save state on lease renewal for client %d: %v", clientID, err)
+		// Rollback the lease expiration change
+		lm.leaseExpires = originalLeaseExpires
+		return false
+	}
+
 	lm.logger.Printf("Lease renewed for client %d until %v", clientID, lm.leaseExpires)
 	return true
 }
@@ -311,7 +448,8 @@ func (lm *LockManager) ReleaseLockIfHeld(clientID int32) {
 
 	// If this client holds the lock, release it
 	if lm.lockHolder == clientID {
-		lm.releaseLock()
+		// Use the combined method which also saves state
+		lm.releaseLockAndSaveState()
 		lm.logger.Printf("Lock released due to client %d closing", clientID)
 	}
 
@@ -366,5 +504,228 @@ func (lm *LockManager) ForceSetLockHolder(clientID int32) {
 	lm.lockHolder = clientID
 	lm.lockToken = uuid.New().String()
 	lm.leaseExpires = time.Now().Add(lm.leaseDuration)
+
+	// Save the forced state change (best effort, but log failures)
+	if err := lm.saveState(); err != nil {
+		lm.logger.Printf("WARNING: Failed to save state after force-setting lock holder to %d: %v", clientID, err)
+	}
+
 	lm.logger.Printf("TESTING: Forcibly set lock holder to client %d with token %s", clientID, lm.lockToken)
+}
+
+// saveState persists the current lock state to disk atomically.
+// IMPORTANT: This MUST be called while holding lm.mu lock.
+func (lm *LockManager) saveState() error {
+	state := PersistentLockState{
+		LockHolder:   lm.lockHolder,
+		LockToken:    lm.lockToken,
+		LeaseExpires: lm.leaseExpires,
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		lm.logger.Printf("ERROR: Failed to marshal lock state: %v", err)
+		return fmt.Errorf("failed to marshal lock state: %w", err)
+	}
+
+	// Ensure directory exists
+	dir := filepath.Dir(lm.stateFilePath)
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		lm.logger.Printf("ERROR: Failed to create directory for lock state file '%s': %v", dir, err)
+		return fmt.Errorf("failed to create state directory: %w", err)
+	}
+
+	// Write to a temporary file first
+	tempFilePath := lm.stateFilePath + ".tmp"
+	file, err := os.OpenFile(tempFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0640)
+	if err != nil {
+		lm.logger.Printf("ERROR: Failed to open temporary state file '%s': %v", tempFilePath, err)
+		return fmt.Errorf("failed to open temp state file: %w", err)
+	}
+
+	_, writeErr := file.Write(data)
+	// Sync error is critical for durability
+	syncErr := file.Sync()
+	// Close error is less critical but good practice
+	closeErr := file.Close()
+
+	if writeErr != nil {
+		lm.logger.Printf("ERROR: Failed to write lock state to temporary file '%s': %v", tempFilePath, writeErr)
+		os.Remove(tempFilePath) // Clean up temp file on error
+		return fmt.Errorf("failed to write state data: %w", writeErr)
+	}
+	if syncErr != nil {
+		lm.logger.Printf("ERROR: Failed to sync lock state temporary file '%s': %v", tempFilePath, syncErr)
+		os.Remove(tempFilePath) // Clean up temp file on error
+		return fmt.Errorf("failed to sync state file: %w", syncErr)
+	}
+	if closeErr != nil {
+		lm.logger.Printf("WARNING: Failed to close lock state temporary file '%s': %v", tempFilePath, closeErr)
+		// Continue, as data is synced
+	}
+
+	// Atomically replace the old state file with the new one
+	if err := os.Rename(tempFilePath, lm.stateFilePath); err != nil {
+		lm.logger.Printf("ERROR: Failed to rename temporary state file to '%s': %v", lm.stateFilePath, err)
+		os.Remove(tempFilePath) // Clean up temp file
+		return fmt.Errorf("failed to commit state file: %w", err)
+	}
+
+	lm.logger.Printf("DEBUG: Successfully saved lock state (Holder: %d, Token: %s..., Expires: %v)",
+		state.LockHolder, lm.safeTokenForLog(state.LockToken), state.LeaseExpires)
+	return nil
+}
+
+// safeTokenForLog returns a truncated version of the token for logging
+func (lm *LockManager) safeTokenForLog(token string) string {
+	if len(token) > 8 {
+		return token[:8]
+	}
+	return token
+}
+
+// loadState loads the lock state from a persistent file. If the file doesn't exist,
+// it assumes an initial state and saves it.
+func (lm *LockManager) loadState() error {
+	// No mutex here; called from functions that already hold the lock
+
+	// If no state file path is set, just use in-memory state
+	if lm.stateFilePath == "" {
+		lm.logger.Printf("No state file path set, using in-memory state only")
+		return nil
+	}
+
+	// Try to read the lock state file
+	data, err := os.ReadFile(lm.stateFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// If the file doesn't exist, log and assume initial state in memory.
+			// The file will be created on the first saveState call.
+			lm.logger.Printf("Lock state file '%s' not found, assuming initial state.", lm.stateFilePath)
+			lm.lockHolder = -1
+			lm.lockToken = ""
+			lm.leaseExpires = time.Time{}
+			return nil // Not an error, just means we start fresh
+		}
+		return fmt.Errorf("failed to read lock state file: %w", err)
+	}
+
+	// Parse the JSON data
+	var state PersistentLockState
+	if err := json.Unmarshal(data, &state); err != nil {
+		// Critical error - panic instead of returning an error to maintain data integrity
+		panic(fmt.Sprintf("Critical error: failed to parse lock state file: %v", err))
+	}
+
+	// Check if the state from file is valid
+	now := time.Now()
+	if state.LockHolder != -1 && state.LeaseExpires.Before(now) {
+		// Lock has expired while the server was down
+		lm.logger.Printf("Loaded state indicates lease for client %d expired while server was down. Releasing lock.", state.LockHolder)
+		lm.lockHolder = -1
+		lm.lockToken = ""
+		lm.leaseExpires = time.Time{}
+
+		// Save the updated state
+		if err := lm.saveState(); err != nil {
+			lm.logger.Printf("ERROR: Failed to save state after releasing expired lock: %v", err)
+			return err
+		}
+		lm.logger.Printf("Lock released internally (e.g., expiry on load, monitor)")
+		lm.cond.Broadcast()
+	} else {
+		// Load the state from the file (could be unexpired or no lock holder)
+		lm.logger.Printf("Successfully loaded lock state (Holder: %d, Token: %s..., Expires: %v)",
+			state.LockHolder, lm.safeTokenForLog(state.LockToken), state.LeaseExpires)
+		lm.lockHolder = state.LockHolder     // Assign from loaded state
+		lm.lockToken = state.LockToken       // Assign from loaded state
+		lm.leaseExpires = state.LeaseExpires // Assign from loaded state
+	}
+
+	return nil
+}
+
+// releaseLockAndSaveState is an internal helper combining release and save.
+// MUST be called while holding lm.mu lock.
+func (lm *LockManager) releaseLockAndSaveState() {
+	originalHolder := lm.lockHolder // Store before clearing
+	lm.lockHolder = -1
+	lm.lockToken = ""
+	lm.leaseExpires = time.Time{}
+
+	if err := lm.saveState(); err != nil {
+		lm.logger.Printf("CRITICAL ERROR: Failed to save state after internal lock release for holder %d: %v", originalHolder, err)
+		// What to do here? State is inconsistent. Maybe panic? Log heavily.
+	} else {
+		lm.logger.Printf("Lock released internally (e.g., expiry on load, monitor)")
+	}
+
+	// Still need to broadcast after releasing the lock (and potentially after saving state)
+	lm.cond.Broadcast()
+}
+
+// SetStateFilePath sets the path where the lock state will be persisted
+func (lm *LockManager) SetStateFilePath(path string) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	lm.logger.Printf("Lock state file path set to: %s", path)
+	lm.stateFilePath = path
+
+	// Ensure the directory exists
+	if path != "" { // Only create dir if path is not empty
+		dir := filepath.Dir(path)
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			lm.logger.Printf("ERROR: Failed to create directory for lock state file '%s': %v", dir, err)
+			// Decide if this should be a fatal error or just a warning
+			return // Return early if we can't create the directory
+		}
+	}
+
+	// Attempt to load state from the new path. If it doesn't exist,
+	// loadState will initialize in-memory state correctly.
+	if err := lm.loadState(); err != nil {
+		lm.logger.Printf("WARNING: Failed to load state from new path '%s': %v", path, err)
+		// Continue with potentially uninitialized (but valid) in-memory state.
+	}
+
+	// Save the state file to ensure it exists immediately after setting the path
+	if err := lm.saveState(); err != nil {
+		lm.logger.Printf("WARNING: Failed to create initial state file at '%s': %v", path, err)
+	}
+}
+
+// ValidatePersistentState checks if the persistent state matches the in-memory state.
+// This is useful for testing and debugging.
+func (lm *LockManager) ValidatePersistentState() error {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	// Read the current state file
+	data, err := os.ReadFile(lm.stateFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("state file does not exist: %s", lm.stateFilePath)
+		}
+		return fmt.Errorf("failed to read state file: %w", err)
+	}
+
+	var fileState PersistentLockState
+	if err := json.Unmarshal(data, &fileState); err != nil {
+		return fmt.Errorf("failed to parse state file: %w", err)
+	}
+
+	// Compare with in-memory state
+	if fileState.LockHolder != lm.lockHolder {
+		return fmt.Errorf("lock holder mismatch: file=%d, memory=%d", fileState.LockHolder, lm.lockHolder)
+	}
+	if fileState.LockToken != lm.lockToken {
+		return fmt.Errorf("lock token mismatch: file=%s, memory=%s", fileState.LockToken, lm.lockToken)
+	}
+	// For time, we need a small tolerance for equality check
+	if !fileState.LeaseExpires.Equal(lm.leaseExpires) {
+		return fmt.Errorf("lease expiry mismatch: file=%v, memory=%v", fileState.LeaseExpires, lm.leaseExpires)
+	}
+
+	return nil
 }
