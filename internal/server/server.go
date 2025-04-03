@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -18,6 +19,7 @@ type LockServer struct {
 	fileManager  *file_manager.FileManager
 	requestCache *RequestCache
 	logger       *log.Logger
+	recoveryDone bool // Indicates if WAL recovery is complete
 }
 
 // NewLockServer initializes a new lock server
@@ -35,8 +37,38 @@ func NewLockServer() *LockServer {
 		fileManager:  fm,
 		requestCache: NewRequestCacheWithSize(10*time.Minute, 10000),
 		logger:       logger,
+		recoveryDone: fm.IsRecoveryComplete(),
 	}
 	return s
+}
+
+// IsRecoveryComplete returns whether WAL recovery is complete
+func (s *LockServer) IsRecoveryComplete() bool {
+	return s.recoveryDone && s.fileManager.IsRecoveryComplete()
+}
+
+// GetRecoveryError returns any error that occurred during recovery
+func (s *LockServer) GetRecoveryError() error {
+	return s.fileManager.GetRecoveryError()
+}
+
+// WaitForRecovery blocks until WAL recovery is complete or timeout is reached
+func (s *LockServer) WaitForRecovery(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for time.Now().Before(deadline) {
+		if s.IsRecoveryComplete() {
+			if err := s.GetRecoveryError(); err != nil {
+				return fmt.Errorf("recovery completed with error: %v", err)
+			}
+			return nil
+		}
+		<-ticker.C
+	}
+
+	return fmt.Errorf("timeout waiting for WAL recovery")
 }
 
 // ClientInit handles the client initialization RPC

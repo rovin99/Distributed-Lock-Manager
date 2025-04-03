@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"Distributed-Lock-Manager/internal/lock_manager"
 	"Distributed-Lock-Manager/internal/wal"
@@ -16,13 +17,15 @@ import (
 
 // FileManager handles all file-related operations
 type FileManager struct {
-	openFiles   map[string]*os.File // Tracks open file handles
-	fileLocks   map[string]string   // maps filename to lock token
-	mu          sync.RWMutex        // Protects maps
-	logger      *log.Logger
-	syncEnabled bool                      // Toggle for fsync after writes
-	wal         *wal.WriteAheadLog        // Write-ahead log for crash recovery
-	lockManager *lock_manager.LockManager // Reference to lock manager for token validation
+	openFiles    map[string]*os.File // Tracks open file handles
+	fileLocks    map[string]string   // maps filename to lock token
+	mu           sync.RWMutex        // Protects maps
+	logger       *log.Logger
+	syncEnabled  bool                      // Toggle for fsync after writes
+	wal          *wal.WriteAheadLog        // Write-ahead log for crash recovery
+	lockManager  *lock_manager.LockManager // Reference to lock manager for token validation
+	recoveryDone bool                      // Indicates if WAL recovery is complete
+	recoveryErr  error                     // Stores any error during recovery
 }
 
 // NewFileManager initializes a new file manager
@@ -42,21 +45,28 @@ func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool, lockManager *lock_
 	}
 
 	fm := &FileManager{
-		openFiles:   make(map[string]*os.File),
-		fileLocks:   make(map[string]string),
-		logger:      logger,
-		syncEnabled: syncEnabled,
-		wal:         wal,
-		lockManager: lockManager,
+		openFiles:    make(map[string]*os.File),
+		fileLocks:    make(map[string]string),
+		logger:       logger,
+		syncEnabled:  syncEnabled,
+		wal:          wal,
+		lockManager:  lockManager,
+		recoveryDone: false,
+		recoveryErr:  nil,
 	}
 
 	// If WAL is enabled, perform recovery on startup
 	if walEnabled && wal != nil {
 		if err := fm.recoverFromWAL(); err != nil {
-			logger.Printf("Warning: Error recovering from write-ahead log: %v", err)
+			fm.logger.Printf("Warning: Error recovering from write-ahead log: %v", err)
+			fm.recoveryErr = err
 		} else {
-			logger.Printf("Successfully recovered from write-ahead log")
+			fm.logger.Printf("Successfully recovered from write-ahead log")
 		}
+		fm.recoveryDone = true
+	} else {
+		// If WAL is not enabled, mark recovery as done
+		fm.recoveryDone = true
 	}
 
 	return fm
@@ -113,7 +123,9 @@ func (fm *FileManager) recoverFromWAL() error {
 
 // AppendToFile appends content to a file, with optional WAL logging
 func (fm *FileManager) AppendToFile(filename string, content []byte, clientID int32, token string) error {
-	return fm.AppendToFileWithRequestID(filename, content, "", clientID, token)
+	// Generate a request ID if none is provided
+	requestID := fmt.Sprintf("append_%d_%d", clientID, time.Now().UnixNano())
+	return fm.AppendToFileWithRequestID(filename, content, requestID, clientID, token)
 }
 
 // AppendToFileWithRequestID appends content to a file with request ID tracking
@@ -309,4 +321,14 @@ func (fm *FileManager) ReadFile(filename string) ([]byte, error) {
 	}
 
 	return content, nil
+}
+
+// IsRecoveryComplete returns whether WAL recovery is complete
+func (fm *FileManager) IsRecoveryComplete() bool {
+	return fm.recoveryDone
+}
+
+// GetRecoveryError returns any error that occurred during recovery
+func (fm *FileManager) GetRecoveryError() error {
+	return fm.recoveryErr
 }
