@@ -19,7 +19,7 @@ CLIENT_SRC=cmd/client/main.go
 # Directories
 BIN_DIR=bin
 DATA_DIR=data
-LOG_DIR=logs
+LOG_DIR=/home/naveen/Project/Distributed-Lock-Manager/logs
 
 # Default target
 all: clean setup build
@@ -89,6 +89,7 @@ clean-bin:
 # Clean data files
 clean-data:
 	@rm -rf $(DATA_DIR)/*
+	@rm -rf /home/naveen/Project/Distributed-Lock-Manager/internal/file_manager/data
 	@echo "Cleaned up data files"
 
 # Clean log files
@@ -104,11 +105,7 @@ deps:
 	$(GOGET) google.golang.org/grpc
 	$(GOGET) google.golang.org/protobuf/cmd/protoc-gen-go
 	$(GOGET) google.golang.org/grpc/cmd/protoc-gen-go-grpc
-
-# Generate protobuf code
-proto:
-	protoc --go_out=. --go-grpc_out=. proto/lock.proto
-
+	
 # Help
 help:
 	@echo "Available commands:"
@@ -124,6 +121,6 @@ help:
 	@echo "  make clean-logs           - Remove log files"
 	@echo "  make clean                - Remove binaries, data files, and logs"
 	@echo "  make deps                 - Install dependencies"
-	@echo "  make proto                - Generate protobuf code"
+
 
 .PHONY: all setup build build-server build-client run-server run-client run-multi-clients test-correctness test-correctness-clean clean-bin clean-data clean-logs clean deps proto help

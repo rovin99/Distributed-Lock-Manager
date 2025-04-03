@@ -1,4 +1,9 @@
 .DS_Store
-/bin/
-/data
-/logs
+# Binaries
+bin/
+
+# Data files
+data/
+
+# Logs
+/home/naveen/Project/Distributed-Lock-Manager/logs/

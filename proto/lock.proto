@@ -25,6 +25,7 @@ service LockService {
 // Client initialization arguments
 message client_init_args {
   int32 client_id = 1;
+  string request_id = 2;  // Added for request tracking
 }
 
 // Client initialization response
@@ -37,6 +38,7 @@ message client_init_response {
 message lock_args {
   int32 client_id = 1;
   string token = 2;  // Token for lock validation
+  string request_id = 3;  // Added for request tracking
 }
 
 // Lock operation response
@@ -52,6 +54,7 @@ message file_args {
   string filename = 2;
   bytes content = 3;
   string token = 4;  // Token for permission validation
+  string request_id = 5;  // Added for request tracking
 }
 
 // File operation response
@@ -64,6 +67,7 @@ message file_response {
 message lease_args {
   int32 client_id = 1;
   string token = 2;  // Token for lease validation
+  string request_id = 3;  // Added for request tracking
 }
 
 // Lease renewal response

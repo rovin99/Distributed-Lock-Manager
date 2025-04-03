@@ -1,9 +1,10 @@
-package file_manager
+package wal
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -34,19 +35,25 @@ func NewWriteAheadLog(enabled bool) (*WriteAheadLog, error) {
 		return &WriteAheadLog{enabled: false}, nil
 	}
 
-	// Create logs directory
-	if err := os.MkdirAll("logs", 0755); err != nil {
+	// Create logs directory with absolute path
+	logDir := "/home/naveen/Project/Distributed-Lock-Manager/logs"
+	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create logs directory: %v", err)
 	}
 
 	// Use current timestamp for log filename
 	timestamp := time.Now().Format("20060102-150405")
-	logPath := filepath.Join("logs", fmt.Sprintf("wal-%s.log", timestamp))
+	logPath := filepath.Join(logDir, fmt.Sprintf("wal-%s.log", timestamp))
 
 	// Open log file for writing
 	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open log file: %v", err)
+	}
+
+	// Clean up old WAL files
+	if err := cleanupOldWALFiles(logDir); err != nil {
+		log.Printf("Warning: Failed to clean up old WAL files: %v", err)
 	}
 
 	return &WriteAheadLog{
@@ -55,6 +62,28 @@ func NewWriteAheadLog(enabled bool) (*WriteAheadLog, error) {
 		logPath: logPath,
 		enabled: enabled,
 	}, nil
+}
+
+// cleanupOldWALFiles removes WAL files older than 24 hours
+func cleanupOldWALFiles(logDir string) error {
+	matches, err := filepath.Glob(filepath.Join(logDir, "wal-*.log"))
+	if err != nil {
+		return fmt.Errorf("failed to find log files: %v", err)
+	}
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, logPath := range matches {
+		info, err := os.Stat(logPath)
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			if err := os.Remove(logPath); err != nil {
+				log.Printf("Warning: Failed to remove old WAL file %s: %v", logPath, err)
+			}
+		}
+	}
+	return nil
 }
 
 // LogOperation records a file operation before it is actually performed
@@ -128,6 +157,9 @@ func (wal *WriteAheadLog) Close() error {
 // RecoverUncommittedOperations processes the log file to find uncommitted operations
 // and returns a list of operations that need to be replayed
 func RecoverUncommittedOperations(logDir string) ([]LogEntry, error) {
+	// Use absolute path for log directory
+	logDir = "/home/naveen/Project/Distributed-Lock-Manager/logs"
+
 	// Find all log files
 	matches, err := filepath.Glob(filepath.Join(logDir, "wal-*.log"))
 	if err != nil {

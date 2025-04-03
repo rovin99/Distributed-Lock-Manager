@@ -49,7 +49,7 @@ This project implements a distributed lock manager with the following components
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/Distributed-Lock-Manager.git
+https://github.com/rovin99/Distributed-Lock-Manager.git
 cd Distributed-Lock-Manager
 ```
 
@@ -171,10 +171,11 @@ The system uses gRPC with Protocol Buffers for communication. The main operation
 - `lock_release`: Release the distributed lock (with token validation)
 - `file_append`: Append data to a file (requires valid lock token)
 - `client_close`: Close the client connection
-- `renew_lease`: Renew the lock lease to prevent timeout
+- `renew_lease`: Renew the lock lease to prevent timeout (includes RequestCache for consistency)
 
 Each operation includes:
 - Unique request IDs for deduplication
 - Token validation for security
 - Retry mechanisms for reliability
 - Proper error handling and status codes
+- Request caching for idempotency and consistency across RPCs

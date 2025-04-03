@@ -18,12 +18,12 @@ import (
 
 func init() {
 	// Create logs directory if it doesn't exist
-	if err := os.MkdirAll("logs", 0755); err != nil {
+	if err := os.MkdirAll("/home/naveen/Project/Distributed-Lock-Manager/logs", 0755); err != nil {
 		log.Printf("Failed to create logs directory: %v", err)
 	}
 
 	// Redirect test logs to file
-	logFile, err := os.OpenFile(filepath.Join("logs", "filemanager_test.log"),
+	logFile, err := os.OpenFile(filepath.Join("/home/naveen/Project/Distributed-Lock-Manager/logs", "filemanager_test.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		log.Printf("Failed to open test log file: %v", err)

@@ -290,8 +290,9 @@ func (c *LockClient) retryFileAppend(operation string, rpcFunc func(context.Cont
 // renewLease sends a lease renewal request to the server
 func (c *LockClient) renewLease(token string) error {
 	args := &pb.LeaseArgs{
-		ClientId: c.id,
-		Token:    token,
+		ClientId:  c.id,
+		Token:     token,
+		RequestId: c.GenerateRequestID(),
 	}
 
 	_, err := c.retryLeaseRenewal("RenewLease", func(ctx context.Context) (*pb.LeaseResponse, error) {
@@ -308,10 +309,11 @@ func (c *LockClient) renewLease(token string) error {
 // FileAppend attempts to append content to a file
 func (c *LockClient) FileAppend(filename string, content []byte) error {
 	args := &pb.FileArgs{
-		ClientId: c.id,
-		Filename: filename,
-		Content:  content,
-		Token:    c.lockToken,
+		ClientId:  c.id,
+		Filename:  filename,
+		Content:   content,
+		Token:     c.lockToken,
+		RequestId: c.GenerateRequestID(),
 	}
 
 	_, err := c.retryFileAppend("FileAppend", func(ctx context.Context) (*pb.FileResponse, error) {
@@ -341,7 +343,8 @@ func (c *LockClient) Close() error {
 // ClientInit initializes the client with the server
 func (c *LockClient) ClientInit() error {
 	args := &pb.ClientInitArgs{
-		ClientId: c.id,
+		ClientId:  c.id,
+		RequestId: c.GenerateRequestID(),
 	}
 
 	_, err := c.retryRPC("ClientInit", func(ctx context.Context) (*pb.LockResponse, error) {
@@ -364,7 +367,8 @@ func (c *LockClient) ClientInit() error {
 // LockAcquire attempts to acquire a lock
 func (c *LockClient) LockAcquire() error {
 	args := &pb.LockArgs{
-		ClientId: c.id,
+		ClientId:  c.id,
+		RequestId: c.GenerateRequestID(),
 	}
 
 	resp, err := c.retryRPC("LockAcquire", func(ctx context.Context) (*pb.LockResponse, error) {
@@ -390,8 +394,9 @@ func (c *LockClient) LockAcquire() error {
 // LockRelease attempts to release the lock
 func (c *LockClient) LockRelease() error {
 	args := &pb.LockArgs{
-		ClientId: c.id,
-		Token:    c.lockToken,
+		ClientId:  c.id,
+		Token:     c.lockToken,
+		RequestId: c.GenerateRequestID(),
 	}
 
 	_, err := c.retryRPC("LockRelease", func(ctx context.Context) (*pb.LockResponse, error) {

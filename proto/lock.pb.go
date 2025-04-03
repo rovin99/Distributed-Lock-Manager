@@ -84,6 +84,7 @@ func (Status) EnumDescriptor() ([]byte, []int) {
 type ClientInitArgs struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ClientId      int32                  `protobuf:"varint,1,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
+	RequestId     string                 `protobuf:"bytes,2,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"` // Added for request tracking
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -123,6 +124,13 @@ func (x *ClientInitArgs) GetClientId() int32 {
 		return x.ClientId
 	}
 	return 0
+}
+
+func (x *ClientInitArgs) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
 }
 
 // Client initialization response
@@ -182,7 +190,8 @@ func (x *ClientInitResponse) GetErrorMessage() string {
 type LockArgs struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ClientId      int32                  `protobuf:"varint,1,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
-	Token         string                 `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"` // Token for lock validation
+	Token         string                 `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"`                          // Token for lock validation
+	RequestId     string                 `protobuf:"bytes,3,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"` // Added for request tracking
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -227,6 +236,13 @@ func (x *LockArgs) GetClientId() int32 {
 func (x *LockArgs) GetToken() string {
 	if x != nil {
 		return x.Token
+	}
+	return ""
+}
+
+func (x *LockArgs) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
 	}
 	return ""
 }
@@ -298,7 +314,8 @@ type FileArgs struct {
 	ClientId      int32                  `protobuf:"varint,1,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
 	Filename      string                 `protobuf:"bytes,2,opt,name=filename,proto3" json:"filename,omitempty"`
 	Content       []byte                 `protobuf:"bytes,3,opt,name=content,proto3" json:"content,omitempty"`
-	Token         string                 `protobuf:"bytes,4,opt,name=token,proto3" json:"token,omitempty"` // Token for permission validation
+	Token         string                 `protobuf:"bytes,4,opt,name=token,proto3" json:"token,omitempty"`                          // Token for permission validation
+	RequestId     string                 `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"` // Added for request tracking
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -361,6 +378,13 @@ func (x *FileArgs) GetToken() string {
 	return ""
 }
 
+func (x *FileArgs) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
 // File operation response
 type FileResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -418,7 +442,8 @@ func (x *FileResponse) GetErrorMessage() string {
 type LeaseArgs struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ClientId      int32                  `protobuf:"varint,1,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
-	Token         string                 `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"` // Token for lease validation
+	Token         string                 `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"`                          // Token for lease validation
+	RequestId     string                 `protobuf:"bytes,3,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"` // Added for request tracking
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -463,6 +488,13 @@ func (x *LeaseArgs) GetClientId() int32 {
 func (x *LeaseArgs) GetToken() string {
 	if x != nil {
 		return x.Token
+	}
+	return ""
+}
+
+func (x *LeaseArgs) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
 	}
 	return ""
 }
@@ -524,31 +556,39 @@ var File_proto_lock_proto protoreflect.FileDescriptor
 
 const file_proto_lock_proto_rawDesc = "" +
 	"\n" +
-	"\x10proto/lock.proto\x12\x04lock\"/\n" +
+	"\x10proto/lock.proto\x12\x04lock\"N\n" +
 	"\x10client_init_args\x12\x1b\n" +
-	"\tclient_id\x18\x01 \x01(\x05R\bclientId\"a\n" +
+	"\tclient_id\x18\x01 \x01(\x05R\bclientId\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x02 \x01(\tR\trequestId\"a\n" +
 	"\x14client_init_response\x12$\n" +
 	"\x06status\x18\x01 \x01(\x0e2\f.lock.StatusR\x06status\x12#\n" +
-	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\">\n" +
+	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"]\n" +
 	"\tlock_args\x12\x1b\n" +
 	"\tclient_id\x18\x01 \x01(\x05R\bclientId\x12\x14\n" +
-	"\x05token\x18\x02 \x01(\tR\x05token\"p\n" +
+	"\x05token\x18\x02 \x01(\tR\x05token\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x03 \x01(\tR\trequestId\"p\n" +
 	"\rlock_response\x12$\n" +
 	"\x06status\x18\x01 \x01(\x0e2\f.lock.StatusR\x06status\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12\x14\n" +
-	"\x05token\x18\x03 \x01(\tR\x05token\"t\n" +
+	"\x05token\x18\x03 \x01(\tR\x05token\"\x93\x01\n" +
 	"\tfile_args\x12\x1b\n" +
 	"\tclient_id\x18\x01 \x01(\x05R\bclientId\x12\x1a\n" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x12\x18\n" +
 	"\acontent\x18\x03 \x01(\fR\acontent\x12\x14\n" +
-	"\x05token\x18\x04 \x01(\tR\x05token\"Z\n" +
+	"\x05token\x18\x04 \x01(\tR\x05token\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x05 \x01(\tR\trequestId\"Z\n" +
 	"\rfile_response\x12$\n" +
 	"\x06status\x18\x01 \x01(\x0e2\f.lock.StatusR\x06status\x12#\n" +
-	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"?\n" +
+	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"^\n" +
 	"\n" +
 	"lease_args\x12\x1b\n" +
 	"\tclient_id\x18\x01 \x01(\x05R\bclientId\x12\x14\n" +
-	"\x05token\x18\x02 \x01(\tR\x05token\"[\n" +
+	"\x05token\x18\x02 \x01(\tR\x05token\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x03 \x01(\tR\trequestId\"[\n" +
 	"\x0elease_response\x12$\n" +
 	"\x06status\x18\x01 \x01(\x0e2\f.lock.StatusR\x06status\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage*g\n" +

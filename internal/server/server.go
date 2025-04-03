@@ -54,140 +54,228 @@ func (s *LockServer) ClientInit(ctx context.Context, args *pb.ClientInitArgs) (*
 func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.LockResponse, error) {
 	clientID := args.ClientId
 	token := args.Token
+	requestID := args.RequestId
 
-	s.logger.Printf("Client %d attempting to acquire lock with token %s", clientID, token)
+	s.logger.Printf("Client %d attempting to acquire lock with token %s (request: %s)", clientID, token, requestID)
+
+	// Check cache for duplicate request
+	if cachedResp, exists := s.requestCache.Get(requestID); exists {
+		s.logger.Printf("Found cached response for request %s", requestID)
+		return cachedResp.(*pb.LockResponse), nil
+	}
+
+	// Mark request as in progress
+	if !s.requestCache.MarkInProgress(requestID) {
+		s.logger.Printf("Request %s already in progress", requestID)
+		return &pb.LockResponse{
+			Status:       pb.Status_ERROR,
+			ErrorMessage: "Request already in progress",
+		}, nil
+	}
 
 	// Check if client already holds the lock (for handling retries)
 	if s.lockManager.HasLockWithToken(clientID, token) {
 		s.logger.Printf("Client %d already holds the lock with token %s", clientID, token)
-		return &pb.LockResponse{
+		resp := &pb.LockResponse{
 			Status:       pb.Status_OK,
 			ErrorMessage: "",
 			Token:        token,
-		}, nil
+		}
+		s.requestCache.Set(requestID, resp)
+		return resp, nil
 	}
 
 	// Use the context-aware acquire method with timeout
 	success, newToken := s.lockManager.AcquireWithTimeout(clientID, ctx)
 
+	var resp *pb.LockResponse
 	if success {
 		s.logger.Printf("Lock acquired by client %d with token %s", clientID, newToken)
-		return &pb.LockResponse{
+		resp = &pb.LockResponse{
 			Status:       pb.Status_OK,
 			ErrorMessage: "",
 			Token:        newToken,
-		}, nil
+		}
+	} else {
+		s.logger.Printf("Client %d failed to acquire lock", clientID)
+		resp = &pb.LockResponse{
+			Status:       pb.Status_ERROR,
+			ErrorMessage: "Failed to acquire lock",
+			Token:        "",
+		}
 	}
 
-	s.logger.Printf("Client %d failed to acquire lock", clientID)
-	return &pb.LockResponse{
-		Status:       pb.Status_ERROR,
-		ErrorMessage: "Failed to acquire lock",
-		Token:        "",
-	}, nil
+	s.requestCache.Set(requestID, resp)
+	return resp, nil
 }
 
 // LockRelease handles the lock release RPC
 func (s *LockServer) LockRelease(ctx context.Context, args *pb.LockArgs) (*pb.LockResponse, error) {
 	clientID := args.ClientId
 	token := args.Token
+	requestID := args.RequestId
 
-	s.logger.Printf("Client %d attempting to release lock with token %s", clientID, token)
+	s.logger.Printf("Client %d attempting to release lock with token %s (request: %s)", clientID, token, requestID)
+
+	// Check cache for duplicate request
+	if cachedResp, exists := s.requestCache.Get(requestID); exists {
+		s.logger.Printf("Found cached response for request %s", requestID)
+		return cachedResp.(*pb.LockResponse), nil
+	}
+
+	// Mark request as in progress
+	if !s.requestCache.MarkInProgress(requestID) {
+		s.logger.Printf("Request %s already in progress", requestID)
+		return &pb.LockResponse{
+			Status:       pb.Status_ERROR,
+			ErrorMessage: "Request already in progress",
+		}, nil
+	}
 
 	// Validate token and check lock ownership
 	if !s.lockManager.HasLockWithToken(clientID, token) {
 		s.logger.Printf("Lock release failed: client %d doesn't hold the lock with token %s", clientID, token)
-		return &pb.LockResponse{
+		resp := &pb.LockResponse{
 			Status:       pb.Status_INVALID_TOKEN,
 			ErrorMessage: "Invalid token or lock not held",
 			Token:        "",
-		}, nil
+		}
+		s.requestCache.Set(requestID, resp)
+		return resp, nil
 	}
 
 	success := s.lockManager.Release(clientID, token)
 
+	var resp *pb.LockResponse
 	if success {
 		s.logger.Printf("Lock released successfully by client %d", clientID)
-		return &pb.LockResponse{
+		resp = &pb.LockResponse{
 			Status:       pb.Status_OK,
 			ErrorMessage: "",
 			Token:        "",
-		}, nil
+		}
+	} else {
+		s.logger.Printf("Lock release failed for client %d: permission denied", clientID)
+		resp = &pb.LockResponse{
+			Status:       pb.Status_PERMISSION_DENIED,
+			ErrorMessage: "Permission denied",
+			Token:        "",
+		}
 	}
 
-	s.logger.Printf("Lock release failed for client %d: permission denied", clientID)
-	return &pb.LockResponse{
-		Status:       pb.Status_PERMISSION_DENIED,
-		ErrorMessage: "Permission denied",
-		Token:        "",
-	}, nil
+	s.requestCache.Set(requestID, resp)
+	return resp, nil
 }
 
 // FileAppend handles the file append RPC
 func (s *LockServer) FileAppend(ctx context.Context, args *pb.FileArgs) (*pb.FileResponse, error) {
 	clientID := args.ClientId
 	token := args.Token
+	requestID := args.RequestId
 
-	s.logger.Printf("Client %d attempting to append to file with token %s", clientID, token)
+	s.logger.Printf("Client %d attempting to append to file with token %s (request: %s)", clientID, token, requestID)
+
+	// Check cache for duplicate request
+	if cachedResp, exists := s.requestCache.Get(requestID); exists {
+		s.logger.Printf("Found cached response for request %s", requestID)
+		return cachedResp.(*pb.FileResponse), nil
+	}
+
+	// Mark request as in progress
+	if !s.requestCache.MarkInProgress(requestID) {
+		s.logger.Printf("Request %s already in progress", requestID)
+		return &pb.FileResponse{
+			Status:       pb.Status_ERROR,
+			ErrorMessage: "Request already in progress",
+		}, nil
+	}
 
 	// Validate token and check lock ownership
 	if !s.lockManager.HasLockWithToken(clientID, token) {
 		s.logger.Printf("File append failed: client %d doesn't hold the lock with token %s", clientID, token)
-		return &pb.FileResponse{
+		resp := &pb.FileResponse{
 			Status:       pb.Status_INVALID_TOKEN,
 			ErrorMessage: "Invalid token or lock not held",
-		}, nil
+		}
+		s.requestCache.Set(requestID, resp)
+		return resp, nil
 	}
 
 	// Process the file append
 	err := s.fileManager.AppendToFile(args.Filename, args.Content, clientID, token)
 
+	var resp *pb.FileResponse
 	if err != nil {
 		s.logger.Printf("File append error: %v", err)
-		return &pb.FileResponse{
+		resp = &pb.FileResponse{
 			Status:       pb.Status_ERROR,
 			ErrorMessage: err.Error(),
-		}, nil
+		}
+	} else {
+		s.logger.Printf("File append successful for client %d", clientID)
+		resp = &pb.FileResponse{
+			Status:       pb.Status_OK,
+			ErrorMessage: "",
+		}
 	}
 
-	s.logger.Printf("File append successful for client %d", clientID)
-	return &pb.FileResponse{
-		Status:       pb.Status_OK,
-		ErrorMessage: "",
-	}, nil
+	s.requestCache.Set(requestID, resp)
+	return resp, nil
 }
 
 // RenewLease handles the lease renewal RPC
 func (s *LockServer) RenewLease(ctx context.Context, args *pb.LeaseArgs) (*pb.LeaseResponse, error) {
 	clientID := args.ClientId
 	token := args.Token
+	requestID := args.RequestId
 
-	s.logger.Printf("Client %d attempting to renew lease with token %s", clientID, token)
+	s.logger.Printf("Client %d attempting to renew lease with token %s (request: %s)", clientID, token, requestID)
+
+	// Check cache for duplicate request
+	if cachedResp, exists := s.requestCache.Get(requestID); exists {
+		s.logger.Printf("Found cached response for request %s", requestID)
+		return cachedResp.(*pb.LeaseResponse), nil
+	}
+
+	// Mark request as in progress
+	if !s.requestCache.MarkInProgress(requestID) {
+		s.logger.Printf("Request %s already in progress", requestID)
+		return &pb.LeaseResponse{
+			Status:       pb.Status_ERROR,
+			ErrorMessage: "Request already in progress",
+		}, nil
+	}
 
 	// Validate token and check lock ownership
 	if !s.lockManager.HasLockWithToken(clientID, token) {
 		s.logger.Printf("Lease renewal failed: client %d doesn't hold the lock with token %s", clientID, token)
-		return &pb.LeaseResponse{
+		resp := &pb.LeaseResponse{
 			Status:       pb.Status_INVALID_TOKEN,
 			ErrorMessage: "Invalid token or lock not held",
-		}, nil
+		}
+		s.requestCache.Set(requestID, resp)
+		return resp, nil
 	}
 
 	success := s.lockManager.RenewLease(clientID, token)
 
+	var resp *pb.LeaseResponse
 	if success {
 		s.logger.Printf("Lease renewed successfully for client %d", clientID)
-		return &pb.LeaseResponse{
+		resp = &pb.LeaseResponse{
 			Status:       pb.Status_OK,
 			ErrorMessage: "",
-		}, nil
+		}
+	} else {
+		s.logger.Printf("Lease renewal failed for client %d", clientID)
+		resp = &pb.LeaseResponse{
+			Status:       pb.Status_ERROR,
+			ErrorMessage: "Failed to renew lease",
+		}
 	}
 
-	s.logger.Printf("Lease renewal failed for client %d", clientID)
-	return &pb.LeaseResponse{
-		Status:       pb.Status_ERROR,
-		ErrorMessage: "Failed to renew lease",
-	}, nil
+	s.requestCache.Set(requestID, resp)
+	return resp, nil
 }
 
 // ClientClose handles the client close RPC

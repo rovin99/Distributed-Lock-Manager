@@ -2,6 +2,7 @@ package file_manager
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -10,16 +11,17 @@ import (
 	"sync"
 
 	"Distributed-Lock-Manager/internal/lock_manager"
+	"Distributed-Lock-Manager/internal/wal"
 )
 
 // FileManager handles all file-related operations
 type FileManager struct {
-	openFiles   map[string]*os.File    // Tracks open file handles
-	fileLocks   map[string]*sync.Mutex // Per-file mutexes for concurrency
-	mu          sync.Mutex             // Protects maps
+	openFiles   map[string]*os.File // Tracks open file handles
+	fileLocks   map[string]string   // maps filename to lock token
+	mu          sync.RWMutex        // Protects maps
 	logger      *log.Logger
 	syncEnabled bool                      // Toggle for fsync after writes
-	wal         *WriteAheadLog            // Write-ahead log for crash recovery
+	wal         *wal.WriteAheadLog        // Write-ahead log for crash recovery
 	lockManager *lock_manager.LockManager // Reference to lock manager for token validation
 }
 
@@ -33,7 +35,7 @@ func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool, lockManager *lock_
 	logger := log.New(os.Stdout, "[FileManager] ", log.LstdFlags)
 
 	// Initialize the write-ahead log
-	wal, err := NewWriteAheadLog(walEnabled)
+	wal, err := wal.NewWriteAheadLog(walEnabled)
 	if err != nil {
 		logger.Printf("Warning: Failed to initialize write-ahead log: %v", err)
 		logger.Printf("Continuing without write-ahead logging")
@@ -41,7 +43,7 @@ func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool, lockManager *lock_
 
 	fm := &FileManager{
 		openFiles:   make(map[string]*os.File),
-		fileLocks:   make(map[string]*sync.Mutex),
+		fileLocks:   make(map[string]string),
 		logger:      logger,
 		syncEnabled: syncEnabled,
 		wal:         wal,
@@ -52,6 +54,8 @@ func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool, lockManager *lock_
 	if walEnabled && wal != nil {
 		if err := fm.recoverFromWAL(); err != nil {
 			logger.Printf("Warning: Error recovering from write-ahead log: %v", err)
+		} else {
+			logger.Printf("Successfully recovered from write-ahead log")
 		}
 	}
 
@@ -76,7 +80,7 @@ func (fm *FileManager) recoverFromWAL() error {
 	fm.logger.Printf("Attempting to recover from write-ahead log")
 
 	// Find uncommitted operations
-	uncommitted, err := RecoverUncommittedOperations("logs")
+	uncommitted, err := wal.RecoverUncommittedOperations("logs")
 	if err != nil {
 		return fmt.Errorf("failed to recover operations: %v", err)
 	}
@@ -90,7 +94,7 @@ func (fm *FileManager) recoverFromWAL() error {
 		// During recovery, we don't validate tokens since the lock state
 		// might not be fully recovered yet. The lock manager will handle
 		// any inconsistencies when it recovers its own state.
-		if err := fm.appendToFileInternal(entry.Filename, entry.Content, false); err != nil {
+		if err := fm.appendToFileInternal(entry.Filename, entry.Content, true); err != nil {
 			fm.logger.Printf("Error replaying operation: %v", err)
 			// Continue with other operations even if one fails
 			continue
@@ -171,20 +175,7 @@ func (fm *FileManager) appendToFileInternal(filename string, content []byte, for
 		return err
 	}
 
-	// Get or create a mutex for this file
-	fm.mu.Lock()
-	if _, exists := fm.fileLocks[fullPath]; !exists {
-		fm.fileLocks[fullPath] = &sync.Mutex{}
-	}
-	fileMutex := fm.fileLocks[fullPath]
-	fm.mu.Unlock()
-
 	// Lock this specific file for writing
-	fileMutex.Lock()
-	defer fileMutex.Unlock()
-
-	// Get or open the file
-	var f *os.File
 	fm.mu.Lock()
 	f, exists := fm.openFiles[fullPath]
 	if !exists {
@@ -236,32 +227,47 @@ func (fm *FileManager) CreateFiles() {
 	}
 
 	for i := 0; i < 100; i++ {
-		filename := fmt.Sprintf("data/file_%d", i)
+		filename := fmt.Sprintf("file_%d", i)
 		// Create file only if it doesn't exist
-		if _, err := os.Stat(filename); os.IsNotExist(err) {
-			f, err := os.Create(filename)
+		if _, err := os.Stat(filepath.Join("data", filename)); os.IsNotExist(err) {
+			// Log the file creation operation if WAL is enabled
+			if fm.wal != nil {
+				requestID := fmt.Sprintf("create_file_%d", i)
+				if err := fm.wal.LogOperation(requestID, filename, []byte{}); err != nil {
+					fm.logger.Printf("Warning: Failed to log file creation to WAL: %v", err)
+				}
+			}
+
+			f, err := os.Create(filepath.Join("data", filename))
 			if err != nil {
 				fm.logger.Fatalf("Failed to create file %s: %v", filename, err)
 			}
 			f.Close()
+
+			// Mark the operation as committed if WAL is enabled
+			if fm.wal != nil {
+				requestID := fmt.Sprintf("create_file_%d", i)
+				if err := fm.wal.MarkCommitted(requestID); err != nil {
+					fm.logger.Printf("Warning: Failed to mark file creation as committed: %v", err)
+				}
+			}
+
 			fm.logger.Printf("Created file: %s", filename)
 		}
 	}
-
-	fm.logger.Printf("All files created successfully")
 }
 
-// Cleanup closes any open files
+// Cleanup closes all open files and cleans up resources
 func (fm *FileManager) Cleanup() {
-	// Close all open file handles
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	for name, file := range fm.openFiles {
-		if err := file.Close(); err != nil {
-			fm.logger.Printf("Error closing file %s: %v", name, err)
+	// Close all open files
+	for path, f := range fm.openFiles {
+		if err := f.Close(); err != nil {
+			fm.logger.Printf("Error closing file %s: %v", path, err)
 		}
-		delete(fm.openFiles, name)
+		delete(fm.openFiles, path)
 	}
 
 	// Close the write-ahead log if it exists
@@ -271,5 +277,36 @@ func (fm *FileManager) Cleanup() {
 		}
 	}
 
-	fm.logger.Println("File manager cleanup complete")
+	// Clear the maps
+	fm.openFiles = make(map[string]*os.File)
+	fm.fileLocks = make(map[string]string)
+}
+
+// ReadFile reads the entire content of a file
+func (fm *FileManager) ReadFile(filename string) ([]byte, error) {
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+
+	file, exists := fm.openFiles[filename]
+	if !exists {
+		filepath := filepath.Join("data", filename)
+		var err error
+		file, err = os.Open(filepath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open file %s: %v", filename, err)
+		}
+		fm.openFiles[filename] = file
+	}
+
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file %s: %v", filename, err)
+	}
+
+	// Reset file pointer for future reads
+	if _, err := file.Seek(0, 0); err != nil {
+		return nil, fmt.Errorf("failed to reset file pointer: %v", err)
+	}
+
+	return content, nil
 }
