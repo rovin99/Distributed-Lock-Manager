@@ -14,52 +14,54 @@ func main() {
 	port := flag.Int("port", 50051, "The server port")
 	flag.Parse()
 
-	// Default values
-	clientID := int32(1)
-	message := "Hello, World!"
-
-	// Parse remaining command-line arguments if provided
+	// Check for required arguments: at least client ID and message
 	args := flag.Args()
-	if len(args) > 0 {
-		id, err := strconv.Atoi(args[0])
-		if err == nil {
-			clientID = int32(id)
-		}
-	}
-	if len(args) > 1 {
-		message = args[1]
+	if len(args) < 2 {
+		log.Fatalf("Usage: %s -port <port> <client_id> <message> [file_name]", flag.CommandLine.Name())
 	}
 
-	// Create server address using the port
+	// Parse client ID
+	clientID, err := strconv.Atoi(args[0])
+	if err != nil {
+		log.Fatalf("Invalid client ID: %v", err)
+	}
+
+	message := args[1] // Required
+	fileName := "file_0"
+	if len(args) >= 3 {
+		fileName = args[2]
+	}
+
+	// Create server address
 	serverAddr := fmt.Sprintf("localhost:%d", *port)
 
-	// Create a new client with the specified ID and server address
-	c, err := client.NewLockClient(serverAddr, clientID)
+	// Create client
+	c, err := client.NewLockClient(serverAddr, int32(clientID))
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
 	defer c.Close()
 
-	// Step 1: Initialize the client
+	// Initialize client
 	if err := c.ClientInit(); err != nil {
 		log.Fatalf("Failed to initialize client: %v", err)
 	}
 	fmt.Printf("Client %d initialized successfully\n", clientID)
 
-	// Step 2: Acquire the lock
+	// Acquire lock
 	if err := c.LockAcquire(); err != nil {
 		log.Fatalf("Failed to acquire lock: %v", err)
 	}
 	fmt.Printf("Client %d acquired lock successfully\n", clientID)
 
-	// Step 3: Append data to a file
+	// Append to file
 	content := fmt.Sprintf("%s from client %d\n", message, clientID)
-	if err := c.FileAppend("file_0", []byte(content)); err != nil {
+	if err := c.FileAppend(fileName, []byte(content)); err != nil {
 		log.Fatalf("Failed to append to file: %v", err)
 	}
-	fmt.Printf("Client %d appended to file successfully\n", clientID)
+	fmt.Printf("Client %d appended to file '%s' successfully\n", clientID, fileName)
 
-	// Step 4: Release the lock
+	// Release lock
 	if err := c.LockRelease(); err != nil {
 		log.Fatalf("Failed to release lock: %v", err)
 	}

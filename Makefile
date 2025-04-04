@@ -51,35 +51,9 @@ run-client: build-client setup
 
 # Run multiple clients concurrently
 run-multi-clients: build-client setup
-	@echo "Running 5 clients concurrently..."
-	@mkdir -p $(LOG_DIR)/multi_clients
-	@for i in 1 2 3 4 5; do \
-	    ($(CLIENT_BIN) -port $(PORT) $$i "Client $$i writing" > $(LOG_DIR)/multi_clients/client_$$i.log 2>&1) & \
-	done
-	@echo "Waiting for all clients to complete..."
-	@wait
-	@echo "All clients completed"
-	@echo "Output logs available in $(LOG_DIR)/multi_clients/"
-	@cat $(LOG_DIR)/multi_clients/client_*.log > $(LOG_DIR)/multi_clients/combined.log
-	@echo "Combined log available at $(LOG_DIR)/multi_clients/combined.log"
+	@echo "Running clients using run.sh..."
+	bash run.sh
 
-# Test correctness with multiple clients writing to the same file
-test-correctness: build-client setup
-	@echo "Testing correctness with multiple clients..."
-	@touch $(DATA_DIR)/file_0
-	@echo "Starting correctness test (appending to existing file)..."
-	@mkdir -p $(LOG_DIR)/test_correctness
-	@for i in 1 2 3 4 5; do \
-	    $(CLIENT_BIN) -port $(PORT) $$i "Client $$i writing" > $(LOG_DIR)/test_correctness/client_$$i.log 2>&1 & \
-	done
-	@echo "Waiting for all clients to complete..."
-	@wait
-	@echo "All clients completed"
-	@echo "Contents of file_0:"
-	@cat $(DATA_DIR)/file_0
-	@echo "Client logs available in $(LOG_DIR)/test_correctness/"
-	@cat $(LOG_DIR)/test_correctness/client_*.log > $(LOG_DIR)/test_correctness/combined.log
-	@echo "Combined log available at $(LOG_DIR)/test_correctness/combined.log"
 
 # Clean up
 clean-bin:
@@ -89,7 +63,6 @@ clean-bin:
 # Clean data files
 clean-data:
 	@rm -rf $(DATA_DIR)/*
-	@rm -rf /home/naveen/Project/Distributed-Lock-Manager/internal/file_manager/data
 	@echo "Cleaned up data files"
 
 # Clean log files
@@ -114,8 +87,6 @@ help:
 	@echo "  make run-server           - Run the server from binary"
 	@echo "  make run-client           - Run the client from binary"
 	@echo "  make run-multi-clients    - Run multiple clients concurrently and wait for completion"
-	@echo "  make test-correctness     - Test lock correctness with multiple clients (append to existing file)"
-	@echo "  make test-correctness-clean - Test lock correctness with multiple clients (clean start)"
 	@echo "  make clean-bin            - Remove binaries"
 	@echo "  make clean-data           - Remove data files"
 	@echo "  make clean-logs           - Remove log files"
