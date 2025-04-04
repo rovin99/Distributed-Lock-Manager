@@ -6,4 +6,4 @@ bin/
 data/
 
 # Logs
-/home/naveen/Project/Distributed-Lock-Manager/logs/
+logs/
