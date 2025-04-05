@@ -47,7 +47,7 @@ run-server: build-server setup
 
 # Run the client with optional PORT
 run-client: build-client setup
-	@$(CLIENT_BIN) $(if $(PORT),-port $(PORT)) 2>&1 | tee $(LOG_DIR)/client.log
+	@$(CLIENT_BIN) $(if $(PORT),-port $(PORT)) 1 "Hello from client 1" 2>&1 | tee $(LOG_DIR)/client.log
 
 # Run multiple clients concurrently
 run-multi-clients: build-client setup

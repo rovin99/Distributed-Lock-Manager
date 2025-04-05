@@ -139,6 +139,7 @@ func (wal *WriteAheadLog) MarkCommitted(requestID string) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
+	// Create a commit marker with the same requestID
 	entry := LogEntry{
 		Timestamp: time.Now(),
 		Type:      EntryTypeCommit,
@@ -253,4 +254,14 @@ func RecoverUncommittedOperations(logDir string) ([]LogEntry, error) {
 	}
 
 	return result, nil
+}
+
+// contains checks if a string slice contains a specific string
+func contains(slice []string, str string) bool {
+	for _, s := range slice {
+		if s == str {
+			return true
+		}
+	}
+	return false
 }
