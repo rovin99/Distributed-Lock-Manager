@@ -14,10 +14,10 @@ func main() {
 	port := flag.Int("port", 50051, "The server port")
 	flag.Parse()
 
-	// Check for required arguments: at least client ID and message
+	// Check for required arguments: at least client ID
 	args := flag.Args()
-	if len(args) < 2 {
-		log.Fatalf("Usage: %s -port <port> <client_id> <message> [file_name]", flag.CommandLine.Name())
+	if len(args) < 1 {
+		log.Fatalf("Usage: %s -port <port> <client_id> [message] [file_name]", flag.CommandLine.Name())
 	}
 
 	// Parse client ID
@@ -26,11 +26,18 @@ func main() {
 		log.Fatalf("Invalid client ID: %v", err)
 	}
 
-	message := args[1] // Required
+	// Set default message if not provided
+	message := "Hello, World!"
+	if len(args) >= 2 {
+		message = args[1]
+	}
+
+	// Set default file name if not provided
 	fileName := "file_0"
 	if len(args) >= 3 {
 		fileName = args[2]
 	}
+
 
 	// Create server address
 	serverAddr := fmt.Sprintf("localhost:%d", *port)
