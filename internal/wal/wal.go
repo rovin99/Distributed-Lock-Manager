@@ -1,6 +1,9 @@
 package wal
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,6 +32,33 @@ type LogEntry struct {
 	// Fields specific to OP type
 	Filename string `json:"filename,omitempty"`
 	Content  []byte `json:"content,omitempty"`
+
+	// Checksum for data integrity
+	Checksum string `json:"checksum,omitempty"`
+}
+
+// computeChecksum calculates a SHA-256 checksum for the entry
+func (entry *LogEntry) computeChecksum() string {
+	h := sha256.New()
+	h.Write([]byte(entry.RequestID))
+	h.Write([]byte(entry.Type))
+	ts := make([]byte, 8)
+	binary.LittleEndian.PutUint64(ts, uint64(entry.Timestamp.UnixNano()))
+	h.Write(ts)
+	h.Write([]byte(entry.Filename))
+	h.Write(entry.Content)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// validateChecksum verifies the entry's integrity with its checksum
+func (entry *LogEntry) validateChecksum() bool {
+	stored := entry.Checksum
+	if stored == "" {
+		return false // No checksum to validate
+	}
+
+	computed := entry.computeChecksum()
+	return computed == stored
 }
 
 // WriteAheadLog implements a simple write-ahead logging system for file operations
@@ -118,6 +148,9 @@ func (wal *WriteAheadLog) LogOperation(requestID, filename string, content []byt
 		Content:   content,
 	}
 
+	// Compute and add the checksum
+	entry.Checksum = entry.computeChecksum()
+
 	if err := wal.encoder.Encode(entry); err != nil {
 		return fmt.Errorf("failed to write log entry: %v", err)
 	}
@@ -139,12 +172,14 @@ func (wal *WriteAheadLog) MarkCommitted(requestID string) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
-	// Create a commit marker with the same requestID
 	entry := LogEntry{
 		Timestamp: time.Now(),
 		Type:      EntryTypeCommit,
 		RequestID: requestID,
 	}
+
+	// Compute and add the checksum
+	entry.Checksum = entry.computeChecksum()
 
 	if err := wal.encoder.Encode(entry); err != nil {
 		return fmt.Errorf("failed to write commit log entry: %v", err)
@@ -207,6 +242,8 @@ func RecoverUncommittedOperations(logDir string) ([]LogEntry, error) {
 	// Preserve commit order
 	orderedCommitIDs := []string{}
 
+	var corruptedEntries int
+
 	// Process each log file
 	for _, logPath := range matches {
 		file, err := os.Open(logPath)
@@ -225,6 +262,13 @@ func RecoverUncommittedOperations(logDir string) ([]LogEntry, error) {
 				return nil, fmt.Errorf("failed to decode log entry: %v", err)
 			}
 
+			// Validate entry checksum
+			if !entry.validateChecksum() {
+				log.Printf("Warning: Corrupted log entry detected for request %s - skipping", entry.RequestID)
+				corruptedEntries++
+				continue
+			}
+
 			switch entry.Type {
 			case EntryTypeOperation:
 				// Store the latest operation details for this request ID
@@ -239,6 +283,10 @@ func RecoverUncommittedOperations(logDir string) ([]LogEntry, error) {
 		}
 
 		file.Close()
+	}
+
+	if corruptedEntries > 0 {
+		log.Printf("Warning: %d corrupted log entries were detected and skipped during recovery", corruptedEntries)
 	}
 
 	// Build the list of committed operations that need to be checked

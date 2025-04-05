@@ -2,6 +2,7 @@
 package wal
 
 import (
+	"bytes"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -166,6 +167,83 @@ func TestRecovery(t *testing.T) {
 	}
 
 	assert.True(t, found1 && found2, "Should find both committed operations")
+}
+
+// TestWALChecksums tests the checksums functionality of the WAL
+func TestWALChecksums(t *testing.T) {
+	// Setup a temporary directory for tests
+	testDir, err := ioutil.TempDir("", "wal-checksum-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(testDir)
+
+	// Set up the logs directory environment variable
+	originalLogsDir := os.Getenv("WAL_LOG_DIR")
+	os.Setenv("WAL_LOG_DIR", testDir)
+	defer os.Setenv("WAL_LOG_DIR", originalLogsDir)
+
+	t.Run("Checksum Creation and Validation", func(t *testing.T) {
+		// Create a log entry
+		entry := LogEntry{
+			Timestamp: time.Now(),
+			Type:      EntryTypeOperation,
+			RequestID: "test_request_1",
+			Filename:  "file.txt",
+			Content:   []byte("test content"),
+		}
+
+		// Compute checksum
+		entry.Checksum = entry.computeChecksum()
+
+		// Verify checksum validation
+		assert.True(t, entry.validateChecksum())
+
+		// Corrupt the entry and verify checksum fails
+		entry.Content = []byte("corrupted content")
+		assert.False(t, entry.validateChecksum())
+	})
+
+	t.Run("WAL with Checksums", func(t *testing.T) {
+		// Create a new WAL
+		wal, err := NewWriteAheadLog(true)
+		require.NoError(t, err)
+
+		// Log some operations
+		err = wal.LogOperation("req1", "file.txt", []byte("data1"))
+		require.NoError(t, err)
+
+		err = wal.MarkCommitted("req1")
+		require.NoError(t, err)
+
+		wal.Close()
+
+		// Manually corrupt an entry in the WAL file
+		files, err := filepath.Glob(filepath.Join(testDir, "wal-*.log"))
+		require.NoError(t, err)
+		require.Len(t, files, 1)
+
+		// Read the file, replace the first entry's checksum
+		data, err := ioutil.ReadFile(files[0])
+		require.NoError(t, err)
+
+		// Replace a portion of the checksum to corrupt it
+		corruptedData := []byte(string(data))
+		checksumIdx := bytes.Index(corruptedData, []byte("\"checksum\":"))
+		require.NotEqual(t, -1, checksumIdx)
+		// Find the actual checksum value
+		checksumStart := bytes.Index(corruptedData[checksumIdx:], []byte("\"")) + checksumIdx + 1
+
+		// Corrupt one character of the checksum
+		corruptedData[checksumStart+5] = 'X'
+
+		// Write back the corrupted file
+		err = ioutil.WriteFile(files[0], corruptedData, 0644)
+		require.NoError(t, err)
+
+		// Now try to recover and verify the corrupt entry is skipped
+		recoveredOps, err := RecoverUncommittedOperations(testDir)
+		require.NoError(t, err)
+		require.Empty(t, recoveredOps, "Corrupted entry should be skipped")
+	})
 }
 
 // --- wal.go Modifications (If needed for testing) ---

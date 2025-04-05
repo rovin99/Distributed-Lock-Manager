@@ -16,11 +16,13 @@ import (
 
 // Constants for retry mechanism
 const (
-	initialTimeout  = 2 * time.Second  // Initial timeout per attempt
-	initialBackoff  = 2 * time.Second  // Initial backoff delay
-	maxRetries      = 5                // Maximum retry attempts
-	leaseRenewalInt = 10 * time.Second // Lease renewal interval
+	initialTimeout = 2 * time.Second // Initial timeout per attempt
+	initialBackoff = 2 * time.Second // Initial backoff delay
+	maxRetries     = 5               // Maximum retry attempts
 )
+
+// Variable for lease renewal
+var leaseRenewalInt = 10 * time.Second // Lease renewal interval
 
 // LockClient wraps the gRPC client functionality
 type LockClient struct {
@@ -380,11 +382,8 @@ func (c *LockClient) FileAppend(filename string, content []byte) error {
 		return c.client.FileAppend(ctx, args)
 	})
 
-	if err != nil {
-		return fmt.Errorf("file append failed: %v", err)
-	}
-
-	return nil
+	// Return the original error to preserve the error type
+	return err
 }
 
 // Close closes the client connection
