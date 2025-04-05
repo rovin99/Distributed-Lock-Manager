@@ -7,11 +7,20 @@ import (
 	"time"
 )
 
-func TestWriteAheadLogging(t *testing.T) {
-	// First ensure logs directory exists
-	if err := os.MkdirAll("logs", 0755); err != nil {
-		t.Fatalf("Failed to create logs directory: %v", err)
+// cleanupLogs removes all WAL files from the logs directory
+func cleanupLogs(t *testing.T) {
+	logDir := "logs"
+	if err := os.RemoveAll(logDir); err != nil {
+		t.Fatalf("Failed to clean up logs directory: %v", err)
 	}
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		t.Fatalf("Failed to recreate logs directory: %v", err)
+	}
+}
+
+func TestWriteAheadLogging(t *testing.T) {
+	// Clean up any existing logs before starting the test
+	cleanupLogs(t)
 
 	// Create a test WAL
 	wal, err := NewWriteAheadLog(true)
@@ -88,10 +97,10 @@ func TestWriteAheadLogging(t *testing.T) {
 }
 
 func TestRecovery(t *testing.T) {
-	// First ensure logs directory exists
-	if err := os.MkdirAll("logs", 0755); err != nil {
-		t.Fatalf("Failed to create logs directory: %v", err)
-	}
+	// Clean up any existing logs before starting the test
+	cleanupLogs(t)
+
+	t.Log("Starting TestRecovery")
 
 	// Create a test WAL
 	wal, err := NewWriteAheadLog(true)
@@ -99,6 +108,8 @@ func TestRecovery(t *testing.T) {
 		t.Fatalf("Failed to create WAL: %v", err)
 	}
 	defer wal.Close()
+
+	t.Log("Created WAL successfully")
 
 	// Log multiple operations without committing
 	operations := []struct {
@@ -111,24 +122,29 @@ func TestRecovery(t *testing.T) {
 		{"op3", "file_1", []byte("operation 3")},
 	}
 
+	t.Logf("Logging %d operations", len(operations))
 	for _, op := range operations {
 		if err := wal.LogOperation(op.requestID, op.filename, op.data); err != nil {
 			t.Fatalf("Failed to log operation %s: %v", op.requestID, err)
 		}
+		t.Logf("Logged operation: %s", op.requestID)
 	}
 
 	// Recover uncommitted operations
+	t.Log("Recovering uncommitted operations")
 	uncommitted, err := RecoverUncommittedOperations("logs")
 	if err != nil {
 		t.Fatalf("Failed to recover operations: %v", err)
 	}
 
 	// Verify all operations were recovered
+	t.Logf("Recovered %d uncommitted operations", len(uncommitted))
 	if len(uncommitted) != len(operations) {
 		t.Errorf("Expected %d uncommitted operations, got %d", len(operations), len(uncommitted))
 	}
 
 	// Verify operation contents
+	t.Log("Verifying operation contents")
 	for i, op := range operations {
 		if uncommitted[i].RequestID != op.requestID {
 			t.Errorf("RequestID mismatch at index %d. Expected: %s, Got: %s", i, op.requestID, uncommitted[i].RequestID)
@@ -140,4 +156,6 @@ func TestRecovery(t *testing.T) {
 			t.Errorf("Content mismatch at index %d. Expected: %s, Got: %s", i, op.data, uncommitted[i].Content)
 		}
 	}
+
+	t.Log("TestRecovery completed successfully")
 }

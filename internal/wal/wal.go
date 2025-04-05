@@ -124,10 +124,13 @@ func (wal *WriteAheadLog) MarkCommitted(requestID string) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
+	// Create a commit marker with the same requestID
 	entry := LogEntry{
 		Timestamp: time.Now(),
 		RequestID: requestID,
 		Committed: true,
+		Filename:  "",  // Empty filename to indicate this is a commit marker
+		Content:   nil, // Empty content to indicate this is a commit marker
 	}
 
 	if err := wal.encoder.Encode(entry); err != nil {
@@ -157,13 +160,17 @@ func (wal *WriteAheadLog) Close() error {
 // RecoverUncommittedOperations processes the log file to find uncommitted operations
 // and returns a list of operations that need to be replayed
 func RecoverUncommittedOperations(logDir string) ([]LogEntry, error) {
-	// Use the provided log directory path as is
 	matches, err := filepath.Glob(filepath.Join(logDir, "wal-*.log"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to find log files: %v", err)
 	}
 
-	uncommitted := make(map[string]LogEntry)
+	// Use a map to track committed operations
+	committed := make(map[string]bool)
+	// Use a map to store the latest version of each operation
+	operations := make(map[string]LogEntry)
+	// Use a slice to maintain operation order
+	var operationOrder []string
 
 	// Process each log file
 	for _, logPath := range matches {
@@ -183,23 +190,40 @@ func RecoverUncommittedOperations(logDir string) ([]LogEntry, error) {
 				return nil, fmt.Errorf("failed to decode log entry: %v", err)
 			}
 
-			// If this is a commit marker, remove the operation from uncommitted
+			// If this is a commit marker, mark the operation as committed
 			if entry.Committed {
-				delete(uncommitted, entry.RequestID)
-			} else {
-				// Otherwise, add/update the operation in uncommitted
-				uncommitted[entry.RequestID] = entry
+				committed[entry.RequestID] = true
+			} else if entry.Filename != "" && entry.Content != nil {
+				// This is a full operation entry, store it
+				operations[entry.RequestID] = entry
+				// Only add to order if we haven't seen this operation before
+				if !contains(operationOrder, entry.RequestID) {
+					operationOrder = append(operationOrder, entry.RequestID)
+				}
 			}
 		}
 
 		file.Close()
 	}
 
-	// Convert map values to slice
-	result := make([]LogEntry, 0, len(uncommitted))
-	for _, entry := range uncommitted {
-		result = append(result, entry)
+	// Filter out committed operations while maintaining order
+	result := make([]LogEntry, 0, len(operations))
+	for _, requestID := range operationOrder {
+		entry := operations[requestID]
+		if !committed[entry.RequestID] {
+			result = append(result, entry)
+		}
 	}
 
 	return result, nil
+}
+
+// contains checks if a string slice contains a specific string
+func contains(slice []string, str string) bool {
+	for _, s := range slice {
+		if s == str {
+			return true
+		}
+	}
+	return false
 }
