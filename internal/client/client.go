@@ -201,7 +201,7 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 				c.lockToken = ""
 				c.mu.Unlock()
 				c.stopLeaseRenewal()
-				return nil, fmt.Errorf("invalid token, lock lost")
+				return nil, &InvalidTokenError{Message: "token validation failed"}
 			}
 		}
 
@@ -218,7 +218,23 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 		time.Sleep(backoff)
 	}
 
-	return nil, fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
+	// If we've exhausted retries, the server is likely down
+	// For certain operations, we should invalidate the lock state when server is unreachable
+	if operation == "LockAcquire" || operation == "LockRelease" || operation == "RenewLease" {
+		c.mu.Lock()
+		// If this was a lock release and we couldn't reach the server, assume lock is released
+		// Since the server is unreachable, we can't hold the lock anymore
+		c.hasLock = false
+		c.lockToken = ""
+		c.mu.Unlock()
+		c.stopLeaseRenewal()
+	}
+
+	return nil, &ServerUnavailableError{
+		Operation: operation,
+		Attempts:  maxRetries,
+		LastError: lastErr,
+	}
 }
 
 // retryLeaseRenewal is a specialized version for lease renewal
@@ -238,6 +254,17 @@ func (c *LockClient) retryLeaseRenewal(operation string, rpcFunc func(context.Co
 			lastErr = fmt.Errorf("%s failed: %v", operation, err)
 		} else {
 			lastErr = fmt.Errorf("%s failed with status: %v", operation, resp.Status)
+
+			// Handle invalid token errors
+			if resp.Status == pb.Status_INVALID_TOKEN {
+				c.mu.Lock()
+				c.hasLock = false
+				c.lockToken = ""
+				c.mu.Unlock()
+				c.stopLeaseRenewal()
+				cancel()
+				return nil, &InvalidTokenError{Message: "token validation failed during lease renewal"}
+			}
 		}
 
 		cancel()
@@ -251,7 +278,18 @@ func (c *LockClient) retryLeaseRenewal(operation string, rpcFunc func(context.Co
 		time.Sleep(backoff)
 	}
 
-	return nil, fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
+	// If lease renewal fails after max retries, we should invalidate the lock
+	c.mu.Lock()
+	c.hasLock = false
+	c.lockToken = ""
+	c.mu.Unlock()
+	c.stopLeaseRenewal()
+
+	return nil, &ServerUnavailableError{
+		Operation: operation,
+		Attempts:  maxRetries,
+		LastError: lastErr,
+	}
 }
 
 // retryFileAppend is a specialized version for file append
@@ -271,6 +309,17 @@ func (c *LockClient) retryFileAppend(operation string, rpcFunc func(context.Cont
 			lastErr = fmt.Errorf("%s failed: %v", operation, err)
 		} else {
 			lastErr = fmt.Errorf("%s failed with status: %v", operation, resp.Status)
+
+			// Handle invalid token errors
+			if resp.Status == pb.Status_INVALID_TOKEN {
+				c.mu.Lock()
+				c.hasLock = false
+				c.lockToken = ""
+				c.mu.Unlock()
+				c.stopLeaseRenewal()
+				cancel()
+				return nil, &InvalidTokenError{Message: "token validation failed during file operation"}
+			}
 		}
 
 		cancel()
@@ -284,7 +333,18 @@ func (c *LockClient) retryFileAppend(operation string, rpcFunc func(context.Cont
 		time.Sleep(backoff)
 	}
 
-	return nil, fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
+	// For file operations, we should also invalidate the lock if server is unreachable
+	c.mu.Lock()
+	c.hasLock = false
+	c.lockToken = ""
+	c.mu.Unlock()
+	c.stopLeaseRenewal()
+
+	return nil, &ServerUnavailableError{
+		Operation: operation,
+		Attempts:  maxRetries,
+		LastError: lastErr,
+	}
 }
 
 // renewLease sends a lease renewal request to the server
@@ -376,7 +436,8 @@ func (c *LockClient) LockAcquire() error {
 	})
 
 	if err != nil {
-		return fmt.Errorf("lock acquisition failed: %v", err)
+		// Server unavailable or invalid token errors are already handled by retryRPC
+		return err
 	}
 
 	// Update client state with the new token
@@ -404,7 +465,9 @@ func (c *LockClient) LockRelease() error {
 	})
 
 	if err != nil {
-		return fmt.Errorf("lock release failed: %v", err)
+		// For server unavailability during release, we've already invalidated our lock state
+		// in the retryRPC function. Just return the error for application handling.
+		return err
 	}
 
 	// Update client state

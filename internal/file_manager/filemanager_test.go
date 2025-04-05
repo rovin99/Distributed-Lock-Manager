@@ -8,10 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"Distributed-Lock-Manager/internal/lock_manager"
 )
@@ -924,5 +927,213 @@ func TestFileManager_Cleanup(t *testing.T) {
 
 	if finalOpenFiles != 0 {
 		t.Errorf("openFiles map should be empty after cleanup, but has %d entries", finalOpenFiles)
+	}
+}
+
+func TestProcessedRequestsIdempotency(t *testing.T) {
+	_, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	// Clean up data directory to ensure a fresh start
+	os.RemoveAll("data")
+	os.MkdirAll("data", 0755)
+
+	// Create a unique directory for WAL logs
+	uniqueID := uuid.New().String()
+	logDir := filepath.Join(os.TempDir(), fmt.Sprintf("idempotency_test_logs_%s", uniqueID))
+	os.MkdirAll(logDir, 0755)
+	defer os.RemoveAll(logDir)
+
+	// Set environment variable for WAL logs
+	oldWalDir := os.Getenv("WAL_LOG_DIR")
+	os.Setenv("WAL_LOG_DIR", logDir)
+	defer os.Setenv("WAL_LOG_DIR", oldWalDir)
+
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+
+	// Create a file manager with WAL enabled
+	fm := NewFileManagerWithWAL(true, true, lm)
+
+	// Clear any processed requests from previous tests
+	if err := fm.ClearProcessedRequests(); err != nil {
+		t.Fatalf("Failed to clear processed requests: %v", err)
+	}
+
+	// Test valid filename and content
+	testContent := []byte("test content")
+	clientID := int32(1)
+	requestID := "test-request-1"
+
+	// Acquire lock for the client and get the token
+	success, token := lm.Acquire(clientID)
+	if !success {
+		t.Fatal("Failed to acquire lock")
+	}
+	defer lm.Release(clientID, token)
+
+	// First append with request ID
+	err := fm.AppendToFileWithRequestID("file_0", testContent, requestID, clientID, token)
+	if err != nil {
+		t.Errorf("AppendToFileWithRequestID failed on first attempt: %v", err)
+	}
+
+	// Verify content was written
+	content, err := os.ReadFile(filepath.Join("data", "file_0"))
+	if err != nil {
+		t.Errorf("Failed to read file: %v", err)
+	}
+	if string(content) != string(testContent) {
+		t.Errorf("File content mismatch. Got %s, want %s", content, testContent)
+	}
+
+	// Try to append again with the same request ID (should be idempotent)
+	err = fm.AppendToFileWithRequestID("file_0", testContent, requestID, clientID, token)
+	if err != nil {
+		t.Errorf("AppendToFileWithRequestID failed on second attempt: %v", err)
+	}
+
+	// Verify content was not duplicated
+	content, err = os.ReadFile(filepath.Join("data", "file_0"))
+	if err != nil {
+		t.Errorf("Failed to read file after second append: %v", err)
+	}
+	if string(content) != string(testContent) {
+		t.Errorf("Content was duplicated or modified. Got %s, want %s", content, testContent)
+	}
+
+	// Try with a different request ID
+	requestID2 := "test-request-2"
+	err = fm.AppendToFileWithRequestID("file_0", testContent, requestID2, clientID, token)
+	if err != nil {
+		t.Errorf("AppendToFileWithRequestID failed with new request ID: %v", err)
+	}
+
+	// Verify content was appended
+	content, err = os.ReadFile(filepath.Join("data", "file_0"))
+	if err != nil {
+		t.Errorf("Failed to read file after third append: %v", err)
+	}
+	expectedContent := string(testContent) + string(testContent)
+	if string(content) != expectedContent {
+		t.Errorf("Content not appended correctly. Got %s, want %s", content, expectedContent)
+	}
+
+	// Verify processed requests log contains both request IDs
+	processedRequestsPath := filepath.Join("data", "processed_requests.log")
+	logContent, err := os.ReadFile(processedRequestsPath)
+	if err != nil {
+		t.Errorf("Failed to read processed requests log: %v", err)
+	}
+
+	logStr := string(logContent)
+	if !strings.Contains(logStr, requestID) || !strings.Contains(logStr, requestID2) {
+		t.Errorf("Processed requests log missing entries. Content: %s", logStr)
+	}
+
+	// Manually check the in-memory map
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+	if !fm.processedRequests[requestID] || !fm.processedRequests[requestID2] {
+		t.Errorf("In-memory processed requests map missing entries: %v", fm.processedRequests)
+	}
+}
+
+func TestRecoveryWithProcessedRequests(t *testing.T) {
+	_, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	// Clean up data directory to ensure a fresh start
+	os.RemoveAll("data")
+	os.MkdirAll("data", 0755)
+
+	// Create a unique directory for WAL logs
+	uniqueID := uuid.New().String()
+	logDir := filepath.Join(os.TempDir(), fmt.Sprintf("recovery_test_logs_%s", uniqueID))
+	os.MkdirAll(logDir, 0755)
+	defer os.RemoveAll(logDir)
+
+	// Set environment variable for WAL logs
+	oldWalDir := os.Getenv("WAL_LOG_DIR")
+	os.Setenv("WAL_LOG_DIR", logDir)
+	defer os.Setenv("WAL_LOG_DIR", oldWalDir)
+
+	// Create a lock manager for testing
+	lm := lock_manager.NewLockManagerWithLeaseDuration(nil, 30*time.Second)
+
+	// Setup: Create a file manager, perform operations, then simulate a crash
+	{
+		fm := NewFileManagerWithWAL(true, true, lm)
+
+		// Clear any processed requests from previous tests
+		if err := fm.ClearProcessedRequests(); err != nil {
+			t.Fatalf("Failed to clear processed requests: %v", err)
+		}
+
+		// Acquire lock
+		clientID := int32(1)
+		success, token := lm.Acquire(clientID)
+		if !success {
+			t.Fatal("Failed to acquire lock")
+		}
+
+		// Test data
+		content1 := []byte("content 1")
+		requestID1 := "test-recovery-1"
+
+		// First operation (should complete normally)
+		err := fm.AppendToFileWithRequestID("file_0", content1, requestID1, clientID, token)
+		if err != nil {
+			t.Errorf("First append failed: %v", err)
+		}
+
+		// Release lock
+		lm.Release(clientID, token)
+
+		// Simulate a crash by not calling Cleanup() - just let it go out of scope
+	}
+
+	// Recovery: Create a new file manager that will recover from the WAL
+	fm2 := NewFileManagerWithWAL(true, true, lm)
+
+	// Verify the recovery was successful
+	if !fm2.IsRecoveryComplete() {
+		t.Error("Recovery not marked as complete")
+	}
+
+	if err := fm2.GetRecoveryError(); err != nil {
+		t.Errorf("Recovery reported an error: %v", err)
+	}
+
+	// Check file content after recovery
+	content, err := os.ReadFile(filepath.Join("data", "file_0"))
+	if err != nil {
+		t.Errorf("Failed to read file after recovery: %v", err)
+	}
+	expectedContent := "content 1"
+	if string(content) != expectedContent {
+		t.Errorf("File content incorrect after recovery. Got %s, want %s", string(content), expectedContent)
+	}
+
+	// Attempt duplicate append (should be idempotent due to processed requests log)
+	clientID := int32(1)
+	success, token := lm.Acquire(clientID)
+	if !success {
+		t.Fatal("Failed to acquire lock after recovery")
+	}
+	defer lm.Release(clientID, token)
+
+	err = fm2.AppendToFileWithRequestID("file_0", []byte("content 1"), "test-recovery-1", clientID, token)
+	if err != nil {
+		t.Errorf("Idempotent append after recovery failed: %v", err)
+	}
+
+	// Verify content was not duplicated
+	content, err = os.ReadFile(filepath.Join("data", "file_0"))
+	if err != nil {
+		t.Errorf("Failed to read file after idempotent append: %v", err)
+	}
+	if string(content) != expectedContent {
+		t.Errorf("Content was duplicated after recovery. Got %s, want %s", string(content), expectedContent)
 	}
 }

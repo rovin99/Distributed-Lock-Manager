@@ -7,17 +7,28 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
+)
+
+// EntryType defines the type of WAL entry
+type EntryType string
+
+const (
+	EntryTypeOperation EntryType = "OP"
+	EntryTypeCommit    EntryType = "COMMIT"
 )
 
 // LogEntry represents a single entry in the write-ahead log
 type LogEntry struct {
 	Timestamp time.Time `json:"timestamp"`
-	RequestID string    `json:"request_id"`
-	Filename  string    `json:"filename"`
-	Content   []byte    `json:"content"`
-	Committed bool      `json:"committed"`
+	Type      EntryType `json:"type"`       // OP or COMMIT
+	RequestID string    `json:"request_id"` // Associates OP and COMMIT
+
+	// Fields specific to OP type
+	Filename string `json:"filename,omitempty"`
+	Content  []byte `json:"content,omitempty"`
 }
 
 // WriteAheadLog implements a simple write-ahead logging system for file operations
@@ -35,8 +46,12 @@ func NewWriteAheadLog(enabled bool) (*WriteAheadLog, error) {
 		return &WriteAheadLog{enabled: false}, nil
 	}
 
-	// Create logs directory with relative path
-	logDir := "logs"
+	// Create logs directory, using environment variable if set
+	logDir := os.Getenv("WAL_LOG_DIR")
+	if logDir == "" {
+		logDir = "logs" // Default if not specified
+	}
+
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create logs directory: %v", err)
 	}
@@ -97,10 +112,10 @@ func (wal *WriteAheadLog) LogOperation(requestID, filename string, content []byt
 
 	entry := LogEntry{
 		Timestamp: time.Now(),
+		Type:      EntryTypeOperation,
 		RequestID: requestID,
 		Filename:  filename,
 		Content:   content,
-		Committed: false,
 	}
 
 	if err := wal.encoder.Encode(entry); err != nil {
@@ -126,8 +141,8 @@ func (wal *WriteAheadLog) MarkCommitted(requestID string) error {
 
 	entry := LogEntry{
 		Timestamp: time.Now(),
+		Type:      EntryTypeCommit,
 		RequestID: requestID,
-		Committed: true,
 	}
 
 	if err := wal.encoder.Encode(entry); err != nil {
@@ -154,16 +169,42 @@ func (wal *WriteAheadLog) Close() error {
 	return wal.logFile.Close()
 }
 
-// RecoverUncommittedOperations processes the log file to find uncommitted operations
-// and returns a list of operations that need to be replayed
+// RecoverUncommittedOperations processes the log files to find operations that need to be replayed.
+// It returns operations that have a COMMIT marker but might not have completed file writes.
 func RecoverUncommittedOperations(logDir string) ([]LogEntry, error) {
+	// If logDir is not specified, use the environment variable or default
+	if logDir == "" {
+		logDir = os.Getenv("WAL_LOG_DIR")
+		if logDir == "" {
+			logDir = "logs" // Default if not specified
+		}
+	}
+
 	// Use the provided log directory path as is
 	matches, err := filepath.Glob(filepath.Join(logDir, "wal-*.log"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to find log files: %v", err)
 	}
 
-	uncommitted := make(map[string]LogEntry)
+	// Sort the log files by modification time (oldest first)
+	sort.Slice(matches, func(i, j int) bool {
+		iInfo, err := os.Stat(matches[i])
+		if err != nil {
+			return false
+		}
+		jInfo, err := os.Stat(matches[j])
+		if err != nil {
+			return true
+		}
+		return iInfo.ModTime().Before(jInfo.ModTime())
+	})
+
+	// Store operation details keyed by RequestID
+	loggedOpsData := make(map[string]LogEntry)
+	// Store committed RequestIDs
+	committedIDs := make(map[string]bool)
+	// Preserve commit order
+	orderedCommitIDs := []string{}
 
 	// Process each log file
 	for _, logPath := range matches {
@@ -183,22 +224,32 @@ func RecoverUncommittedOperations(logDir string) ([]LogEntry, error) {
 				return nil, fmt.Errorf("failed to decode log entry: %v", err)
 			}
 
-			// If this is a commit marker, remove the operation from uncommitted
-			if entry.Committed {
-				delete(uncommitted, entry.RequestID)
-			} else {
-				// Otherwise, add/update the operation in uncommitted
-				uncommitted[entry.RequestID] = entry
+			switch entry.Type {
+			case EntryTypeOperation:
+				// Store the latest operation details for this request ID
+				loggedOpsData[entry.RequestID] = entry
+			case EntryTypeCommit:
+				// Mark as committed, potentially adding to ordered list
+				if !committedIDs[entry.RequestID] {
+					committedIDs[entry.RequestID] = true
+					orderedCommitIDs = append(orderedCommitIDs, entry.RequestID)
+				}
 			}
 		}
 
 		file.Close()
 	}
 
-	// Convert map values to slice
-	result := make([]LogEntry, 0, len(uncommitted))
-	for _, entry := range uncommitted {
-		result = append(result, entry)
+	// Build the list of committed operations that need to be checked
+	result := make([]LogEntry, 0, len(committedIDs))
+	for _, reqID := range orderedCommitIDs {
+		if opData, exists := loggedOpsData[reqID]; exists {
+			// We have the original operation data for this committed request
+			result = append(result, opData)
+		} else {
+			// This case (Commit without preceding OP) should ideally not happen
+			log.Printf("Warning: Found commit marker for request ID %s but no corresponding operation log entry.", reqID)
+		}
 	}
 
 	return result, nil

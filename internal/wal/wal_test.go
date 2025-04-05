@@ -1,143 +1,174 @@
+// wal_test.go
 package wal
 
 import (
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
+// TestWriteAheadLogging tests the basic WAL operations
 func TestWriteAheadLogging(t *testing.T) {
-	// First ensure logs directory exists
-	if err := os.MkdirAll("logs", 0755); err != nil {
-		t.Fatalf("Failed to create logs directory: %v", err)
-	}
-
-	// Create a test WAL
-	wal, err := NewWriteAheadLog(true)
+	// Setup a temporary directory for tests
+	testDir, err := ioutil.TempDir("", "wal-test")
 	if err != nil {
-		t.Fatalf("Failed to create WAL: %v", err)
+		t.Fatalf("Failed to create temp directory: %v", err)
 	}
-	defer wal.Close()
+	defer os.RemoveAll(testDir)
 
-	// Test data
-	testData := []byte("test data")
-	filename := "file_0"
-	requestID := "test_request_1"
+	// Set up the logs directory environment variable to use our test directory
+	originalLogsDir := os.Getenv("WAL_LOG_DIR")
+	os.Setenv("WAL_LOG_DIR", testDir)
+	defer os.Setenv("WAL_LOG_DIR", originalLogsDir)
 
-	// Step 1: Log an operation
 	t.Run("Log Operation", func(t *testing.T) {
-		if err := wal.LogOperation(requestID, filename, testData); err != nil {
-			t.Fatalf("Failed to log operation: %v", err)
-		}
+		logDir := filepath.Join(testDir, "log1")
+		os.MkdirAll(logDir, 0755)
 
-		// Verify the log file exists using OS-agnostic path
-		logFiles, err := filepath.Glob(filepath.Join("logs", "wal-*.log"))
-		if err != nil {
-			t.Fatalf("Failed to find log files: %v", err)
-		}
-		if len(logFiles) == 0 {
-			t.Fatal("No log files found")
-		}
+		// Override the logs directory for this test
+		os.Setenv("WAL_LOG_DIR", logDir)
+
+		wal, err := NewWriteAheadLog(true)
+		assert.NoError(t, err)
+		assert.NotNil(t, wal)
+
+		err = wal.LogOperation("test_request_1", "file_0", []byte("test data"))
+		assert.NoError(t, err)
+
+		wal.Close()
+
+		// Recover operations directly from logDir
+		ops, err := RecoverUncommittedOperations(logDir)
+		assert.NoError(t, err)
+		// Since we didn't mark any operations as committed, no operations should be returned
+		assert.Empty(t, ops, "Should find no operations to replay since none were committed")
 	})
 
-	// Step 2: Mark operation as committed
 	t.Run("Mark Committed", func(t *testing.T) {
-		if err := wal.MarkCommitted(requestID); err != nil {
-			t.Fatalf("Failed to mark operation as committed: %v", err)
-		}
+		logDir := filepath.Join(testDir, "log2")
+		os.MkdirAll(logDir, 0755)
 
-		// Verify the operation is marked as committed
-		uncommitted, err := RecoverUncommittedOperations("logs")
-		if err != nil {
-			t.Fatalf("Failed to recover operations: %v", err)
-		}
-		if len(uncommitted) > 0 {
-			t.Error("Found uncommitted operations after marking as committed")
-		}
+		// Override the logs directory for this test
+		os.Setenv("WAL_LOG_DIR", logDir)
+
+		wal, err := NewWriteAheadLog(true)
+		require.NoError(t, err)
+		require.NotNil(t, wal)
+
+		// Log an operation
+		err = wal.LogOperation("test_request_1", "file_0", []byte("test data"))
+		require.NoError(t, err)
+
+		// Mark it as committed
+		err = wal.MarkCommitted("test_request_1")
+		require.NoError(t, err)
+
+		wal.Close()
+
+		// Recover operations directly from logDir
+		ops, err := RecoverUncommittedOperations(logDir)
+		require.NoError(t, err)
+		// With our new implementation, committed operations should be returned for potential replay
+		require.Len(t, ops, 1, "Should find the committed operation for potential replay")
+		assert.Equal(t, "test_request_1", ops[0].RequestID)
+		assert.Equal(t, EntryTypeOperation, ops[0].Type)
 	})
 
-	// Step 3: Test WAL cleanup
 	t.Run("WAL Cleanup", func(t *testing.T) {
-		// Create an old WAL file using OS-agnostic path
-		oldLogPath := filepath.Join("logs", "wal-old.log")
-		oldFile, err := os.Create(oldLogPath)
-		if err != nil {
-			t.Fatalf("Failed to create old log file: %v", err)
-		}
-		oldFile.Close()
+		logDir := filepath.Join(testDir, "log3")
+		os.MkdirAll(logDir, 0755)
 
-		// Set the modification time to 25 hours ago
+		// Override the logs directory for this test
+		os.Setenv("WAL_LOG_DIR", logDir)
+
+		// Create some old WAL files
+		oldWalPath := filepath.Join(logDir, "wal-20060102-030405.log")
+		err := ioutil.WriteFile(oldWalPath, []byte("test"), 0644)
+		assert.NoError(t, err)
+
+		// Set modification time to more than 24 hours ago
 		oldTime := time.Now().Add(-25 * time.Hour)
-		if err := os.Chtimes(oldLogPath, oldTime, oldTime); err != nil {
-			t.Fatalf("Failed to set file times: %v", err)
-		}
+		err = os.Chtimes(oldWalPath, oldTime, oldTime)
+		assert.NoError(t, err)
 
-		// Create a new WAL to trigger cleanup
-		newWAL, err := NewWriteAheadLog(true)
-		if err != nil {
-			t.Fatalf("Failed to create new WAL: %v", err)
-		}
-		newWAL.Close()
+		// Create a new WAL (should trigger cleanup)
+		wal, err := NewWriteAheadLog(true)
+		assert.NoError(t, err)
+		wal.Close()
 
-		// Verify the old file was cleaned up
-		if _, err := os.Stat(oldLogPath); err == nil {
-			t.Error("Old WAL file was not cleaned up")
-		}
+		// Old WAL file should be removed
+		_, err = os.Stat(oldWalPath)
+		assert.True(t, os.IsNotExist(err), "Old WAL file should be deleted")
 	})
 }
 
+// TestRecovery tests recovering operations from WAL files
 func TestRecovery(t *testing.T) {
-	// First ensure logs directory exists
-	if err := os.MkdirAll("logs", 0755); err != nil {
-		t.Fatalf("Failed to create logs directory: %v", err)
+	// Setup a temporary directory for tests
+	testDir, err := ioutil.TempDir("", "wal-recovery-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
 	}
+	defer os.RemoveAll(testDir)
 
-	// Create a test WAL
+	// Set up the logs directory environment variable to use our test directory
+	originalLogsDir := os.Getenv("WAL_LOG_DIR")
+	os.Setenv("WAL_LOG_DIR", testDir)
+	defer os.Setenv("WAL_LOG_DIR", originalLogsDir)
+
+	// Create a WAL
 	wal, err := NewWriteAheadLog(true)
-	if err != nil {
-		t.Fatalf("Failed to create WAL: %v", err)
-	}
-	defer wal.Close()
+	require.NoError(t, err)
 
-	// Log multiple operations without committing
-	operations := []struct {
-		requestID string
-		filename  string
-		data      []byte
-	}{
-		{"op1", "file_1", []byte("operation 1")},
-		{"op2", "file_1", []byte("operation 2")},
-		{"op3", "file_1", []byte("operation 3")},
-	}
+	// Log multiple operations
+	err = wal.LogOperation("op1", "file_0", []byte("operation 1"))
+	require.NoError(t, err)
+	err = wal.LogOperation("op2", "file_1", []byte("operation 2"))
+	require.NoError(t, err)
+	err = wal.LogOperation("op3", "file_2", []byte("operation 3"))
+	require.NoError(t, err)
 
-	for _, op := range operations {
-		if err := wal.LogOperation(op.requestID, op.filename, op.data); err != nil {
-			t.Fatalf("Failed to log operation %s: %v", op.requestID, err)
+	// Mark some as committed
+	err = wal.MarkCommitted("op1")
+	require.NoError(t, err)
+	err = wal.MarkCommitted("op2")
+	require.NoError(t, err)
+	// op3 is left uncommitted
+
+	wal.Close()
+
+	// Recover operations directly from the temporary directory
+	committedOps, err := RecoverUncommittedOperations(testDir)
+	require.NoError(t, err)
+
+	// With our new implementation, we should get the operations that were committed
+	// but may not have completed file writes
+	require.Len(t, committedOps, 2, "Expected 2 committed operations for replay")
+
+	// Verify the operations
+	var found1, found2 bool
+	for _, op := range committedOps {
+		assert.Equal(t, EntryTypeOperation, op.Type)
+		if op.RequestID == "op1" {
+			found1 = true
+			assert.Equal(t, "file_0", op.Filename)
+			assert.Equal(t, []byte("operation 1"), op.Content)
+		} else if op.RequestID == "op2" {
+			found2 = true
+			assert.Equal(t, "file_1", op.Filename)
+			assert.Equal(t, []byte("operation 2"), op.Content)
 		}
 	}
 
-	// Recover uncommitted operations
-	uncommitted, err := RecoverUncommittedOperations("logs")
-	if err != nil {
-		t.Fatalf("Failed to recover operations: %v", err)
-	}
-
-	// Verify all operations were recovered
-	if len(uncommitted) != len(operations) {
-		t.Errorf("Expected %d uncommitted operations, got %d", len(operations), len(uncommitted))
-	}
-
-	// Verify operation contents
-	for i, op := range operations {
-		if uncommitted[i].RequestID != op.requestID {
-			t.Errorf("RequestID mismatch at index %d. Expected: %s, Got: %s", i, op.requestID, uncommitted[i].RequestID)
-		}
-		if uncommitted[i].Filename != op.filename {
-			t.Errorf("Filename mismatch at index %d. Expected: %s, Got: %s", i, op.filename, uncommitted[i].Filename)
-		}
-		if string(uncommitted[i].Content) != string(op.data) {
-			t.Errorf("Content mismatch at index %d. Expected: %s, Got: %s", i, op.data, uncommitted[i].Content)
-		}
-	}
+	assert.True(t, found1 && found2, "Should find both committed operations")
 }
+
+// --- wal.go Modifications (If needed for testing) ---
+// Consider modifying NewWriteAheadLog to accept logDir parameter
+// func NewWriteAheadLog(enabled bool, logDir string) (*WriteAheadLog, error) { ... }
+// And update RecoverUncommittedOperations if needed based on how logDir is passed.
