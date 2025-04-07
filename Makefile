@@ -19,7 +19,7 @@ CLIENT_SRC=cmd/client/main.go
 # Directories
 BIN_DIR=bin
 DATA_DIR=data
-LOG_DIR=/home/naveen/Project/Distributed-Lock-Manager/logs
+LOG_DIR=logs
 
 # Default target
 all: clean setup build
@@ -41,9 +41,14 @@ build-client:
 	$(GOBUILD) -o $(CLIENT_BIN) $(CLIENT_SRC)
 	@echo "Client built successfully"
 
-# Run the server
+# Run a single server
 run-server: build-server setup
-	@$(SERVER_BIN) -address :$(if $(PORT),$(PORT),50051) 2>&1 | tee $(LOG_DIR)/server.log
+	@$(SERVER_BIN) -id $(if $(ID),$(ID),server1) -addr :$(if $(PORT),$(PORT),50051) -peers "$(if $(PEERS),$(PEERS),)" 2>&1 | tee $(LOG_DIR)/server_$(if $(ID),$(ID),server1).log
+
+# Run the cluster of servers
+run-cluster: build-server setup
+	@echo "Starting server cluster..."
+	@bash scripts/run_cluster.sh 2>&1 | tee $(LOG_DIR)/cluster.log
 
 # Run the client with optional PORT
 run-client: build-client setup
@@ -52,8 +57,7 @@ run-client: build-client setup
 # Run multiple clients concurrently
 run-multi-clients: build-client setup
 	@echo "Running clients using run.sh..."
-	bash run.sh
-
+	bash run.sh 2>&1 | tee $(LOG_DIR)/multi_client.log
 
 # Clean up
 clean-bin:
@@ -63,6 +67,9 @@ clean-bin:
 # Clean data files
 clean-data:
 	@rm -rf $(DATA_DIR)/*
+	@rm -rf internal/file_manager/data
+	@rm -rf internal/file_manager/data_backup
+	@rm -rf internal/lock_manager/data
 	@echo "Cleaned up data files"
 
 # Clean log files
@@ -84,7 +91,8 @@ help:
 	@echo "Available commands:"
 	@echo "  make all                  - Clean, setup directories, and build binaries"
 	@echo "  make build                - Build server and client binaries"
-	@echo "  make run-server           - Run the server from binary"
+	@echo "  make run-server           - Run a single server (use ID=server1 PORT=50051 PEERS=...)"
+	@echo "  make run-cluster          - Run the cluster of servers"
 	@echo "  make run-client           - Run the client from binary"
 	@echo "  make run-multi-clients    - Run multiple clients concurrently and wait for completion"
 	@echo "  make clean-bin            - Remove binaries"
@@ -92,6 +100,5 @@ help:
 	@echo "  make clean-logs           - Remove log files"
 	@echo "  make clean                - Remove binaries, data files, and logs"
 	@echo "  make deps                 - Install dependencies"
-
 
 .PHONY: all setup build build-server build-client run-server run-client run-multi-clients test-correctness test-correctness-clean clean-bin clean-data clean-logs clean deps proto help

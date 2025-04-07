@@ -15,6 +15,7 @@ import (
 // LockServer implements the LockServiceServer interface
 type LockServer struct {
 	pb.UnimplementedLockServiceServer
+	serverID     string
 	lockManager  *lock_manager.LockManager
 	fileManager  *file_manager.FileManager
 	requestCache *RequestCache
@@ -23,8 +24,10 @@ type LockServer struct {
 }
 
 // NewLockServer initializes a new lock server
-func NewLockServer() *LockServer {
-	logger := log.New(os.Stdout, "[LockServer] ", log.LstdFlags)
+func NewLockServer(serverID string, logger *log.Logger) *LockServer {
+	if logger == nil {
+		logger = log.New(os.Stdout, fmt.Sprintf("[LockServer-%s] ", serverID), log.LstdFlags)
+	}
 
 	// Initialize lock manager with lease duration
 	lm := lock_manager.NewLockManagerWithLeaseDuration(logger, 30*time.Second)
@@ -33,6 +36,7 @@ func NewLockServer() *LockServer {
 	fm := file_manager.NewFileManagerWithWAL(true, true, lm)
 
 	s := &LockServer{
+		serverID:     serverID,
 		lockManager:  lm,
 		fileManager:  fm,
 		requestCache: NewRequestCacheWithSize(10*time.Minute, 10000),
