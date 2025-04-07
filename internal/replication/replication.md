@@ -148,7 +148,7 @@ Stage 2 focused on implementing the replication protocol for the distributed loc
 - Proper resource cleanup and management
 - Extensive test coverage
 
-## Stage 3: Lock Replication (In Progress)
+## Stage 3: Lock Replication (Completed)
 
 Stage 3 focuses on implementing lock replication for the distributed lock manager.
 
@@ -228,7 +228,7 @@ Stage 3 focuses on implementing lock replication for the distributed lock manage
    - Error handling and recovery
    - Testing and verification
 
-3. **Stage 3: Lock Replication** (In Progress)
+3. **Stage 3: Lock Replication** (Completed)
    - Lock state replication
    - Conflict resolution
    - Lock recovery
@@ -253,6 +253,345 @@ Stage 3 focuses on implementing lock replication for the distributed lock manage
 - Load testing
 - Stress testing
 - Long-running stability testing
+
+## Monitoring and Observability
+
+### Logging
+- Detailed connection logs
+- Replication operation logs
+- Error and warning logs
+- Performance metrics logs
+
+### Metrics
+- Connection status metrics
+- Replication performance metrics
+- Error rate metrics
+- Resource usage metrics
+
+### Alerts
+- Connection failure alerts
+- Replication failure alerts
+- Performance degradation alerts
+- Resource exhaustion alerts
+
+## Detailed Review and Suggestions for Improvement
+
+### Stage 1: Basic Server Configuration and Peer Discovery
+
+#### What's Working Well
+- Clean `ServerConfig` structure to hold server and peer information
+- Practical command-line parsing for peer addresses
+- Solid foundation for communication with gRPC connections
+
+#### Suggestions for Improvement
+
+##### Retry Mechanism for Peer Connections
+If a peer connection fails (e.g., due to a temporary network issue), the current code logs the error and moves on. Consider adding a retry mechanism to attempt reconnection a few times before giving up:
+
+```go
+func (s *LockServer) connectToPeers() {
+    for _, peer := range s.config.Peers {
+        var conn *grpc.ClientConn
+        var err error
+        for attempts := 0; attempts < 3; attempts++ {
+            conn, err = grpc.Dial(peer.Address, grpc.WithInsecure())
+            if err == nil {
+                break
+            }
+            time.Sleep(time.Second * time.Duration(attempts+1)) // Exponential backoff
+        }
+        if err != nil {
+            s.logger.Printf("Failed to connect to peer %s after retries: %v", peer.ID, err)
+            continue
+        }
+        s.peers[peer.ID] = conn
+    }
+}
+```
+
+##### Periodic Reconnection
+Add a background goroutine to periodically check and reconnect to failed peers, enhancing resilience.
+
+##### Security
+Currently using `grpc.WithInsecure()`, which is fine for development, but plan to switch to secure connections (e.g., TLS) in production.
+
+##### Testing Enhancement
+Add a test to simulate a peer being unavailable initially and then coming online, verifying that the server eventually connects.
+
+### Stage 2: Basic State Replication
+
+#### What's Working Well
+- Straightforward `ReplicationService` in the proto file
+- Good starting point with replicating state after local lock acquisition
+- Helpful logging of replication failures for debugging
+
+#### Suggestions for Improvement
+
+##### Consistency Guarantee
+Currently, the system acquires the lock locally and then replicates to peers, but if replication fails, the system could become inconsistent. To ensure consistency, consider a two-phase approach:
+
+1. **Prepare Phase**: Send the replication request to all peers and wait for acknowledgment.
+2. **Commit Phase**: If enough peers agree, commit the change locally and confirm to peers.
+
+```go
+func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.LockResponse, error) {
+    // Prepare phase
+    prepareSuccess := true
+    for peerID, conn := range s.peers {
+        client := pb.NewReplicationServiceClient(conn)
+        resp, err := client.ReplicateState(ctx, &pb.ReplicationRequest{
+            OperationType: "prepare_acquire",
+            ClientId:      args.ClientId,
+            LockId:        args.LockId,
+        })
+        if err != nil || !resp.Success {
+            s.logger.Printf("Prepare failed for peer %s: %v", peerID, err)
+            prepareSuccess = false
+        }
+    }
+    if !prepareSuccess {
+        return &pb.LockResponse{Status: pb.Status_ERROR, ErrorMessage: "Prepare failed"}, nil
+    }
+
+    // Local acquire and commit
+    success, token := s.lockManager.AcquireWithTimeout(args.ClientId, ctx)
+    if !success {
+        return &pb.LockResponse{Status: pb.Status_ERROR, ErrorMessage: "Failed to acquire lock"}, nil
+    }
+    for peerID, conn := range s.peers {
+        client := pb.NewReplicationServiceClient(conn)
+        client.ReplicateState(ctx, &pb.ReplicationRequest{
+            OperationType: "commit_acquire",
+            ClientId:      args.ClientId,
+            Token:         token,
+            LockId:        args.LockId,
+        })
+    }
+    return &pb.LockResponse{Status: pb.Status_OK, Token: token}, nil
+}
+```
+
+##### Error Handling
+If replication to a peer fails, the system continues with others but doesn't rollback the local change. Consider tracking failures and deciding whether to proceed based on a minimum number of successful replications.
+
+##### Testing Enhancement
+Test a scenario where one peer fails to replicate, ensuring the system either rolls back or logs the inconsistency appropriately.
+
+### Stage 3: Leader Election
+
+#### What's Working Well
+- Well-defined proto messages for voting and heartbeats
+- Good starting point with basic election logic (self-vote plus peer votes)
+- Correct design choice to restrict operations to the leader
+
+#### Suggestions for Improvement
+
+##### Robustness
+The current leader election is simple but vulnerable to network partitions or split-brain scenarios. Consider adopting an established algorithm like Raft or Paxos. For a simpler alternative, enhance the timeout-based approach:
+
+```go
+func (s *LockServer) startElection() {
+    s.election.term++
+    s.election.votedFor = s.config.ServerID
+    votes := 1
+
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    var mu sync.Mutex
+    for peerID, conn := range s.peers {
+        go func(id string, client pb.ReplicationServiceClient) {
+            resp, err := client.RequestVote(ctx, &pb.VoteRequest{
+                Term:        s.election.term,
+                CandidateId: s.config.ServerID,
+            })
+            mu.Lock()
+            if err == nil && resp.VoteGranted {
+                votes++
+            }
+            mu.Unlock()
+        }(peerID, pb.NewReplicationServiceClient(conn))
+    }
+
+    time.Sleep(1 * time.Second) // Wait for votes
+    if votes > len(s.peers)/2 {
+        s.election.isLeader = true
+        s.startHeartbeat()
+    }
+}
+```
+
+##### Heartbeat Frequency
+Ensure the `startHeartbeat` method sends heartbeats frequently enough to prevent unnecessary elections but not so often as to overload the network.
+
+##### Testing Enhancement
+Simulate a network partition by blocking communication between some servers and verify that only one leader emerges.
+
+### Stage 4: Quorum-Based Operations
+
+#### What's Working Well
+- Solid `Quorum` struct and logic to wait for a majority of responses
+- Good fail-safe to release the lock locally if quorum isn't reached
+
+#### Suggestions for Improvement
+
+##### Rollback Mechanism
+If quorum isn't reached, the system releases the local lock, but peers that already replicated the state might retain it. Enhance the rollback to notify successful peers:
+
+```go
+func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.LockResponse, error) {
+    if !s.election.isLeader {
+        return &pb.LockResponse{Status: pb.Status_ERROR, ErrorMessage: "Not the leader"}, nil
+    }
+
+    success, token := s.lockManager.AcquireWithTimeout(args.ClientId, ctx)
+    if !success {
+        return &pb.LockResponse{Status: pb.Status_ERROR, ErrorMessage: "Failed to acquire lock"}, nil
+    }
+
+    quorum := &Quorum{size: (len(s.peers)/2)+1, responses: make(map[string]bool)}
+    successfulPeers := make(map[string]struct{})
+
+    for peerID, conn := range s.peers {
+        client := pb.NewReplicationServiceClient(conn)
+        resp, err := client.ReplicateState(ctx, &pb.ReplicationRequest{
+            OperationType: "acquire",
+            ClientId:      args.ClientId,
+            Token:         token,
+            LockId:        args.LockId,
+        })
+        if err == nil && resp.Success {
+            successfulPeers[peerID] = struct{}{}
+            if quorum.AddResponse(peerID, true) {
+                return &pb.LockResponse{Status: pb.Status_OK, Token: token}, nil
+            }
+        }
+    }
+
+    // Rollback
+    s.lockManager.Release(args.ClientId, token)
+    for peerID, conn := range s.peers {
+        if _, ok := successfulPeers[peerID]; ok {
+            client := pb.NewReplicationServiceClient(conn)
+            client.ReplicateState(ctx, &pb.ReplicationRequest{
+                OperationType: "release",
+                ClientId:      args.ClientId,
+                Token:         token,
+                LockId:        args.LockId,
+            })
+        }
+    }
+    return &pb.LockResponse{Status: pb.Status_ERROR, ErrorMessage: "Failed to get quorum"}, nil
+}
+```
+
+##### Timeout
+Add a timeout to replication attempts to avoid hanging indefinitely if peers are unresponsive.
+
+##### Testing Enhancement
+Test with exactly half the peers failing and verify the rollback completes correctly.
+
+### Stage 5: Client Failover
+
+#### What's Working Well
+- Simple and effective round-robin approach to trying servers
+- Thread-safe server selection with mutex
+
+#### Suggestions for Improvement
+
+##### Leader Discovery
+Instead of trying servers sequentially, have the client query servers to find the current leader:
+
+```go
+func (c *Client) AcquireLock(ctx context.Context, lockID string) (string, error) {
+    c.mu.RLock()
+    server := c.currentServer
+    c.mu.RUnlock()
+
+    for _, s := range c.servers {
+        conn, err := grpc.Dial(s, grpc.WithInsecure())
+        if err != nil {
+            continue
+        }
+        client := pb.NewLockServiceClient(conn)
+        resp, err := client.LockAcquire(ctx, &pb.LockArgs{ClientId: rand.Int63(), LockId: lockID})
+        conn.Close()
+        if err == nil {
+            c.mu.Lock()
+            c.currentServer = s
+            c.mu.Unlock()
+            return resp.Token, nil
+        }
+        if resp != nil && resp.ErrorMessage == "Not the leader" {
+            // Could extend this to return leader info from servers
+            continue
+        }
+    }
+    return "", errors.New("no available servers")
+}
+```
+
+##### Exponential Backoff
+Add backoff between retries to avoid overwhelming the system during failures.
+
+##### Testing Enhancement
+Test with multiple clients simultaneously failing over to ensure no race conditions occur.
+
+### General Recommendations
+
+#### Error Handling
+Across all stages, ensure errors are logged and handled gracefully. For example, in peer communication, distinguish between temporary and permanent failures.
+
+#### Testing
+The testing plans are good—expand them to include edge cases like network partitions, server crashes during replication, and concurrent client requests.
+
+### Implementation Details
+
+#### Lock State Management
+- `LockState` struct tracks lock ownership and metadata
+- Supports exclusive and shared locks
+- Handles lock timeouts and cleanup
+
+#### Lock Operations
+- `AcquireLock`: Implements distributed lock acquisition with replication
+- `ReleaseLock`: Handles lock release with replication
+- `GetLockState`: Retrieves current lock state
+- `HandleLockTimeout`: Manages lock expiration
+- `ReplicateLockState`: Replicates lock state to peers
+
+#### Testing
+- Unit tests for all lock operations
+- Integration tests for distributed scenarios
+- Concurrent access testing
+- Timeout and recovery testing
+
+## Stage 4: Leader Election (In Progress)
+- Implement leader election protocol
+- Add failure detection
+- Create leader state replication
+- Add leader change handling
+- Implement testing
+
+## Stage 5: Client Failover (Planned)
+- Implement client failover strategy
+- Add automatic client redirection
+- Create failover testing
+- Add monitoring and metrics
+- Implement documentation
+
+## Implementation Timeline
+1. Stage 1: Connection Management ✓
+2. Stage 2: Replication Protocol ✓
+3. Stage 3: Lock Replication ✓
+4. Stage 4: Leader Election (In Progress)
+5. Stage 5: Client Failover (Planned)
+
+## Testing Strategy
+- Unit tests for each component
+- Integration tests for distributed scenarios
+- Performance testing
+- Failure scenario testing
+- Monitoring and observability
 
 ## Monitoring and Observability
 
