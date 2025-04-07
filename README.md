@@ -167,7 +167,7 @@ Parameters:
 ```bash
 make run-multi-clients
 ```
-This will run multple clients concurrently, each writing to a random file.
+This will run a bash file which will spawn multple clients concurrently, each writing to a random file.
 
 ## Testing
 

@@ -19,7 +19,7 @@ CLIENT_SRC=cmd/client/main.go
 # Directories
 BIN_DIR=bin
 DATA_DIR=data
-LOG_DIR=/home/naveen/Project/Distributed-Lock-Manager/logs
+LOG_DIR=logs
 
 # Default target
 all: clean setup build
@@ -52,7 +52,7 @@ run-client: build-client setup
 # Run multiple clients concurrently
 run-multi-clients: build-client setup
 	@echo "Running clients using run.sh..."
-	bash run.sh
+	bash run.sh 2>&1 | tee $(LOG_DIR)/multi_client.log
 
 
 # Clean up
@@ -63,6 +63,10 @@ clean-bin:
 # Clean data files
 clean-data:
 	@rm -rf $(DATA_DIR)/*
+	@rm -rf internal/file_manager/data
+	@rm -rf internal/file_manager/data_backup
+	@rm -rf internal/lock_manager/data
+
 	@echo "Cleaned up data files"
 
 # Clean log files
