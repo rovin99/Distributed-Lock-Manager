@@ -1,0 +1,35 @@
+[FileCreation] 2025/04/09 01:44:19 Lock state file './data/lock_state.json' not found, assuming initial state.
+[FileManager] 2025/04/09 01:44:19 Loaded 0 processed request IDs from log
+[LockServer-1] 2025/04/09 01:44:19 Lock state file './data/lock_state.json' not found, assuming initial state.
+[FileManager] 2025/04/09 01:44:19 Loaded 0 processed request IDs from log
+[FileManager] 2025/04/09 01:44:19 Attempting to recover from write-ahead log
+[FileManager] 2025/04/09 01:44:19 Loaded 0 processed request IDs from log
+[FileManager] 2025/04/09 01:44:19 Loaded 0 already completed request IDs
+[FileManager] 2025/04/09 01:44:19 Found 0 WAL-committed operations to check against processed list
+[FileManager] 2025/04/09 01:44:19 WAL recovery check completed: 0 operations replayed, 0 skipped
+[FileManager] 2025/04/09 01:44:19 Successfully recovered from write-ahead log
+[LockServer-1] 2025/04/09 01:44:19 Connected to peer at localhost:50052
+2025/04/09 01:44:19 Starting as primary server (ID: 1) with peer: localhost:50052
+2025/04/09 01:44:19 Waiting for WAL recovery to complete...
+2025/04/09 01:44:19 WAL recovery completed successfully
+2025/04/09 01:44:19 Verifying server ID uniqueness...
+[LockServer-1] 2025/04/09 01:44:19 Attempt 1: unable to verify peer server ID: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused", retrying in 1s
+[LockServer-1] 2025/04/09 01:44:20 Attempt 2: unable to verify peer server ID: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused", retrying in 1s
+[LockServer-1] 2025/04/09 01:44:21 Attempt 3: unable to verify peer server ID: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused", retrying in 1s
+[LockServer-1] 2025/04/09 01:44:22 Attempt 4: unable to verify peer server ID: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused", retrying in 1s
+[LockServer-1] 2025/04/09 01:44:23 Attempt 5: unable to verify peer server ID: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused", retrying in 1s
+[LockServer-1] 2025/04/09 01:44:24 WARNING: Could not verify server ID uniqueness after 5 attempts: unable to verify peer server ID: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused"
+[LockServer-1] 2025/04/09 01:44:24 Continuing startup, but be aware that duplicate IDs may cause issues
+2025/04/09 01:44:24 Server ID verification completed
+2025/04/09 01:44:24 Verifying shared filesystem access...
+[LockServer-1] 2025/04/09 01:44:24 Attempt 1: filesystem verification failed - error calling peer: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused", retrying in 1s
+[LockServer-1] 2025/04/09 01:44:25 Attempt 2: filesystem verification failed - error calling peer: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused", retrying in 1s
+[LockServer-1] 2025/04/09 01:44:26 Attempt 3: filesystem verification failed - error calling peer: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused", retrying in 1s
+[LockServer-1] 2025/04/09 01:44:27 Attempt 4: filesystem verification failed - error calling peer: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused", retrying in 1s
+[LockServer-1] 2025/04/09 01:44:28 Attempt 5: filesystem verification failed - error calling peer: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused", retrying in 1s
+[LockServer-1] 2025/04/09 01:44:29 WARNING: Could not verify shared filesystem after 5 attempts: filesystem verification failed - error calling peer: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp [::1]:50052: connect: connection refused"
+[LockServer-1] 2025/04/09 01:44:29 Continuing startup, but be aware that filesystem sharing may not be working correctly
+2025/04/09 01:44:29 Shared filesystem verification completed
+2025/04/09 01:44:29 Server listening at [::]:50051
+[LockServer-1] 2025/04/09 01:44:29 Received filesystem verification request for file: ./data/fs_verify_1744143269483478000.tmp
+[LockServer-1] 2025/04/09 01:44:29 Filesystem verification successful for file: ./data/fs_verify_1744143269483478000.tmp

@@ -170,6 +170,7 @@ func (lm *LockManager) Acquire(clientID int32) (bool, string) {
 	if !lm.waitingSet[clientID] {
 		lm.queue = append(lm.queue, clientID)
 		lm.waitingSet[clientID] = true
+		lm.logger.Printf("Added client %d to queue. Queue length: %d", clientID, len(lm.queue))
 	}
 
 	// Check if the current lock has expired
@@ -181,8 +182,22 @@ func (lm *LockManager) Acquire(clientID int32) (bool, string) {
 
 	// Wait until the lock is free AND this client is at the front of the queue
 	for lm.lockHolder != -1 || (len(lm.queue) > 0 && lm.queue[0] != clientID) {
-		lm.logger.Printf("Client %d waiting for lock (currently held by %d)", clientID, lm.lockHolder)
+		lm.logger.Printf("Client %d waiting for lock (currently held by %d, queue position: %d)",
+			clientID, lm.lockHolder, findClientPosition(lm.queue, clientID))
 		lm.cond.Wait() // Unlocks mu, waits, then relocks mu when woken
+
+		// After waking up, check if the lock has expired
+		if lm.lockHolder != -1 && !lm.leaseExpires.IsZero() && time.Now().After(lm.leaseExpires) {
+			lm.logger.Printf("Lock held by client %d has expired while client %d was waiting, releasing",
+				lm.lockHolder, clientID)
+			lm.releaseLockAndSaveState()
+		}
+	}
+
+	// Safety check - verify the client is still at the head of the queue
+	if len(lm.queue) == 0 || lm.queue[0] != clientID {
+		lm.logger.Printf("ERROR: Client %d was expecting to be at the front of the queue but isn't", clientID)
+		return false, ""
 	}
 
 	// Remove client from queue and waiting set
@@ -198,22 +213,30 @@ func (lm *LockManager) Acquire(clientID int32) (bool, string) {
 	lm.lockToken = newToken
 	lm.leaseExpires = newLeaseExpires
 
-	// Persist the state change
+	// Save the state
 	if err := lm.saveState(); err != nil {
-		lm.logger.Printf("ERROR: Failed to save state on acquire for client %d: %v", clientID, err)
-		// Rollback the state change
+		// Rollback changes if save fails
+		lm.logger.Printf("ERROR: Failed to save lock state for client %d: %v", clientID, err)
 		lm.lockHolder = -1
 		lm.lockToken = ""
 		lm.leaseExpires = time.Time{}
-		// Wake others as acquire failed
-		lm.cond.Broadcast()
 		return false, ""
 	}
 
 	lm.logger.Printf("Lock acquired by client %d with token %s, expires at %v",
-		clientID, lm.lockToken, lm.leaseExpires)
+		clientID, lm.safeTokenForLog(newToken), newLeaseExpires)
 
-	return true, lm.lockToken
+	return true, newToken
+}
+
+// Helper function to find a client's position in the queue
+func findClientPosition(queue []int32, clientID int32) int {
+	for i, id := range queue {
+		if id == clientID {
+			return i
+		}
+	}
+	return -1 // Not in queue
 }
 
 // AcquireWithTimeout attempts to acquire the lock with a timeout
@@ -333,37 +356,40 @@ func (lm *LockManager) AcquireWithTimeout(clientID int32, ctx context.Context) (
 	return true, token
 }
 
-// Release attempts to release the lock for the given client
+// Release attempts to release the lock held by the client
 func (lm *LockManager) Release(clientID int32, token string) bool {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	lm.logger.Printf("Client %d attempting to release lock with token %s", clientID, token)
+	lm.logger.Printf("Client %d attempting to release lock with token %s", clientID, lm.safeTokenForLog(token))
 
-	// Check if this client owns the lock
+	// Check if client holds the lock with the correct token
 	if lm.lockHolder != clientID {
-		lm.logger.Printf("Lock release failed: client %d doesn't hold the lock", clientID)
+		lm.logger.Printf("ERROR: Client %d tried to release lock, but current holder is %d", clientID, lm.lockHolder)
 		return false
 	}
 
-	// If the lease has expired, we should still allow the client to release the lock
-	// This helps prevent deadlocks where a client can't release a lock because its lease expired
-	if !lm.leaseExpires.IsZero() && time.Now().After(lm.leaseExpires) {
-		lm.logger.Printf("Lease has expired, but allowing client %d to release lock", clientID)
-		// Use the combined method which also saves state
-		lm.releaseLockAndSaveState()
-		return true
-	}
-
-	// Check if the token is valid
 	if lm.lockToken != token {
-		lm.logger.Printf("Lock release failed: token %s is invalid", token)
+		lm.logger.Printf("ERROR: Client %d provided invalid token for release", clientID)
 		return false
 	}
 
-	// Token is valid and client owns the lock, release it with state persistence
-	// Use the combined method which handles clearing the state, saving, and broadcasting
-	lm.releaseLockAndSaveState()
+	// Clear lock state
+	lm.lockHolder = -1
+	lm.lockToken = ""
+	lm.leaseExpires = time.Time{}
+
+	// Save the state
+	if err := lm.saveState(); err != nil {
+		// This is a critical error - we've released the lock in memory but failed to persist it
+		// Log the error and continue, as rolling back would mean reclaiming a lock that the client thinks is released
+		lm.logger.Printf("CRITICAL ERROR: Failed to save state on release for client %d: %v", clientID, err)
+	}
+
+	lm.logger.Printf("Lock released by client %d", clientID)
+
+	// Notify waiting clients
+	lm.cond.Broadcast()
 	return true
 }
 
@@ -646,22 +672,25 @@ func (lm *LockManager) loadState() error {
 	return nil
 }
 
-// releaseLockAndSaveState is an internal helper combining release and save.
-// MUST be called while holding lm.mu lock.
+// releaseLockAndSaveState releases the lock due to lease expiration or other reasons
+// and persists the state change. Caller must hold the mutex.
 func (lm *LockManager) releaseLockAndSaveState() {
-	originalHolder := lm.lockHolder // Store before clearing
+	// Remember the previous holder for logging
+	previousHolder := lm.lockHolder
+
+	// Clear the lock state
 	lm.lockHolder = -1
 	lm.lockToken = ""
 	lm.leaseExpires = time.Time{}
 
+	// Persist the state change
 	if err := lm.saveState(); err != nil {
-		lm.logger.Printf("CRITICAL ERROR: Failed to save state after internal lock release for holder %d: %v", originalHolder, err)
-		// What to do here? State is inconsistent. Maybe panic? Log heavily.
-	} else {
-		lm.logger.Printf("Lock released internally (e.g., expiry on load, monitor)")
+		lm.logger.Printf("ERROR: Failed to save state on internal release for client %d: %v", previousHolder, err)
 	}
 
-	// Still need to broadcast after releasing the lock (and potentially after saving state)
+	lm.logger.Printf("Lock forcibly released from client %d due to lease expiration or server request", previousHolder)
+
+	// Notify waiting goroutines
 	lm.cond.Broadcast()
 }
 
@@ -825,4 +854,12 @@ func (lm *LockManager) GetCurrentTokenNoLock() string {
 // The caller must hold the mutex
 func (lm *LockManager) GetTokenExpirationNoLock() time.Time {
 	return lm.leaseExpires
+}
+
+// GetQueueLength returns the current length of the waiting queue
+func (lm *LockManager) GetQueueLength() int {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	return len(lm.queue)
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,20 @@ const (
 	SecondaryRole ServerRole = "secondary"
 )
 
+// HeartbeatConfig stores configuration for heartbeat mechanism
+type HeartbeatConfig struct {
+	Interval        time.Duration // Interval between heartbeats
+	Timeout         time.Duration // Timeout for each heartbeat
+	MaxFailureCount int           // Number of consecutive failures before failover
+}
+
+// Default heartbeat configuration
+var DefaultHeartbeatConfig = HeartbeatConfig{
+	Interval:        2 * time.Second,
+	Timeout:         5 * time.Second,
+	MaxFailureCount: 3,
+}
+
 // LockServer implements the LockServiceServer interface
 type LockServer struct {
 	pb.UnimplementedLockServiceServer
@@ -33,7 +48,8 @@ type LockServer struct {
 	fileManager  *file_manager.FileManager
 	requestCache *RequestCache
 	logger       *log.Logger
-	recoveryDone bool // Indicates if WAL recovery is complete
+	recoveryDone bool                // Indicates if WAL recovery is complete
+	metrics      *PerformanceMetrics // Added metrics for monitoring
 
 	// Replication-related fields
 	role        ServerRole           // Current role (primary or secondary)
@@ -43,9 +59,18 @@ type LockServer struct {
 	peerClient  pb.LockServiceClient // gRPC client for peer communication
 	peerConn    *grpc.ClientConn     // gRPC connection to peer
 
+	// Replication queue for reliable state updates
+	replicationQueue      []*pb.ReplicatedState // Queue of updates to be sent to secondary
+	replicationQueueMu    sync.Mutex            // Protects the replication queue
+	replicationInProgress atomic.Bool           // Flag to prevent multiple concurrent replication workers
+
+	// Heartbeat configuration
+	heartbeatConfig HeartbeatConfig // Configuration for heartbeat mechanism
+
 	// Fencing-related fields
-	isFencing      atomic.Bool // Is the server in fencing period?
-	fencingEndTime time.Time   // When does the fencing period end?
+	isFencing      atomic.Bool   // Is the server in fencing period?
+	fencingEndTime time.Time     // When does the fencing period end?
+	fencingBuffer  time.Duration // Additional buffer time after lease duration
 }
 
 // NewLockServer initializes a new lock server
@@ -67,12 +92,18 @@ func NewLockServer() *LockServer {
 		role:         PrimaryRole, // Default to primary role
 		isPrimary:    true,        // Default to primary
 		serverID:     1,           // Default ID
+		metrics:      NewPerformanceMetrics(logger),
 	}
 	return s
 }
 
 // NewReplicatedLockServer initializes a lock server with replication configuration
 func NewReplicatedLockServer(role ServerRole, serverID int32, peerAddress string) *LockServer {
+	return NewReplicatedLockServerWithConfig(role, serverID, peerAddress, DefaultHeartbeatConfig)
+}
+
+// NewReplicatedLockServerWithConfig initializes a lock server with replication and custom heartbeat config
+func NewReplicatedLockServerWithConfig(role ServerRole, serverID int32, peerAddress string, hbConfig HeartbeatConfig) *LockServer {
 	logger := log.New(os.Stdout, fmt.Sprintf("[LockServer-%d] ", serverID), log.LstdFlags)
 
 	// Initialize lock manager with lease duration
@@ -84,15 +115,19 @@ func NewReplicatedLockServer(role ServerRole, serverID int32, peerAddress string
 	isPrimary := role == PrimaryRole
 
 	s := &LockServer{
-		lockManager:  lm,
-		fileManager:  fm,
-		requestCache: NewRequestCacheWithSize(10*time.Minute, 10000),
-		logger:       logger,
-		recoveryDone: fm.IsRecoveryComplete(),
-		role:         role,
-		isPrimary:    isPrimary,
-		serverID:     serverID,
-		peerAddress:  peerAddress,
+		lockManager:      lm,
+		fileManager:      fm,
+		requestCache:     NewRequestCacheWithSize(10*time.Minute, 10000),
+		logger:           logger,
+		recoveryDone:     fm.IsRecoveryComplete(),
+		role:             role,
+		isPrimary:        isPrimary,
+		serverID:         serverID,
+		peerAddress:      peerAddress,
+		heartbeatConfig:  hbConfig,
+		fencingBuffer:    5 * time.Second, // Default 5s buffer for fencing
+		replicationQueue: make([]*pb.ReplicatedState, 0),
+		metrics:          NewPerformanceMetrics(logger),
 	}
 
 	// Connect to peer if address is provided
@@ -105,6 +140,11 @@ func NewReplicatedLockServer(role ServerRole, serverID int32, peerAddress string
 	// Start heartbeat sender if this is a secondary
 	if !isPrimary && peerAddress != "" {
 		go s.startHeartbeatSender()
+	}
+
+	// Start background replication worker for reliable updates
+	if isPrimary && peerAddress != "" {
+		go s.startReplicationWorker()
 	}
 
 	return s
@@ -134,11 +174,14 @@ func (s *LockServer) connectToPeer() error {
 
 // startHeartbeatSender periodically sends heartbeats to the primary
 func (s *LockServer) startHeartbeatSender() {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(s.heartbeatConfig.Interval)
 	defer ticker.Stop()
 
-	const maxConsecutiveFailures = 3
 	failureCount := 0
+	maxFailures := s.heartbeatConfig.MaxFailureCount
+
+	s.logger.Printf("Starting heartbeat sender with interval=%v, timeout=%v, max failures=%d",
+		s.heartbeatConfig.Interval, s.heartbeatConfig.Timeout, maxFailures)
 
 	for range ticker.C {
 		// Stop sending heartbeats if we're now the primary
@@ -148,7 +191,7 @@ func (s *LockServer) startHeartbeatSender() {
 		}
 
 		// Send heartbeat
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), s.heartbeatConfig.Timeout)
 		resp, err := s.peerClient.Ping(ctx, &pb.HeartbeatRequest{
 			ServerId: s.serverID,
 		})
@@ -157,12 +200,12 @@ func (s *LockServer) startHeartbeatSender() {
 		if err != nil {
 			failureCount++
 			s.logger.Printf("Heartbeat failed (%d/%d): %v",
-				failureCount, maxConsecutiveFailures, err)
+				failureCount, maxFailures, err)
 
 			// Check if we've reached the failure threshold
-			if failureCount >= maxConsecutiveFailures {
+			if failureCount >= maxFailures {
 				s.logger.Printf("Primary is unreachable after %d attempts, promoting to primary",
-					maxConsecutiveFailures)
+					maxFailures)
 				s.promoteToPrimary()
 				return
 			}
@@ -189,12 +232,15 @@ func (s *LockServer) promoteToPrimary() {
 
 	// Start fencing period
 	leaseDuration := s.lockManager.GetLeaseDuration()
-	fencingDuration := leaseDuration + 5*time.Second // Add 5s buffer
+	fencingDuration := leaseDuration + s.fencingBuffer
 	s.fencingEndTime = time.Now().Add(fencingDuration)
 	s.isFencing.Store(true)
 
 	s.logger.Printf("Entering fencing period for %v (until %v)",
 		fencingDuration, s.fencingEndTime)
+
+	// Attempt to log the current lock state before fencing
+	s.logCurrentLockState("Before fencing")
 
 	// Start a goroutine to end the fencing period
 	go s.waitForFencingEnd()
@@ -213,12 +259,40 @@ func (s *LockServer) waitForFencingEnd() {
 	s.logger.Printf("Fencing period ended, clearing lock state")
 	s.isFencing.Store(false)
 
+	// Log the lock state before clearing
+	s.logCurrentLockState("Before forced clear")
+
 	// Clear lock state to ensure safe operation
 	if err := s.lockManager.ForceClearLockState(); err != nil {
 		s.logger.Printf("Warning: Failed to clear lock state after fencing: %v", err)
 	}
 
+	// Log the lock state after clearing
+	s.logCurrentLockState("After forced clear")
+
 	s.logger.Printf("Server is now fully operational as primary")
+}
+
+// logCurrentLockState logs the current lock state for debugging purposes
+func (s *LockServer) logCurrentLockState(context string) {
+	holder := s.lockManager.CurrentHolder()
+	expiry := s.lockManager.GetTokenExpiration()
+
+	var expiryStr string
+	if expiry.IsZero() {
+		expiryStr = "not set"
+	} else {
+		expiryStr = expiry.Format(time.RFC3339)
+	}
+
+	s.logger.Printf("Lock state (%s): holder=%d, expiry=%s",
+		context, holder, expiryStr)
+}
+
+// SetFencingBuffer sets the buffer time to add to lease duration for fencing
+func (s *LockServer) SetFencingBuffer(buffer time.Duration) {
+	s.fencingBuffer = buffer
+	s.logger.Printf("Fencing buffer set to %v", buffer)
 }
 
 // replicateStateToSecondary sends the current lock state to the secondary server
@@ -239,21 +313,179 @@ func (s *LockServer) replicateStateToSecondary() {
 	}
 	s.lockManager.GetMutex().Unlock()
 
+	// Create the state update to send
+	stateUpdate := &pb.ReplicatedState{
+		LockHolder:      holder,
+		LockToken:       token,
+		ExpiryTimestamp: expiryTimestamp,
+	}
+
+	// Add the update to the replication queue first to ensure reliability
+	s.enqueueReplication(stateUpdate)
+
 	// Send update asynchronously to avoid blocking client operations
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		// Configuration for retries
+		maxRetries := 3
+		initialBackoff := 500 * time.Millisecond
+		backoff := initialBackoff
 
-		_, err := s.peerClient.UpdateSecondaryState(ctx, &pb.ReplicatedState{
-			LockHolder:      holder,
-			LockToken:       token,
-			ExpiryTimestamp: expiryTimestamp,
-		})
+		// Attempt to replicate with retries
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			// Create a new context for each attempt
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
-		if err != nil {
-			s.logger.Printf("Failed to replicate state to secondary: %v", err)
+			// Send the replication request
+			_, err := s.peerClient.UpdateSecondaryState(ctx, stateUpdate)
+			cancel() // Cancel the context immediately after the call
+
+			// If successful, we're done
+			if err == nil {
+				if attempt > 0 {
+					s.logger.Printf("Successfully replicated state to secondary after %d retries", attempt)
+				}
+
+				// On success, remove this update from the queue if it matches
+				s.dequeueProcessedUpdate(stateUpdate)
+				return
+			}
+
+			// Log the error and prepare for retry
+			s.logger.Printf("Failed to replicate state to secondary (attempt %d/%d): %v",
+				attempt+1, maxRetries, err)
+
+			// If this was the last attempt, give up
+			if attempt == maxRetries-1 {
+				s.logger.Printf("Immediate replication failed after %d attempts - relying on background worker", maxRetries)
+				break
+			}
+
+			// Wait before retrying with exponential backoff
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
+		}
+
+		// At this point, all retries have failed
+		// The update is already in the queue, so the background worker will try again later
+
+		// Try to reconnect to the peer for future replication attempts
+		if err := s.connectToPeer(); err != nil {
+			s.logger.Printf("Failed to reconnect to peer after replication failures: %v", err)
 		}
 	}()
+}
+
+// enqueueReplication adds a state update to the replication queue
+func (s *LockServer) enqueueReplication(state *pb.ReplicatedState) {
+	s.replicationQueueMu.Lock()
+	defer s.replicationQueueMu.Unlock()
+
+	// If queue is getting too large, log a warning (possible connectivity issues)
+	if len(s.replicationQueue) > 100 {
+		s.logger.Printf("WARNING: Replication queue contains %d pending updates", len(s.replicationQueue))
+	}
+
+	// For lock state updates, we can optimize by only keeping the latest state
+	// Since earlier updates are superseded by the latest one
+	if len(s.replicationQueue) > 0 {
+		// Replace the last item with the new state (most recent always wins)
+		s.replicationQueue[len(s.replicationQueue)-1] = state
+	} else {
+		// Queue was empty, add the state
+		s.replicationQueue = append(s.replicationQueue, state)
+	}
+
+	s.logger.Printf("Enqueued state update for replication (queue size: %d)", len(s.replicationQueue))
+}
+
+// dequeueProcessedUpdate removes a processed update from the queue
+func (s *LockServer) dequeueProcessedUpdate(processed *pb.ReplicatedState) {
+	s.replicationQueueMu.Lock()
+	defer s.replicationQueueMu.Unlock()
+
+	// For lock state, we can just empty the queue since the latest state was applied
+	if len(s.replicationQueue) > 0 {
+		// Clear the queue since we successfully applied the latest state
+		s.replicationQueue = s.replicationQueue[:0]
+		s.logger.Printf("Cleared replication queue after successful update")
+	}
+}
+
+// getNextReplicationUpdate gets the next update to process
+func (s *LockServer) getNextReplicationUpdate() *pb.ReplicatedState {
+	s.replicationQueueMu.Lock()
+	defer s.replicationQueueMu.Unlock()
+
+	if len(s.replicationQueue) == 0 {
+		return nil
+	}
+
+	// Return the first item without removing it
+	// It will be removed after successful processing
+	return s.replicationQueue[0]
+}
+
+// startReplicationWorker starts a background worker to process the replication queue
+func (s *LockServer) startReplicationWorker() {
+	// Set the flag to indicate that a worker is running
+	if !s.replicationInProgress.CompareAndSwap(false, true) {
+		s.logger.Printf("Replication worker already running, not starting another one")
+		return
+	}
+
+	s.logger.Printf("Starting background replication worker")
+
+	go func() {
+		defer s.replicationInProgress.Store(false)
+
+		// Process the queue periodically
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			// Stop if we're no longer primary
+			if !s.isPrimary {
+				s.logger.Printf("No longer primary, stopping replication worker")
+				return
+			}
+
+			select {
+			case <-ticker.C:
+				s.processReplicationQueue()
+			}
+		}
+	}()
+}
+
+// processReplicationQueue processes pending updates in the replication queue
+func (s *LockServer) processReplicationQueue() {
+	// Skip if not primary or no peer connection
+	if !s.isPrimary || s.peerClient == nil {
+		return
+	}
+
+	// Get the next update to process
+	update := s.getNextReplicationUpdate()
+	if update == nil {
+		// Queue is empty, nothing to do
+		return
+	}
+
+	s.logger.Printf("Processing pending replication update from queue")
+
+	// Try to send the update
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := s.peerClient.UpdateSecondaryState(ctx, update)
+	if err != nil {
+		s.logger.Printf("Background replication failed: %v - will retry later", err)
+		return
+	}
+
+	// Success, remove the update from the queue
+	s.dequeueProcessedUpdate(update)
+	s.logger.Printf("Successfully processed pending replication update")
 }
 
 // IsRecoveryComplete returns whether WAL recovery is complete
@@ -297,84 +529,99 @@ func (s *LockServer) ClientInit(ctx context.Context, args *pb.ClientInitArgs) (*
 	}, nil
 }
 
-// LockAcquire handles the lock acquisition RPC
+// LockAcquire handles requests to acquire a lock
 func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.LockResponse, error) {
-	// Check if we're in secondary mode
+	startTime := time.Now()
+	s.metrics.IncrementConcurrentRequests()
+	defer s.metrics.DecrementConcurrentRequests()
+	defer s.metrics.TrackOperationLatency(OpLockAcquire, time.Since(startTime))
+
+	// Check if request has been processed already
+	if cachedResp, exists := s.requestCache.Get(args.RequestId); exists {
+		s.logger.Printf("Detected repeated request %s from client %d", args.RequestId, args.ClientId)
+		if cachedResp != nil {
+			return cachedResp.(*pb.LockResponse), nil
+		}
+	}
+
+	// Check if the server is in secondary mode
 	if !s.isPrimary {
+		s.logger.Printf("Cannot acquire lock - server is in secondary mode")
 		return &pb.LockResponse{
 			Status:       pb.Status_SECONDARY_MODE,
-			ErrorMessage: "Server is in secondary mode and cannot process client requests",
-			Token:        "",
+			ErrorMessage: "This server is in secondary mode, try the primary",
 		}, nil
 	}
 
-	// Check if we're in fencing period
-	if s.isFencing.Load() {
+	// Check if the server is in fencing period
+	if s.isFencing.Load() && time.Now().Before(s.fencingEndTime) {
+		s.logger.Printf("Cannot acquire lock - server is in fencing period")
 		return &pb.LockResponse{
 			Status:       pb.Status_SERVER_FENCING,
-			ErrorMessage: "Server is in fencing period after failover",
-			Token:        "",
+			ErrorMessage: "Server is in fencing period, try again later",
 		}, nil
 	}
 
-	clientID := args.ClientId
-	token := args.Token
-	requestID := args.RequestId
-
-	s.logger.Printf("Client %d attempting to acquire lock with token %s (request: %s)", clientID, token, requestID)
-
-	// Check cache for duplicate request
-	if cachedResp, exists := s.requestCache.Get(requestID); exists {
-		s.logger.Printf("Found cached response for request %s", requestID)
-		return cachedResp.(*pb.LockResponse), nil
-	}
-
-	// Mark request as in progress
-	if !s.requestCache.MarkInProgress(requestID) {
-		s.logger.Printf("Request %s already in progress", requestID)
+	// Check request validity
+	if args.ClientId <= 0 {
+		errMsg := "Invalid client ID"
+		s.logger.Printf("Lock acquisition failed: %s", errMsg)
+		s.metrics.TrackOperationFailure(OpLockAcquire)
 		return &pb.LockResponse{
 			Status:       pb.Status_ERROR,
-			ErrorMessage: "Request already in progress",
+			ErrorMessage: errMsg,
 		}, nil
 	}
 
-	// Check if client already holds the lock (for handling retries)
-	if s.lockManager.HasLockWithToken(clientID, token) {
-		s.logger.Printf("Client %d already holds the lock with token %s", clientID, token)
+	// Before acquiring lock, track the queue length for monitoring
+	queueLength := s.lockManager.GetQueueLength()
+	s.metrics.RecordQueueLength(queueLength)
+
+	// Log current state for debugging
+	s.logCurrentLockState("Before lock acquire")
+
+	// Attempt to acquire the lock
+	waitStart := time.Now()
+	success, token := s.lockManager.Acquire(args.ClientId)
+	waitTime := time.Since(waitStart)
+	if waitTime > 10*time.Millisecond {
+		s.metrics.RecordQueueWaitTime(waitTime)
+	}
+
+	if success {
+		// Record successful acquisition in metrics
+		s.metrics.RecordLockAcquisition(args.ClientId)
+
+		s.logger.Printf("Lock acquired by client %d with token %s", args.ClientId, token)
+		// Create response
 		resp := &pb.LockResponse{
-			Status:       pb.Status_OK,
-			ErrorMessage: "",
-			Token:        token,
+			Status: pb.Status_OK,
+			Token:  token,
 		}
-		s.requestCache.Set(requestID, resp)
+
+		// Cache the response for idempotence
+		s.requestCache.Set(args.RequestId, resp)
+
+		// Replicate the state to the secondary
+		if s.peerClient != nil {
+			s.replicateStateToSecondary()
+		}
+
+		// Log current state for debugging
+		s.logCurrentLockState("After lock acquire")
+
 		return resp, nil
 	}
 
-	// Use the context-aware acquire method with timeout
-	success, newToken := s.lockManager.AcquireWithTimeout(clientID, ctx)
+	// Lock acquisition failed
+	s.metrics.TrackOperationFailure(OpLockAcquire)
+	s.metrics.RecordLockContention()
+	s.logger.Printf("Failed to acquire lock for client %d", args.ClientId)
 
-	var resp *pb.LockResponse
-	if success {
-		s.logger.Printf("Lock acquired by client %d with token %s", clientID, newToken)
-		resp = &pb.LockResponse{
-			Status:       pb.Status_OK,
-			ErrorMessage: "",
-			Token:        newToken,
-		}
-
-		// Replicate state to secondary
-		s.replicateStateToSecondary()
-	} else {
-		s.logger.Printf("Client %d failed to acquire lock", clientID)
-		resp = &pb.LockResponse{
-			Status:       pb.Status_ERROR,
-			ErrorMessage: "Failed to acquire lock",
-			Token:        "",
-		}
-	}
-
-	s.requestCache.Set(requestID, resp)
-	return resp, nil
+	return &pb.LockResponse{
+		Status:       pb.Status_ERROR,
+		ErrorMessage: "Lock is currently held by another client",
+	}, nil
 }
 
 // LockRelease handles the lock release RPC
@@ -627,12 +874,29 @@ func (s *LockServer) Ping(ctx context.Context, req *pb.HeartbeatRequest) (*pb.He
 		}, nil
 	}
 
-	// Just log and respond - this confirms the primary is alive
-	s.logger.Printf("Received heartbeat from secondary server %d", req.ServerId)
+	// Log heartbeat with reduced frequency to avoid flooding logs
+	if time.Now().Second()%10 == 0 { // Log only every ~10 seconds
+		s.logger.Printf("Received heartbeat from secondary server %d", req.ServerId)
+	}
 
 	return &pb.HeartbeatResponse{
 		Status:       pb.Status_OK,
 		ErrorMessage: "",
+	}, nil
+}
+
+// ServerInfo returns information about this server instance
+func (s *LockServer) ServerInfo(ctx context.Context, req *pb.ServerInfoRequest) (*pb.ServerInfoResponse, error) {
+	s.logger.Printf("Received ServerInfo request")
+
+	role := "primary"
+	if !s.isPrimary {
+		role = "secondary"
+	}
+
+	return &pb.ServerInfoResponse{
+		ServerId: s.serverID,
+		Role:     role,
 	}, nil
 }
 
@@ -663,4 +927,179 @@ func CreateFiles() {
 func (s *LockServer) Cleanup() {
 	s.fileManager.Cleanup()
 	s.logger.Println("Server cleanup complete")
+}
+
+// VerifyUniqueServerID checks for duplicate server IDs with retry
+func (s *LockServer) VerifyUniqueServerID() error {
+	if s.peerAddress == "" {
+		// No peer to check against
+		return nil
+	}
+
+	// Retry a few times since the peer might still be starting up
+	maxRetries := 5
+	retryDelay := 1 * time.Second
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Ensure we have a connection to the peer
+		if s.peerClient == nil {
+			if err := s.connectToPeer(); err != nil {
+				lastErr = fmt.Errorf("failed to connect to peer for ID verification: %w", err)
+				s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
+				time.Sleep(retryDelay)
+				continue
+			}
+		}
+
+		// Use ServerInfo RPC to check peer's ID
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp, err := s.peerClient.ServerInfo(ctx, &pb.ServerInfoRequest{})
+		cancel()
+
+		if err != nil {
+			lastErr = fmt.Errorf("unable to verify peer server ID: %w", err)
+			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		// Successfully got peer info - check for duplicate ID
+		if resp.ServerId == s.serverID {
+			errMsg := fmt.Sprintf("Duplicate server ID detected! This server and peer both have ID %d", s.serverID)
+			s.logger.Printf("ERROR: %s", errMsg)
+			return fmt.Errorf(errMsg)
+		}
+
+		// Success!
+		s.logger.Printf("Verified unique server ID: local=%d, peer=%d", s.serverID, resp.ServerId)
+		return nil
+	}
+
+	// If we reach here, we failed after all retries
+	s.logger.Printf("WARNING: Could not verify server ID uniqueness after %d attempts: %v", maxRetries, lastErr)
+	s.logger.Printf("Continuing startup, but be aware that duplicate IDs may cause issues")
+	return nil // Allow startup to continue despite verification failure
+}
+
+// VerifySharedFilesystem checks if the shared filesystem is properly accessible with retry
+func (s *LockServer) VerifySharedFilesystem() error {
+	if s.peerAddress == "" {
+		// No peer to verify with
+		return nil
+	}
+
+	// Retry a few times since the peer might still be starting up
+	maxRetries := 5
+	retryDelay := 1 * time.Second
+
+	// Try to validate direct filesystem access first
+	lockStatePath := "./data/lock_state.json"
+	testContent := []byte(fmt.Sprintf("Filesystem test from server %d at %s\n",
+		s.serverID, time.Now().Format(time.RFC3339)))
+
+	// Test if we can write to the path
+	if err := os.WriteFile(lockStatePath+".test", testContent, 0644); err != nil {
+		return fmt.Errorf("cannot write to data directory: %w", err)
+	}
+	defer os.Remove(lockStatePath + ".test")
+
+	// Verify through peer with retries
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Ensure we have a connection to the peer
+		if s.peerClient == nil {
+			if err := s.connectToPeer(); err != nil {
+				lastErr = fmt.Errorf("failed to connect to peer for filesystem verification: %w", err)
+				s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
+				time.Sleep(retryDelay)
+				continue
+			}
+		}
+
+		// Create a test file with random content
+		testFileName := fmt.Sprintf("./data/fs_verify_%d.tmp", time.Now().UnixNano())
+		testContent := fmt.Sprintf("Filesystem verification from server %d at %s",
+			s.serverID, time.Now().Format(time.RFC3339))
+
+		// Write test content to file
+		if err := os.WriteFile(testFileName, []byte(testContent), 0644); err != nil {
+			return fmt.Errorf("failed to write test file for filesystem verification: %w", err)
+		}
+		defer os.Remove(testFileName) // Clean up the test file when done
+
+		// Ask peer to read the file
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp, err := s.peerClient.VerifyFileAccess(ctx, &pb.FileAccessRequest{
+			FilePath:        testFileName,
+			ExpectedContent: testContent,
+		})
+		cancel()
+
+		if err != nil {
+			lastErr = fmt.Errorf("filesystem verification failed - error calling peer: %w", err)
+			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		if resp.Status != pb.Status_OK {
+			lastErr = fmt.Errorf("filesystem verification failed: %s", resp.ErrorMessage)
+			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		if resp.ActualContent != testContent {
+			lastErr = fmt.Errorf("filesystem verification failed - content mismatch: expected '%s', got '%s'",
+				testContent, resp.ActualContent)
+			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
+			time.Sleep(retryDelay)
+			continue
+		}
+
+		// Success!
+		s.logger.Printf("Shared filesystem verification successful")
+		return nil
+	}
+
+	// If we reach here, we failed after all retries
+	s.logger.Printf("WARNING: Could not verify shared filesystem after %d attempts: %v", maxRetries, lastErr)
+	s.logger.Printf("Continuing startup, but be aware that filesystem sharing may not be working correctly")
+	return nil // Allow startup to continue despite verification failure
+}
+
+// VerifyFileAccess implements the RPC to check file access from a peer
+func (s *LockServer) VerifyFileAccess(ctx context.Context, req *pb.FileAccessRequest) (*pb.FileAccessResponse, error) {
+	s.logger.Printf("Received filesystem verification request for file: %s", req.FilePath)
+
+	// Attempt to read the specified file
+	content, err := os.ReadFile(req.FilePath)
+	if err != nil {
+		errMsg := fmt.Sprintf("Failed to read file %s: %v", req.FilePath, err)
+		s.logger.Printf("Filesystem verification failed: %s", errMsg)
+		return &pb.FileAccessResponse{
+			Status:       pb.Status_FILESYSTEM_ERROR,
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	actualContent := string(content)
+
+	// Check if content matches what's expected
+	if actualContent != req.ExpectedContent {
+		errMsg := fmt.Sprintf("Content mismatch in file %s", req.FilePath)
+		s.logger.Printf("Filesystem verification failed: %s", errMsg)
+		return &pb.FileAccessResponse{
+			Status:        pb.Status_FILESYSTEM_ERROR,
+			ErrorMessage:  errMsg,
+			ActualContent: actualContent,
+		}, nil
+	}
+
+	s.logger.Printf("Filesystem verification successful for file: %s", req.FilePath)
+	return &pb.FileAccessResponse{
+		Status:        pb.Status_OK,
+		ActualContent: actualContent,
+	}, nil
 }

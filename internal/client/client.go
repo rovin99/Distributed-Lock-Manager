@@ -33,6 +33,11 @@ type LockClient struct {
 	clientUUID     string     // Unique instance ID to survive crashes
 	mu             sync.Mutex // Protects sequenceNumber and lockToken
 
+	// Added for high availability
+	serverAddrs      []string   // List of all available server addresses
+	currentServerIdx int        // Index of the current server in use
+	serverMu         sync.Mutex // Protects server-related fields
+
 	// Added for lease management
 	lockToken     string        // Current lock token
 	hasLock       bool          // Whether the client currently holds a lock
@@ -41,28 +46,81 @@ type LockClient struct {
 	cancelRenewal chan struct{} // Channel to stop renewal goroutine
 }
 
-// NewLockClient creates a new client connected to the server
+// NewLockClient creates a new client connected to the primary server
 func NewLockClient(serverAddr string, clientID int32) (*LockClient, error) {
-	// Establish a connection to the server
-	conn, err := grpc.Dial(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to server: %v", err)
+	return NewLockClientWithFailover([]string{serverAddr}, clientID)
+}
+
+// NewLockClientWithFailover creates a new client with multiple server addresses for failover
+func NewLockClientWithFailover(serverAddrs []string, clientID int32) (*LockClient, error) {
+	if len(serverAddrs) == 0 {
+		return nil, fmt.Errorf("at least one server address must be provided")
 	}
 
-	// Create a gRPC client instance
-	client := pb.NewLockServiceClient(conn)
+	client := &LockClient{
+		id:               clientID,
+		sequenceNumber:   0,
+		clientUUID:       uuid.New().String(),
+		serverAddrs:      serverAddrs,
+		currentServerIdx: 0,
+		lockToken:        "",
+		hasLock:          false,
+		renewalActive:    false,
+		cancelRenewal:    make(chan struct{}),
+	}
 
-	return &LockClient{
-		conn:           conn,
-		client:         client,
-		id:             clientID,
-		sequenceNumber: 0,                   // Initialize sequence number
-		clientUUID:     uuid.New().String(), // Generate a unique UUID for this client instance
-		lockToken:      "",
-		hasLock:        false,
-		renewalActive:  false,
-		cancelRenewal:  make(chan struct{}),
-	}, nil
+	// Connect to the first server
+	if err := client.connectToCurrentServer(); err != nil {
+		return nil, fmt.Errorf("failed to connect to initial server: %w", err)
+	}
+
+	return client, nil
+}
+
+// connectToCurrentServer establishes a connection to the current server
+func (c *LockClient) connectToCurrentServer() error {
+	c.serverMu.Lock()
+	defer c.serverMu.Unlock()
+
+	// Close existing connection if there is one
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+		c.client = nil
+	}
+
+	// Get current server address
+	if c.currentServerIdx >= len(c.serverAddrs) {
+		return fmt.Errorf("no available servers to connect to")
+	}
+
+	serverAddr := c.serverAddrs[c.currentServerIdx]
+	conn, err := grpc.Dial(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("failed to connect to server %s: %w", serverAddr, err)
+	}
+
+	c.conn = conn
+	c.client = pb.NewLockServiceClient(conn)
+	fmt.Printf("Connected to server at %s\n", serverAddr)
+	return nil
+}
+
+// tryNextServer attempts to connect to the next available server
+func (c *LockClient) tryNextServer() error {
+	c.serverMu.Lock()
+	defer c.serverMu.Unlock()
+
+	// Move to the next server
+	c.currentServerIdx = (c.currentServerIdx + 1) % len(c.serverAddrs)
+
+	// If we've tried all servers and came back to the first one, return error
+	if c.currentServerIdx == 0 {
+		return fmt.Errorf("tried all available servers, none are reachable")
+	}
+
+	// Try to connect to the next server
+	return c.connectToCurrentServer()
 }
 
 // GenerateRequestID creates a unique request ID
@@ -116,14 +174,26 @@ func (c *LockClient) startLeaseRenewal() {
 				// Attempt to renew the lease
 				if err := c.renewLease(currentToken); err != nil {
 					fmt.Printf("Lease renewal failed: %v\n", err)
-					// If renewal fails, we should stop renewal and invalidate the lock
-					c.mu.Lock()
-					if c.lockToken == currentToken {
-						c.hasLock = false
-						c.lockToken = ""
+
+					// If it's a server unavailable error, try to reconnect to another server
+					if IsServerUnavailable(err) {
+						fmt.Println("Attempting to connect to another server...")
+						if reconnErr := c.tryNextServer(); reconnErr != nil {
+							fmt.Printf("Failed to connect to another server: %v\n", reconnErr)
+						} else {
+							// Try lease renewal again with the new server
+							if err := c.renewLease(currentToken); err != nil {
+								fmt.Printf("Lease renewal with new server failed: %v\n", err)
+								c.invalidateLock()
+							} else {
+								fmt.Println("Successfully renewed lease with new server")
+								continue
+							}
+						}
+					} else {
+						// For other errors, invalidate the lock
+						c.invalidateLock()
 					}
-					c.renewalActive = false
-					c.mu.Unlock()
 					return
 				}
 
@@ -136,6 +206,16 @@ func (c *LockClient) startLeaseRenewal() {
 			}
 		}
 	}(currentToken)
+}
+
+// invalidateLock clears the client's lock state
+func (c *LockClient) invalidateLock() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.hasLock = false
+	c.lockToken = ""
+	c.renewalActive = false
 }
 
 // stopLeaseRenewal stops the background lease renewal
@@ -151,6 +231,7 @@ func (c *LockClient) stopLeaseRenewal() {
 // retryRPC is a generic function that executes an RPC with retries and exponential backoff
 func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*pb.LockResponse, error)) (*pb.LockResponse, error) {
 	var lastErr error
+	backoff := initialBackoff
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// Create a context with timeout for this attempt
@@ -165,73 +246,65 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 			return resp, nil
 		}
 
-		// Handle DeadlineExceeded error specially
-		if err != nil && strings.Contains(err.Error(), "DeadlineExceeded") {
-			// For lock release, if we get a DeadlineExceeded, we should verify the lock was released
-			if operation == "LockRelease" {
-				// Try one more time with a fresh context to verify the lock was released
-				verifyCtx, verifyCancel := context.WithTimeout(context.Background(), initialTimeout)
-				verifyResp, verifyErr := rpcFunc(verifyCtx)
-				verifyCancel()
-
-				// If the verification succeeds or we get a specific error indicating the lock is not held,
-				// then we can assume the lock was released
-				if verifyErr == nil && verifyResp.Status == pb.Status_OK ||
-					(verifyErr == nil && verifyResp.Status == pb.Status_INVALID_TOKEN) {
-					// Update client state since the lock was released
-					c.mu.Lock()
-					c.hasLock = false
-					c.lockToken = ""
-					c.mu.Unlock()
-					c.stopLeaseRenewal()
-					cancel()
-					return &pb.LockResponse{Status: pb.Status_OK}, nil
-				}
-			}
+		// Handle server fencing error
+		if err == nil && resp.Status == pb.Status_SERVER_FENCING {
+			fmt.Printf("Server is in fencing period, retrying in %v...\n", backoff)
+			cancel()
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
+			continue
 		}
 
-		// Save error for return if all attempts fail
+		// Handle secondary mode error (server is not primary)
+		if err == nil && resp.Status == pb.Status_SECONDARY_MODE {
+			fmt.Printf("Server is in secondary mode, trying next server...\n")
+			cancel()
+
+			// Try next server
+			if reconnErr := c.tryNextServer(); reconnErr != nil {
+				lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
+				break // No more servers to try
+			}
+			continue // Try with new server
+		}
+
+		// Handle connection errors (server might be down)
+		if err != nil && (strings.Contains(err.Error(), "connection") ||
+			strings.Contains(err.Error(), "Unavailable") ||
+			strings.Contains(err.Error(), "DeadlineExceeded")) {
+
+			fmt.Printf("Connection error on attempt %d: %v, trying next server...\n", attempt+1, err)
+			cancel()
+
+			// Try next server
+			if reconnErr := c.tryNextServer(); reconnErr != nil {
+				lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
+				break // No more servers to try
+			}
+			continue // Try with new server
+		}
+
+		// Handle token validation errors
+		if err == nil && (resp.Status == pb.Status_INVALID_TOKEN || resp.Status == pb.Status_PERMISSION_DENIED) {
+			cancel()
+			c.invalidateLock() // Clear lock state
+			return resp, &InvalidTokenError{Message: resp.ErrorMessage}
+		}
+
+		// For other errors, back off and retry
 		if err != nil {
-			lastErr = fmt.Errorf("%s failed: %v", operation, err)
+			lastErr = err
 		} else {
-			lastErr = fmt.Errorf("%s failed with status: %v", operation, resp.Status)
-
-			// Special handling for token-related errors
-			if resp.Status == pb.Status_INVALID_TOKEN {
-				c.mu.Lock()
-				c.hasLock = false
-				c.lockToken = ""
-				c.mu.Unlock()
-				c.stopLeaseRenewal()
-				return nil, &InvalidTokenError{Message: "token validation failed"}
-			}
+			lastErr = fmt.Errorf("server returned status: %v, message: %s", resp.Status, resp.ErrorMessage)
 		}
 
-		// Cancel the context for this attempt
+		fmt.Printf("Attempt %d failed: %v, retrying in %v...\n", attempt+1, lastErr, backoff)
 		cancel()
-
-		// Calculate backoff (2^attempt * initialBackoff)
-		backoff := initialBackoff * time.Duration(1<<uint(attempt))
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second // Cap the maximum backoff
-		}
-
-		fmt.Printf("Retry %d for %s after %v delay\n", attempt+1, operation, backoff)
 		time.Sleep(backoff)
+		backoff *= 2 // Exponential backoff
 	}
 
-	// If we've exhausted retries, the server is likely down
-	// For certain operations, we should invalidate the lock state when server is unreachable
-	if operation == "LockAcquire" || operation == "LockRelease" || operation == "RenewLease" {
-		c.mu.Lock()
-		// If this was a lock release and we couldn't reach the server, assume lock is released
-		// Since the server is unreachable, we can't hold the lock anymore
-		c.hasLock = false
-		c.lockToken = ""
-		c.mu.Unlock()
-		c.stopLeaseRenewal()
-	}
-
+	// All retries failed
 	return nil, &ServerUnavailableError{
 		Operation: operation,
 		Attempts:  maxRetries,
@@ -239,54 +312,81 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 	}
 }
 
-// retryLeaseRenewal is a specialized version for lease renewal
+// retryLeaseRenewal is similar to retryRPC but for lease renewal operations
 func (c *LockClient) retryLeaseRenewal(operation string, rpcFunc func(context.Context) (*pb.LeaseResponse, error)) (*pb.LeaseResponse, error) {
 	var lastErr error
+	backoff := initialBackoff
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Create a context with timeout for this attempt
 		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
 
+		// Execute the RPC
 		resp, err := rpcFunc(ctx)
+
+		// Check for success
 		if err == nil && resp.Status == pb.Status_OK {
-			cancel()
+			cancel() // Remember to cancel the context on success
 			return resp, nil
 		}
 
-		if err != nil {
-			lastErr = fmt.Errorf("%s failed: %v", operation, err)
-		} else {
-			lastErr = fmt.Errorf("%s failed with status: %v", operation, resp.Status)
+		// Handle server fencing error (similar to retryRPC)
+		if err == nil && resp.Status == pb.Status_SERVER_FENCING {
+			fmt.Printf("Server is in fencing period, retrying in %v...\n", backoff)
+			cancel()
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
+			continue
+		}
 
-			// Handle invalid token errors
-			if resp.Status == pb.Status_INVALID_TOKEN {
-				c.mu.Lock()
-				c.hasLock = false
-				c.lockToken = ""
-				c.mu.Unlock()
-				c.stopLeaseRenewal()
-				cancel()
-				return nil, &InvalidTokenError{Message: "token validation failed during lease renewal"}
+		// Handle secondary mode error (server is not primary)
+		if err == nil && resp.Status == pb.Status_SECONDARY_MODE {
+			fmt.Printf("Server is in secondary mode, trying next server...\n")
+			cancel()
+
+			if reconnErr := c.tryNextServer(); reconnErr != nil {
+				lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
+				break // No more servers to try
 			}
+			continue // Try with new server
 		}
 
+		// Handle connection errors (server might be down)
+		if err != nil && (strings.Contains(err.Error(), "connection") ||
+			strings.Contains(err.Error(), "Unavailable") ||
+			strings.Contains(err.Error(), "DeadlineExceeded")) {
+
+			fmt.Printf("Connection error on attempt %d: %v, trying next server...\n", attempt+1, err)
+			cancel()
+
+			if reconnErr := c.tryNextServer(); reconnErr != nil {
+				lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
+				break
+			}
+			continue
+		}
+
+		// Handle token validation errors
+		if err == nil && (resp.Status == pb.Status_INVALID_TOKEN || resp.Status == pb.Status_PERMISSION_DENIED) {
+			cancel()
+			c.invalidateLock() // Clear lock state
+			return resp, &InvalidTokenError{Message: resp.ErrorMessage}
+		}
+
+		// For other errors, back off and retry
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("server returned status: %v, message: %s", resp.Status, resp.ErrorMessage)
+		}
+
+		fmt.Printf("Attempt %d failed: %v, retrying in %v...\n", attempt+1, lastErr, backoff)
 		cancel()
-
-		backoff := initialBackoff * time.Duration(1<<uint(attempt))
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
-		}
-
-		fmt.Printf("Retry %d for %s after %v delay\n", attempt+1, operation, backoff)
 		time.Sleep(backoff)
+		backoff *= 2 // Exponential backoff
 	}
 
-	// If lease renewal fails after max retries, we should invalidate the lock
-	c.mu.Lock()
-	c.hasLock = false
-	c.lockToken = ""
-	c.mu.Unlock()
-	c.stopLeaseRenewal()
-
+	// All retries failed
 	return nil, &ServerUnavailableError{
 		Operation: operation,
 		Attempts:  maxRetries,
@@ -294,54 +394,81 @@ func (c *LockClient) retryLeaseRenewal(operation string, rpcFunc func(context.Co
 	}
 }
 
-// retryFileAppend is a specialized version for file append
+// retryFileAppend is a specialized retry function for file append operations
 func (c *LockClient) retryFileAppend(operation string, rpcFunc func(context.Context) (*pb.FileResponse, error)) (*pb.FileResponse, error) {
 	var lastErr error
+	backoff := initialBackoff
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Create a context with timeout for this attempt
 		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
 
+		// Execute the RPC
 		resp, err := rpcFunc(ctx)
+
+		// Check for success
 		if err == nil && resp.Status == pb.Status_OK {
-			cancel()
+			cancel() // Remember to cancel the context on success
 			return resp, nil
 		}
 
-		if err != nil {
-			lastErr = fmt.Errorf("%s failed: %v", operation, err)
-		} else {
-			lastErr = fmt.Errorf("%s failed with status: %v", operation, resp.Status)
+		// Handle server fencing error
+		if err == nil && resp.Status == pb.Status_SERVER_FENCING {
+			fmt.Printf("Server is in fencing period, retrying in %v...\n", backoff)
+			cancel()
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
+			continue
+		}
 
-			// Handle invalid token errors
-			if resp.Status == pb.Status_INVALID_TOKEN {
-				c.mu.Lock()
-				c.hasLock = false
-				c.lockToken = ""
-				c.mu.Unlock()
-				c.stopLeaseRenewal()
-				cancel()
-				return nil, &InvalidTokenError{Message: "token validation failed during file operation"}
+		// Handle secondary mode error
+		if err == nil && resp.Status == pb.Status_SECONDARY_MODE {
+			fmt.Printf("Server is in secondary mode, trying next server...\n")
+			cancel()
+
+			if reconnErr := c.tryNextServer(); reconnErr != nil {
+				lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
+				break
 			}
+			continue
 		}
 
+		// Handle connection errors
+		if err != nil && (strings.Contains(err.Error(), "connection") ||
+			strings.Contains(err.Error(), "Unavailable") ||
+			strings.Contains(err.Error(), "DeadlineExceeded")) {
+
+			fmt.Printf("Connection error on attempt %d: %v, trying next server...\n", attempt+1, err)
+			cancel()
+
+			if reconnErr := c.tryNextServer(); reconnErr != nil {
+				lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
+				break
+			}
+			continue
+		}
+
+		// Handle token validation errors
+		if err == nil && (resp.Status == pb.Status_INVALID_TOKEN || resp.Status == pb.Status_PERMISSION_DENIED) {
+			cancel()
+			c.invalidateLock() // Clear lock state
+			return resp, &InvalidTokenError{Message: resp.ErrorMessage}
+		}
+
+		// For other errors, back off and retry
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("server returned status: %v, message: %s", resp.Status, resp.ErrorMessage)
+		}
+
+		fmt.Printf("Attempt %d failed: %v, retrying in %v...\n", attempt+1, lastErr, backoff)
 		cancel()
-
-		backoff := initialBackoff * time.Duration(1<<uint(attempt))
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
-		}
-
-		fmt.Printf("Retry %d for %s after %v delay\n", attempt+1, operation, backoff)
 		time.Sleep(backoff)
+		backoff *= 2 // Exponential backoff
 	}
 
-	// For file operations, we should also invalidate the lock if server is unreachable
-	c.mu.Lock()
-	c.hasLock = false
-	c.lockToken = ""
-	c.mu.Unlock()
-	c.stopLeaseRenewal()
-
+	// All retries failed
 	return nil, &ServerUnavailableError{
 		Operation: operation,
 		Attempts:  maxRetries,

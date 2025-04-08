@@ -26,6 +26,8 @@ const (
 	LockService_RenewLease_FullMethodName           = "/lock.LockService/RenewLease"
 	LockService_UpdateSecondaryState_FullMethodName = "/lock.LockService/UpdateSecondaryState"
 	LockService_Ping_FullMethodName                 = "/lock.LockService/Ping"
+	LockService_ServerInfo_FullMethodName           = "/lock.LockService/ServerInfo"
+	LockService_VerifyFileAccess_FullMethodName     = "/lock.LockService/VerifyFileAccess"
 )
 
 // LockServiceClient is the client API for LockService service.
@@ -48,6 +50,10 @@ type LockServiceClient interface {
 	UpdateSecondaryState(ctx context.Context, in *ReplicatedState, opts ...grpc.CallOption) (*ReplicationResponse, error)
 	// Heartbeat to check if primary is alive (Secondary -> Primary)
 	Ping(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
+	// Server info (for duplicate ID detection)
+	ServerInfo(ctx context.Context, in *ServerInfoRequest, opts ...grpc.CallOption) (*ServerInfoResponse, error)
+	// Verify file access (to check shared filesystem)
+	VerifyFileAccess(ctx context.Context, in *FileAccessRequest, opts ...grpc.CallOption) (*FileAccessResponse, error)
 }
 
 type lockServiceClient struct {
@@ -128,6 +134,26 @@ func (c *lockServiceClient) Ping(ctx context.Context, in *HeartbeatRequest, opts
 	return out, nil
 }
 
+func (c *lockServiceClient) ServerInfo(ctx context.Context, in *ServerInfoRequest, opts ...grpc.CallOption) (*ServerInfoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ServerInfoResponse)
+	err := c.cc.Invoke(ctx, LockService_ServerInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *lockServiceClient) VerifyFileAccess(ctx context.Context, in *FileAccessRequest, opts ...grpc.CallOption) (*FileAccessResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FileAccessResponse)
+	err := c.cc.Invoke(ctx, LockService_VerifyFileAccess_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LockServiceServer is the server API for LockService service.
 // All implementations must embed UnimplementedLockServiceServer
 // for forward compatibility.
@@ -148,6 +174,10 @@ type LockServiceServer interface {
 	UpdateSecondaryState(context.Context, *ReplicatedState) (*ReplicationResponse, error)
 	// Heartbeat to check if primary is alive (Secondary -> Primary)
 	Ping(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
+	// Server info (for duplicate ID detection)
+	ServerInfo(context.Context, *ServerInfoRequest) (*ServerInfoResponse, error)
+	// Verify file access (to check shared filesystem)
+	VerifyFileAccess(context.Context, *FileAccessRequest) (*FileAccessResponse, error)
 	mustEmbedUnimplementedLockServiceServer()
 }
 
@@ -178,6 +208,12 @@ func (UnimplementedLockServiceServer) UpdateSecondaryState(context.Context, *Rep
 }
 func (UnimplementedLockServiceServer) Ping(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Ping not implemented")
+}
+func (UnimplementedLockServiceServer) ServerInfo(context.Context, *ServerInfoRequest) (*ServerInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ServerInfo not implemented")
+}
+func (UnimplementedLockServiceServer) VerifyFileAccess(context.Context, *FileAccessRequest) (*FileAccessResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method VerifyFileAccess not implemented")
 }
 func (UnimplementedLockServiceServer) mustEmbedUnimplementedLockServiceServer() {}
 func (UnimplementedLockServiceServer) testEmbeddedByValue()                     {}
@@ -326,6 +362,42 @@ func _LockService_Ping_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LockService_ServerInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ServerInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LockServiceServer).ServerInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LockService_ServerInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LockServiceServer).ServerInfo(ctx, req.(*ServerInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LockService_VerifyFileAccess_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FileAccessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LockServiceServer).VerifyFileAccess(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LockService_VerifyFileAccess_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LockServiceServer).VerifyFileAccess(ctx, req.(*FileAccessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LockService_ServiceDesc is the grpc.ServiceDesc for LockService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -360,6 +432,14 @@ var LockService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Ping",
 			Handler:    _LockService_Ping_Handler,
+		},
+		{
+			MethodName: "ServerInfo",
+			Handler:    _LockService_ServerInfo_Handler,
+		},
+		{
+			MethodName: "VerifyFileAccess",
+			Handler:    _LockService_VerifyFileAccess_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

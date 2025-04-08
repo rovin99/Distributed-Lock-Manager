@@ -28,6 +28,12 @@ service LockService {
   
   // Heartbeat to check if primary is alive (Secondary -> Primary)
   rpc Ping (heartbeat_request) returns (heartbeat_response) {}
+
+  // Server info (for duplicate ID detection)
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+  
+  // Verify file access (to check shared filesystem)
+  rpc VerifyFileAccess(FileAccessRequest) returns (FileAccessResponse);
 }
 
 // Client initialization arguments
@@ -108,6 +114,28 @@ message heartbeat_response {
   string error_message = 2;
 }
 
+// ServerInfo request
+message ServerInfoRequest {}
+
+// ServerInfo response
+message ServerInfoResponse {
+  int32 server_id = 1;
+  string role = 2;
+}
+
+// File access verification request
+message FileAccessRequest {
+  string file_path = 1;    // Path to the file to check
+  string expected_content = 2;  // Content that should be in the file
+}
+
+// File access verification response
+message FileAccessResponse {
+  Status status = 1;
+  string error_message = 2;
+  string actual_content = 3;  // What was actually read from the file
+}
+
 // Status codes for responses
 enum Status {
   OK = 0;
@@ -118,4 +146,6 @@ enum Status {
   PERMISSION_DENIED = 5;  // New status for permission-related errors
   SERVER_FENCING = 6;  // Server is in fencing period after promotion
   SECONDARY_MODE = 7;  // Server is in secondary mode and can't process client requests
-}
+  DUPLICATE_SERVER_ID = 8;  // Server detected duplicate server ID
+  FILESYSTEM_ERROR = 9;  // Error accessing shared filesystem
+} 

@@ -21,6 +21,7 @@ func main() {
 	role := flag.String("role", "primary", "Server role: 'primary' or 'secondary'")
 	serverID := flag.Int("id", 1, "Server ID (1 for primary, 2 for secondary)")
 	peerAddress := flag.String("peer", "", "Address of peer server (e.g., 'localhost:50052')")
+	skipVerifications := flag.Bool("skip-verifications", false, "Skip ID and filesystem verifications")
 
 	flag.Parse()
 
@@ -57,6 +58,23 @@ func main() {
 		log.Printf("Server will start but may have inconsistent state")
 	} else {
 		log.Printf("WAL recovery completed successfully")
+	}
+
+	// Perform verifications if this is a replicated setup
+	if *peerAddress != "" && !*skipVerifications {
+		// Verify server ID uniqueness
+		log.Printf("Verifying server ID uniqueness...")
+		if err := lockServer.VerifyUniqueServerID(); err != nil {
+			log.Fatalf("Server ID verification failed: %v", err)
+		}
+		log.Printf("Server ID verification completed")
+
+		// Verify shared filesystem
+		log.Printf("Verifying shared filesystem access...")
+		if err := lockServer.VerifySharedFilesystem(); err != nil {
+			log.Fatalf("Shared filesystem verification failed: %v", err)
+		}
+		log.Printf("Shared filesystem verification completed")
 	}
 
 	// Set up TCP listener using the specified address
