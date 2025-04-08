@@ -576,12 +576,13 @@ func (lm *LockManager) saveState() error {
 	return nil
 }
 
-// safeTokenForLog returns a truncated version of the token for logging
+// safeTokenForLog returns a safe version of token for logging
+// (shortened to avoid cluttering logs with UUID strings)
 func (lm *LockManager) safeTokenForLog(token string) string {
-	if len(token) > 8 {
-		return token[:8]
+	if len(token) <= 8 {
+		return token
 	}
-	return token
+	return token[:8] + "..."
 }
 
 // loadState loads the lock state from a persistent file. If the file doesn't exist,
@@ -728,4 +729,100 @@ func (lm *LockManager) ValidatePersistentState() error {
 	}
 
 	return nil
+}
+
+// ApplyReplicatedState applies a replicated state from the primary server
+// It overwrites the current lock state with the provided values and saves to disk
+func (lm *LockManager) ApplyReplicatedState(holder int32, token string, expiryTimestamp int64) error {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	lm.logger.Printf("Applying replicated state: holder=%d, token=%s, expiry=%v",
+		holder, lm.safeTokenForLog(token), time.Unix(expiryTimestamp, 0))
+
+	// Store original values for rollback if needed
+	originalHolder := lm.lockHolder
+	originalToken := lm.lockToken
+	originalExpiry := lm.leaseExpires
+
+	// Set the new state
+	lm.lockHolder = holder
+	lm.lockToken = token
+
+	// Convert Unix timestamp to time.Time
+	if expiryTimestamp > 0 {
+		lm.leaseExpires = time.Unix(expiryTimestamp, 0)
+	} else {
+		lm.leaseExpires = time.Time{} // Zero time for unlocked state
+	}
+
+	// Save to disk
+	if err := lm.saveState(); err != nil {
+		// Rollback on error
+		lm.lockHolder = originalHolder
+		lm.lockToken = originalToken
+		lm.leaseExpires = originalExpiry
+		lm.logger.Printf("Failed to save replicated state: %v", err)
+		return fmt.Errorf("failed to save replicated state: %w", err)
+	}
+
+	// Signal waiting goroutines in case the replication changed lock state
+	lm.cond.Broadcast()
+
+	return nil
+}
+
+// ForceClearLockState forces the lock state to be cleared and persisted as unlocked
+// Used after fencing period to ensure any potentially stale lock state is cleared
+func (lm *LockManager) ForceClearLockState() error {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	lm.logger.Printf("Forcing clear of lock state")
+
+	// Save original values for logging
+	originalHolder := lm.lockHolder
+	originalToken := lm.lockToken
+
+	// Clear state
+	lm.lockHolder = -1
+	lm.lockToken = ""
+	lm.leaseExpires = time.Time{}
+
+	// Save the cleared state
+	if err := lm.saveState(); err != nil {
+		lm.logger.Printf("Failed to save cleared lock state: %v", err)
+		return fmt.Errorf("failed to save cleared lock state: %w", err)
+	}
+
+	lm.logger.Printf("Successfully cleared lock state (was held by %d with token %s)",
+		originalHolder, lm.safeTokenForLog(originalToken))
+
+	// Signal waiting goroutines
+	lm.cond.Broadcast()
+
+	return nil
+}
+
+// GetMutex returns the mutex for external synchronization
+func (lm *LockManager) GetMutex() *sync.Mutex {
+	return &lm.mu
+}
+
+// CurrentHolderNoLock returns the current lock holder without locking
+// The caller must hold the mutex
+func (lm *LockManager) CurrentHolderNoLock() int32 {
+	return lm.lockHolder
+}
+
+// GetCurrentTokenNoLock returns the current lock token without locking
+// The caller must hold the mutex
+func (lm *LockManager) GetCurrentTokenNoLock() string {
+	return lm.lockToken
+}
+
+// GetTokenExpirationNoLock returns the lock expiration time without locking
+// The caller must hold the mutex
+func (lm *LockManager) GetTokenExpirationNoLock() time.Time {
+	return lm.leaseExpires
 }

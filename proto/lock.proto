@@ -20,6 +20,14 @@ service LockService {
   
   // Renew lease for a lock
   rpc RenewLease (lease_args) returns (lease_response) {}
+  
+  // Server-to-server replication RPCs
+  
+  // Update the secondary server's lock state (Primary -> Secondary)
+  rpc UpdateSecondaryState (replicated_state) returns (replication_response) {}
+  
+  // Heartbeat to check if primary is alive (Secondary -> Primary)
+  rpc Ping (heartbeat_request) returns (heartbeat_response) {}
 }
 
 // Client initialization arguments
@@ -76,6 +84,30 @@ message lease_response {
   string error_message = 2;
 }
 
+// Replicated state message for primary -> secondary communication
+message replicated_state {
+  int32 lock_holder = 1;    // ID of lock holder (-1 if free)
+  string lock_token = 2;    // Current lock token
+  int64 expiry_timestamp = 3; // Expiry time as unix timestamp
+}
+
+// Response to replication update
+message replication_response {
+  Status status = 1;
+  string error_message = 2;
+}
+
+// Heartbeat request (secondary -> primary)
+message heartbeat_request {
+  int32 server_id = 1;  // ID of the secondary server
+}
+
+// Heartbeat response
+message heartbeat_response {
+  Status status = 1;
+  string error_message = 2;
+}
+
 // Status codes for responses
 enum Status {
   OK = 0;
@@ -84,4 +116,6 @@ enum Status {
   LOCK_NOT_HELD = 3;
   INVALID_TOKEN = 4;  // New status for token validation failures
   PERMISSION_DENIED = 5;  // New status for permission-related errors
+  SERVER_FENCING = 6;  // Server is in fencing period after promotion
+  SECONDARY_MODE = 7;  // Server is in secondary mode and can't process client requests
 }

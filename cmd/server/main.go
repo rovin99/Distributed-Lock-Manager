@@ -16,6 +16,12 @@ func main() {
 	// Define flags
 	address := flag.String("address", ":50051", "Address to listen on")
 	recoveryTimeout := flag.Duration("recovery-timeout", 30*time.Second, "Timeout for WAL recovery")
+
+	// Add replication flags
+	role := flag.String("role", "primary", "Server role: 'primary' or 'secondary'")
+	serverID := flag.Int("id", 1, "Server ID (1 for primary, 2 for secondary)")
+	peerAddress := flag.String("peer", "", "Address of peer server (e.g., 'localhost:50052')")
+
 	flag.Parse()
 
 	// Initialize the files
@@ -23,7 +29,25 @@ func main() {
 
 	// Create gRPC server
 	s := grpc.NewServer()
-	lockServer := server.NewLockServer()
+
+	// Determine server role from flags
+	var lockServer *server.LockServer
+	if *role == "primary" || *role == "secondary" {
+		// Convert role string to ServerRole type
+		serverRole := server.PrimaryRole
+		if *role == "secondary" {
+			serverRole = server.SecondaryRole
+		}
+
+		// Create replicated server
+		lockServer = server.NewReplicatedLockServer(serverRole, int32(*serverID), *peerAddress)
+		log.Printf("Starting as %s server (ID: %d) with peer: %s", *role, *serverID, *peerAddress)
+	} else {
+		// Create standalone server (backward compatibility)
+		lockServer = server.NewLockServer()
+		log.Printf("Starting as standalone server (invalid role: %s)", *role)
+	}
+
 	pb.RegisterLockServiceServer(s, lockServer)
 
 	// Wait for WAL recovery to complete
