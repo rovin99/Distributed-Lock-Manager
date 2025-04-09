@@ -11,6 +11,9 @@ import (
 )
 
 func main() {
+	// Add debug for command-line arguments
+	fmt.Println("DEBUG - Raw command-line args:", os.Args)
+
 	// Define command-line flags
 	var (
 		serversFlag = flag.String("servers", "localhost:50051", "Comma-separated list of server addresses")
@@ -22,8 +25,43 @@ func main() {
 		interval    = flag.Duration("interval", 5*time.Second, "Interval between repeated operations")
 	)
 
+	// Custom flag parsing to handle command in the middle
+	var command string
+	var cmdArgs []string
+	var cmdPos int
+
+	// Find the position of the command (acquire, release, append, hold)
+	for i, arg := range os.Args {
+		if arg == "acquire" || arg == "release" || arg == "append" || arg == "hold" {
+			command = arg
+			cmdPos = i
+			break
+		}
+	}
+
+	// If we found a command, split arguments
+	if command != "" {
+		// Parse flags that come before the command
+		flag.CommandLine.Parse(os.Args[1:cmdPos])
+
+		// Parse flags that come after the command
+		if cmdPos+1 < len(os.Args) {
+			cmdArgs = os.Args[cmdPos+1:]
+			flag.CommandLine.Parse(cmdArgs)
+		}
+	} else {
+		// Standard flag parsing if no command found
+		flag.Parse()
+
+		if flag.NArg() < 1 {
+			flag.Usage()
+			os.Exit(1)
+		}
+		command = flag.Arg(0)
+	}
+
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] command\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] command [flags]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Commands:\n")
 		fmt.Fprintf(os.Stderr, "  acquire    Acquire a lock\n")
 		fmt.Fprintf(os.Stderr, "  release    Release a lock\n")
@@ -33,17 +71,16 @@ func main() {
 		flag.PrintDefaults()
 	}
 
-	flag.Parse()
-
-	if flag.NArg() < 1 {
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	command := flag.Arg(0)
+	// Debug flags after parsing
+	fmt.Printf("DEBUG - After flag.Parse(): servers=%s, command=%s\n", *serversFlag, command)
+	fmt.Printf("DEBUG - FLAGS: client-id=%d, file=%s, content=%s, timeout=%v\n",
+		*clientID, *filename, *content, *timeout)
 
 	// Parse the server addresses
 	serverAddrs := strings.Split(*serversFlag, ",")
+
+	// Add debugging output
+	fmt.Printf("INFO: Using server addresses: %v\n", serverAddrs)
 
 	// Create a client with the specified server addresses for failover
 	c, err := client.NewLockClientWithFailover(serverAddrs, int32(*clientID))

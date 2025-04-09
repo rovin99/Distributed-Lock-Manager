@@ -53,6 +53,8 @@ func NewLockClient(serverAddr string, clientID int32) (*LockClient, error) {
 
 // NewLockClientWithFailover creates a new client with multiple server addresses for failover
 func NewLockClientWithFailover(serverAddrs []string, clientID int32) (*LockClient, error) {
+	fmt.Printf("DEBUG: Creating client with server addresses: %v\n", serverAddrs)
+
 	if len(serverAddrs) == 0 {
 		return nil, fmt.Errorf("at least one server address must be provided")
 	}
@@ -69,9 +71,32 @@ func NewLockClientWithFailover(serverAddrs []string, clientID int32) (*LockClien
 		cancelRenewal:    make(chan struct{}),
 	}
 
-	// Connect to the first server
-	if err := client.connectToCurrentServer(); err != nil {
-		return nil, fmt.Errorf("failed to connect to initial server: %w", err)
+	fmt.Printf("DEBUG: Initial client struct created with serverAddrs=%v, currentServerIdx=%d\n",
+		client.serverAddrs, client.currentServerIdx)
+
+	// Try each server in the provided order until one succeeds
+	var lastErr error
+	connected := false
+
+	for i := 0; i < len(serverAddrs); i++ {
+		client.currentServerIdx = i
+		fmt.Printf("DEBUG: Attempting to connect to server at index %d (%s)\n",
+			client.currentServerIdx, serverAddrs[i])
+
+		if err := client.connectToCurrentServer(); err != nil {
+			lastErr = err
+			fmt.Printf("DEBUG: Failed to connect to server %s: %v, trying next...\n", serverAddrs[i], err)
+			continue
+		}
+		connected = true
+		fmt.Printf("DEBUG: Successfully connected to server at index %d (%s)\n",
+			client.currentServerIdx, serverAddrs[i])
+		break
+	}
+
+	if !connected {
+		fmt.Printf("DEBUG: Failed to connect to any server after trying all addresses\n")
+		return nil, fmt.Errorf("failed to connect to any server: %w", lastErr)
 	}
 
 	return client, nil
@@ -84,6 +109,7 @@ func (c *LockClient) connectToCurrentServer() error {
 
 	// Close existing connection if there is one
 	if c.conn != nil {
+		fmt.Printf("DEBUG: Closing existing connection before connecting to new server\n")
 		c.conn.Close()
 		c.conn = nil
 		c.client = nil
@@ -95,14 +121,18 @@ func (c *LockClient) connectToCurrentServer() error {
 	}
 
 	serverAddr := c.serverAddrs[c.currentServerIdx]
+	fmt.Printf("DEBUG: Attempting to connect to server %s (index %d of %d servers)\n",
+		serverAddr, c.currentServerIdx, len(c.serverAddrs))
+
 	conn, err := grpc.Dial(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
+		fmt.Printf("DEBUG: grpc.Dial(%s) failed with error: %v\n", serverAddr, err)
 		return fmt.Errorf("failed to connect to server %s: %w", serverAddr, err)
 	}
 
 	c.conn = conn
 	c.client = pb.NewLockServiceClient(conn)
-	fmt.Printf("Connected to server at %s\n", serverAddr)
+	fmt.Printf("DEBUG: Successfully connected to server at %s (index %d)\n", serverAddr, c.currentServerIdx)
 	return nil
 }
 
@@ -111,16 +141,31 @@ func (c *LockClient) tryNextServer() error {
 	c.serverMu.Lock()
 	defer c.serverMu.Unlock()
 
-	// Move to the next server
-	c.currentServerIdx = (c.currentServerIdx + 1) % len(c.serverAddrs)
+	initialIdx := c.currentServerIdx
 
-	// If we've tried all servers and came back to the first one, return error
-	if c.currentServerIdx == 0 {
-		return fmt.Errorf("tried all available servers, none are reachable")
+	// Try each server in order starting from the next one
+	for i := 0; i < len(c.serverAddrs); i++ {
+		// Move to the next server in a circular fashion
+		c.currentServerIdx = (c.currentServerIdx + 1) % len(c.serverAddrs)
+
+		// Skip if we've come back to the server that just failed
+		if c.currentServerIdx == initialIdx {
+			continue
+		}
+
+		// Try to connect to this server
+		if err := c.connectToCurrentServer(); err != nil {
+			fmt.Printf("Failed to connect to server %s: %v\n",
+				c.serverAddrs[c.currentServerIdx], err)
+			continue
+		}
+
+		// Successfully connected to a server
+		return nil
 	}
 
-	// Try to connect to the next server
-	return c.connectToCurrentServer()
+	// If we got here, we tried all servers and none worked
+	return fmt.Errorf("tried all available servers, none are reachable")
 }
 
 // GenerateRequestID creates a unique request ID
@@ -248,11 +293,12 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 
 		// Handle server fencing error
 		if err == nil && resp.Status == pb.Status_SERVER_FENCING {
-			fmt.Printf("Server is in fencing period, retrying in %v...\n", backoff)
+			fmt.Printf("Server is in fencing period, operation rejected\n")
 			cancel()
-			time.Sleep(backoff)
-			backoff *= 2 // Exponential backoff
-			continue
+			return nil, &ServerFencingError{
+				Operation: operation,
+				Message:   resp.ErrorMessage,
+			}
 		}
 
 		// Handle secondary mode error (server is not primary)
@@ -332,11 +378,12 @@ func (c *LockClient) retryLeaseRenewal(operation string, rpcFunc func(context.Co
 
 		// Handle server fencing error (similar to retryRPC)
 		if err == nil && resp.Status == pb.Status_SERVER_FENCING {
-			fmt.Printf("Server is in fencing period, retrying in %v...\n", backoff)
+			fmt.Printf("Server is in fencing period, operation rejected\n")
 			cancel()
-			time.Sleep(backoff)
-			backoff *= 2 // Exponential backoff
-			continue
+			return nil, &ServerFencingError{
+				Operation: operation,
+				Message:   resp.ErrorMessage,
+			}
 		}
 
 		// Handle secondary mode error (server is not primary)
@@ -414,11 +461,12 @@ func (c *LockClient) retryFileAppend(operation string, rpcFunc func(context.Cont
 
 		// Handle server fencing error
 		if err == nil && resp.Status == pb.Status_SERVER_FENCING {
-			fmt.Printf("Server is in fencing period, retrying in %v...\n", backoff)
+			fmt.Printf("Server is in fencing period, operation rejected\n")
 			cancel()
-			time.Sleep(backoff)
-			backoff *= 2 // Exponential backoff
-			continue
+			return nil, &ServerFencingError{
+				Operation: operation,
+				Message:   resp.ErrorMessage,
+			}
 		}
 
 		// Handle secondary mode error
@@ -611,4 +659,20 @@ func (c *LockClient) LockRelease() error {
 // AcquireLockWithRetry is kept for backward compatibility
 func (c *LockClient) AcquireLockWithRetry() error {
 	return c.LockAcquire()
+}
+
+// ServerFencingError is returned when the server is in fencing period
+type ServerFencingError struct {
+	Operation string
+	Message   string
+}
+
+func (e *ServerFencingError) Error() string {
+	return fmt.Sprintf("operation %s rejected: server is in fencing period - %s", e.Operation, e.Message)
+}
+
+// IsServerFencing checks if an error is a ServerFencingError
+func IsServerFencing(err error) bool {
+	_, ok := err.(*ServerFencingError)
+	return ok
 }

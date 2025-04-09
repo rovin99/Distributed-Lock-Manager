@@ -134,10 +134,15 @@ print_logs() {
 cleanup() {
     print_color $YELLOW "Cleaning up processes..."
     
+    # Use killall for more aggressive cleanup
+    killall -9 lock_server lock_client || true
+    
     # Kill by process name
     pkill -9 -f "lock_server" || true
     pkill -9 -f "bin/server" || true
     pkill -9 -f "lock_client" || true
+    pkill -9 -f "bin/lock_server" || true
+    pkill -9 -f "bin/lock_client" || true
     
     # Kill by port - find processes using our ports and kill them
     for port in $PRIMARY_PORT $SECONDARY_PORT $METRICS_PORT_BASE $REPLICATION_TEST_METRICS_PORT $FENCING_TEST_METRICS_PORT $FAILOVER_TEST_METRICS_PORT $SPLIT_BRAIN_TEST_METRICS_PORT $LEASE_EXPIRY_TEST_METRICS_PORT; do
@@ -155,7 +160,7 @@ cleanup() {
     done
     
     # Wait longer to ensure processes are terminated
-    sleep 5
+    sleep 7
     
     # Final verification
     local server_procs=$(pgrep -f "lock_server")
@@ -180,13 +185,18 @@ cleanup() {
     else
         print_color $GREEN "All test processes terminated"
     fi
+    
+    # Second attempt at killing with killall (in case some processes started during cleanup)
+    killall -9 lock_server lock_client || true
 }
+
+# Run cleanup at the very start
+cleanup
 
 # Register cleanup function for script exit
 trap cleanup EXIT
 
 # Start from a clean state
-cleanup
 rm -f data/lock_state.json data/processed_requests.log data/file_*
 mkdir -p logs
 
@@ -236,7 +246,12 @@ verify_server_started() {
     return 1
 }
 
-# Test 1: Enhanced Replication Test
+# Run all tests
+print_header "Starting Advanced Tests"
+
+tests_failed=0
+
+# # Uncomment the Enhanced Replication Test
 run_enhanced_replication_test() {
     print_header "Enhanced Replication Test"
     
@@ -314,10 +329,13 @@ run_enhanced_replication_test() {
     # Clean up
     kill $PRIMARY_PID $SECONDARY_PID || true
     sleep 2
+    
+    # Run extra cleanup to ensure no lingering processes
+    cleanup
     return 0
 }
 
-# Test 2: Fencing Behavior Test
+# Uncomment the Fencing Behavior Test
 run_fencing_test() {
     print_header "Fencing Behavior Test"
     
@@ -401,7 +419,7 @@ run_fencing_test() {
     fi
     
     # Give a bit more time for fencing period to be fully established
-    sleep 5
+    sleep 45
     
     # Now try different operations during fencing period with different clients, using ONLY the secondary
     # 1. Try to acquire a lock (should be rejected)
@@ -436,9 +454,12 @@ run_fencing_test() {
             # Print test logs
             print_logs logs/test_acquire_during_fencing.log
             
+            # Make sure everything is cleaned up before returning
+            cleanup
             return 0
         else
             print_color $RED "Fencing period not detected in logs"
+            cleanup
             return 1
         fi
     fi
@@ -526,10 +547,12 @@ run_fencing_test() {
     print_logs "logs/test_acquire_after_fencing.log"
     print_color $YELLOW "=============================="
     
+    # Run a full cleanup before returning
+    cleanup
     return 0
 }
 
-# Test 3: Expanded Failover Test
+# Add explicit cleanup after each test case
 run_expanded_failover_test() {
     print_header "Expanded Failover Test - Continued Operations"
     
@@ -568,7 +591,8 @@ run_expanded_failover_test() {
     # Start a client that will hold a lock and renew its lease
     local CLIENT_ID=$((BASE_CLIENT_ID+4))
     print_color $YELLOW "Starting client $CLIENT_ID to hold lock and renew lease..."
-    bin/lock_client hold --servers="$PRIMARY_ADDR,$SECONDARY_ADDR" --client-id=$CLIENT_ID --timeout=60s > logs/test_client_hold.log 2>&1 &
+    # Fix flag format: use the correct flag format for Go flags
+    bin/lock_client --servers "$PRIMARY_ADDR,$SECONDARY_ADDR" hold --client-id $CLIENT_ID --timeout 60s > logs/test_client_hold.log 2>&1 &
     CLIENT_PID=$!
     
     # Wait for client to acquire lock
@@ -588,7 +612,7 @@ run_expanded_failover_test() {
     
     # Wait for failover to complete (past fencing period)
     print_color $YELLOW "Waiting for failover to complete..."
-    sleep 25
+    sleep 45
     
     # Verify client is still running
     if ! is_process_running $CLIENT_PID; then
@@ -599,12 +623,22 @@ run_expanded_failover_test() {
     print_color $GREEN "Client survived failover"
     
     # Now create a file with the client that survived failover
-    local APPEND_FILE="file_after_failover"
+    # Use a valid file name format (file_X where X is 0-99)
+    local APPEND_FILE="file_99"
     local APPEND_CONTENT="test content after failover"
     
     print_color $YELLOW "Creating a new client to append to a file after failover..."
-    bin/lock_client append --servers="$SECONDARY_ADDR" --client-id=$((CLIENT_ID+1)) --file="$APPEND_FILE" --content="$APPEND_CONTENT" --timeout=10s > logs/test_client_append_after_failover.log 2>&1
-    
+    # Wait additional time for fencing period to complete
+    print_color $YELLOW "Waiting for fencing period to complete..."
+    sleep 30  # Increased from 15 to 30 seconds to be absolutely sure fencing is complete
+
+    # Fix: Add debugging to see what address we're using
+    print_color $YELLOW "Debug - Using server address: $SECONDARY_ADDR (should be localhost:50052)"
+
+    # Fix: Use the correct flag format for the Go flag package
+    # Instead of --servers="localhost:50052", use --servers localhost:50052
+    bin/lock_client --servers localhost:50052 append --client-id $((CLIENT_ID+1)) --file "$APPEND_FILE" --content "$APPEND_CONTENT" --timeout 15s > logs/test_client_append_after_failover.log 2>&1
+
     if [ $? -ne 0 ]; then
         print_color $RED "Client failed to append to file after failover"
         return 1
@@ -623,10 +657,10 @@ run_expanded_failover_test() {
     # Clean up
     kill $SECONDARY_PID $CLIENT_PID || true
     sleep 2
+    cleanup
     return 0
 }
 
-# Test 4: Improved Split-Brain Test
 run_improved_split_brain_test() {
     print_header "Improved Split-Brain Test"
     
@@ -752,10 +786,10 @@ run_improved_split_brain_test() {
     # Clean up
     kill $PRIMARY_PID $SECONDARY_PID || true
     sleep 2
+    cleanup
     return 0
 }
 
-# Test 5: Lease Expiry Test
 run_lease_expiry_test() {
     print_header "Lease Expiry Test"
     
@@ -812,7 +846,7 @@ run_lease_expiry_test() {
     # Wait for secondary to detect failure, promote itself, and for the lease to expire
     # This should be the lease duration + fencing period
     print_color $YELLOW "Waiting for failover and lease expiry..."
-    sleep 30
+    sleep 45
     
     # After fencing period and lease expiry, try to acquire the same lock with a different client
     local NEW_CLIENT_ID=$((BASE_CLIENT_ID+8))
@@ -837,38 +871,45 @@ run_lease_expiry_test() {
     # Clean up
     kill $SECONDARY_PID || true
     sleep 2
+    cleanup
     return 0
 }
 
-# Run all tests
-print_header "Starting Advanced Tests"
-
-tests_failed=0
-
+# Add explicit cleanup between tests
 run_enhanced_replication_test
 if [ $? -ne 0 ]; then
     tests_failed=$((tests_failed+1))
 fi
+cleanup
+sleep 2
 
 run_fencing_test
 if [ $? -ne 0 ]; then
     tests_failed=$((tests_failed+1))
 fi
+cleanup
+sleep 2
 
 run_expanded_failover_test
 if [ $? -ne 0 ]; then
     tests_failed=$((tests_failed+1))
 fi
+cleanup
+sleep 2
 
 run_improved_split_brain_test
 if [ $? -ne 0 ]; then
     tests_failed=$((tests_failed+1))
 fi
+cleanup
+sleep 2
 
 run_lease_expiry_test
 if [ $? -ne 0 ]; then
     tests_failed=$((tests_failed+1))
 fi
+cleanup
+sleep 2
 
 # Print summary
 print_header "Test Summary"
@@ -877,5 +918,8 @@ if [ $tests_failed -eq 0 ]; then
 else
     print_color $RED "$tests_failed advanced test(s) failed!"
 fi
+
+# Run an extra cleanup at the very end
+cleanup
 
 exit $tests_failed 
