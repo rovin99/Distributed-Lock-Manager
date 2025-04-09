@@ -145,6 +145,9 @@ func NewReplicatedLockServerWithConfig(role ServerRole, serverID int32, peerAddr
 	// Start background replication worker for reliable updates
 	if isPrimary && peerAddress != "" {
 		go s.startReplicationWorker()
+
+		// Start periodic split-brain check for primaries
+		go s.startSplitBrainChecker()
 	}
 
 	return s
@@ -230,12 +233,16 @@ func (s *LockServer) promoteToPrimary() {
 	s.isPrimary = true
 	s.role = PrimaryRole
 
-	// Start fencing period
+	// Start fencing period with detailed logging
 	leaseDuration := s.lockManager.GetLeaseDuration()
 	fencingDuration := leaseDuration + s.fencingBuffer
 	s.fencingEndTime = time.Now().Add(fencingDuration)
 	s.isFencing.Store(true)
 
+	// Log all the timing details
+	now := time.Now()
+	s.logger.Printf("DEBUG FENCING SETUP: Now=%v, FencingEndTime=%v, Duration=%v, LeaseDuration=%v, Buffer=%v",
+		now, s.fencingEndTime, fencingDuration, leaseDuration, s.fencingBuffer)
 	s.logger.Printf("Entering fencing period for %v (until %v)",
 		fencingDuration, s.fencingEndTime)
 
@@ -529,12 +536,85 @@ func (s *LockServer) ClientInit(ctx context.Context, args *pb.ClientInitArgs) (*
 	}, nil
 }
 
-// LockAcquire handles requests to acquire a lock
+// checkPeerRole verifies if the peer server has been promoted
+func (s *LockServer) checkPeerRole() bool {
+	// If this server doesn't have a peer client configured, nothing to check
+	if s.peerClient == nil {
+		return false
+	}
+
+	// Create a timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Call ServerInfo RPC to check peer's role
+	resp, err := s.peerClient.ServerInfo(ctx, &pb.ServerInfoRequest{})
+	if err != nil {
+		s.logger.Printf("Unable to check peer role: %v", err)
+		return false // Assume peer is still secondary if we can't contact it
+	}
+
+	// Check if the peer reports itself as primary
+	if resp.Role == "primary" {
+		s.logger.Printf("SPLIT-BRAIN DETECTION: Peer server (ID %d) reports itself as primary!", resp.ServerId)
+
+		// If we think we're primary but the peer also thinks it's primary,
+		// we have a split-brain scenario
+		if s.isPrimary {
+			s.logger.Printf("SPLIT-BRAIN RESOLVED: Demoting self to secondary to avoid split-brain")
+
+			// Demote this server to secondary
+			s.isPrimary = false
+			s.role = SecondaryRole
+
+			// Start heartbeat sender to monitor the new primary
+			go s.startHeartbeatSender()
+
+			return true
+		}
+	}
+
+	return false
+}
+
+// LockAcquire handles lock acquisition requests
 func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.LockResponse, error) {
-	startTime := time.Now()
-	s.metrics.IncrementConcurrentRequests()
-	defer s.metrics.DecrementConcurrentRequests()
-	defer s.metrics.TrackOperationLatency(OpLockAcquire, time.Since(startTime))
+	// Check for split-brain condition if this server thinks it's primary
+	if s.isPrimary && s.checkPeerRole() {
+		// We've been demoted to secondary, reject the request
+		return &pb.LockResponse{
+			Status:       pb.Status_SECONDARY_MODE,
+			ErrorMessage: "This server was demoted to secondary to avoid split-brain",
+		}, nil
+	}
+
+	// Check if this server is in secondary mode
+	if !s.isPrimary && !s.isFencing.Load() {
+		return &pb.LockResponse{
+			Status:       pb.Status_SECONDARY_MODE,
+			ErrorMessage: "This server is in secondary mode and cannot grant locks",
+		}, nil
+	}
+
+	// Add detailed logging for fencing check
+	isFencingNow := s.isFencing.Load()
+	nowTime := time.Now()
+	fencingEnds := s.fencingEndTime
+	isBeforeEnd := nowTime.Before(fencingEnds)
+
+	s.logger.Printf("DEBUG FENCING CHECK: ClientID=%d RequestID=%s isFencing=%t, Now=%v, End=%v, IsBeforeEnd=%t",
+		args.ClientId, args.RequestId, isFencingNow, nowTime, fencingEnds, isBeforeEnd)
+
+	// Check if the server is in fencing period
+	if isFencingNow {
+		s.logger.Printf("FENCING: Rejecting lock acquisition from client %d during fencing period", args.ClientId)
+		return &pb.LockResponse{
+			Status:       pb.Status_SERVER_FENCING,
+			ErrorMessage: "Server is in fencing period and cannot grant locks",
+		}, nil
+	}
+
+	s.logger.Printf("DEBUG FENCING CHECK: Proceeding with acquire for client %d", args.ClientId)
 
 	// Check if request has been processed already
 	if cachedResp, exists := s.requestCache.Get(args.RequestId); exists {
@@ -542,24 +622,6 @@ func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.Lo
 		if cachedResp != nil {
 			return cachedResp.(*pb.LockResponse), nil
 		}
-	}
-
-	// Check if the server is in secondary mode
-	if !s.isPrimary {
-		s.logger.Printf("Cannot acquire lock - server is in secondary mode")
-		return &pb.LockResponse{
-			Status:       pb.Status_SECONDARY_MODE,
-			ErrorMessage: "This server is in secondary mode, try the primary",
-		}, nil
-	}
-
-	// Check if the server is in fencing period
-	if s.isFencing.Load() && time.Now().Before(s.fencingEndTime) {
-		s.logger.Printf("Cannot acquire lock - server is in fencing period")
-		return &pb.LockResponse{
-			Status:       pb.Status_SERVER_FENCING,
-			ErrorMessage: "Server is in fencing period, try again later",
-		}, nil
 	}
 
 	// Check request validity
@@ -626,6 +688,16 @@ func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.Lo
 
 // LockRelease handles the lock release RPC
 func (s *LockServer) LockRelease(ctx context.Context, args *pb.LockArgs) (*pb.LockResponse, error) {
+	// Check for split-brain condition if this server thinks it's primary
+	if s.isPrimary && s.checkPeerRole() {
+		// We've been demoted to secondary, reject the request
+		return &pb.LockResponse{
+			Status:       pb.Status_SECONDARY_MODE,
+			ErrorMessage: "This server was demoted to secondary to avoid split-brain",
+			Token:        "",
+		}, nil
+	}
+
 	// Check if we're in secondary mode
 	if !s.isPrimary {
 		return &pb.LockResponse{
@@ -697,39 +769,52 @@ func (s *LockServer) LockRelease(ctx context.Context, args *pb.LockArgs) (*pb.Lo
 	return resp, nil
 }
 
-// FileAppend handles the file append RPC
+// FileAppend handles file append requests
 func (s *LockServer) FileAppend(ctx context.Context, args *pb.FileArgs) (*pb.FileResponse, error) {
-	// Check if we're in secondary mode
+	// Check for split-brain condition if this server thinks it's primary
+	if s.isPrimary && s.checkPeerRole() {
+		// We've been demoted to secondary, reject the request
+		return &pb.FileResponse{
+			Status:       pb.Status_SECONDARY_MODE,
+			ErrorMessage: "This server was demoted to secondary to avoid split-brain",
+		}, nil
+	}
+
+	// Check if we're in fencing period first, before any other checks
+	isFencingNow := s.isFencing.Load()
+	nowTime := time.Now()
+	fencingEnds := s.fencingEndTime
+	isBeforeEnd := nowTime.Before(fencingEnds)
+
+	s.logger.Printf("DEBUG FileAppend: ClientID=%d RequestID=%s isFencing=%t Now=%v End=%v IsBeforeEnd=%t",
+		args.ClientId, args.RequestId, isFencingNow, nowTime, fencingEnds, isBeforeEnd)
+
+	// Reject if in fencing period
+	if isFencingNow && isBeforeEnd {
+		s.logger.Printf("FENCING: Rejecting file append from client %d during fencing period", args.ClientId)
+		return &pb.FileResponse{
+			Status:       pb.Status_SERVER_FENCING,
+			ErrorMessage: "Server is in fencing period and cannot process file operations",
+		}, nil
+	}
+
+	// Check if in secondary mode
 	if !s.isPrimary {
 		return &pb.FileResponse{
 			Status:       pb.Status_SECONDARY_MODE,
-			ErrorMessage: "Server is in secondary mode and cannot process client requests",
+			ErrorMessage: "This server is in secondary mode and cannot process file operations",
 		}, nil
 	}
-
-	// Check if we're in fencing period - reject file operations during fencing
-	if s.isFencing.Load() {
-		return &pb.FileResponse{
-			Status:       pb.Status_SERVER_FENCING,
-			ErrorMessage: "Server is in fencing period after failover",
-		}, nil
-	}
-
-	clientID := args.ClientId
-	token := args.Token
-	requestID := args.RequestId
-
-	s.logger.Printf("Client %d attempting to append to file with token %s (request: %s)", clientID, token, requestID)
 
 	// Check cache for duplicate request
-	if cachedResp, exists := s.requestCache.Get(requestID); exists {
-		s.logger.Printf("Found cached response for request %s", requestID)
+	if cachedResp, exists := s.requestCache.Get(args.RequestId); exists {
+		s.logger.Printf("Found cached response for request %s", args.RequestId)
 		return cachedResp.(*pb.FileResponse), nil
 	}
 
 	// Mark request as in progress
-	if !s.requestCache.MarkInProgress(requestID) {
-		s.logger.Printf("Request %s already in progress", requestID)
+	if !s.requestCache.MarkInProgress(args.RequestId) {
+		s.logger.Printf("Request %s already in progress", args.RequestId)
 		return &pb.FileResponse{
 			Status:       pb.Status_ERROR,
 			ErrorMessage: "Request already in progress",
@@ -737,40 +822,47 @@ func (s *LockServer) FileAppend(ctx context.Context, args *pb.FileArgs) (*pb.Fil
 	}
 
 	// Validate token and check lock ownership
-	if !s.lockManager.HasLockWithToken(clientID, token) {
-		s.logger.Printf("File append failed: client %d doesn't hold the lock with token %s", clientID, token)
+	if !s.lockManager.HasLockWithToken(args.ClientId, args.Token) {
+		s.logger.Printf("FileAppend rejected: client %d doesn't hold lock with token %s", args.ClientId, args.Token)
 		resp := &pb.FileResponse{
 			Status:       pb.Status_INVALID_TOKEN,
 			ErrorMessage: "Invalid token or lock not held",
 		}
-		s.requestCache.Set(requestID, resp)
+		s.requestCache.Set(args.RequestId, resp)
 		return resp, nil
 	}
 
-	// Process the file append
-	err := s.fileManager.AppendToFile(args.Filename, args.Content, clientID, token)
-
-	var resp *pb.FileResponse
+	// Process the append operation
+	err := s.fileManager.AppendToFile(args.Filename, args.Content, args.ClientId, args.Token)
 	if err != nil {
-		s.logger.Printf("File append error: %v", err)
-		resp = &pb.FileResponse{
+		s.logger.Printf("FileAppend error: %v", err)
+		resp := &pb.FileResponse{
 			Status:       pb.Status_ERROR,
 			ErrorMessage: err.Error(),
 		}
-	} else {
-		s.logger.Printf("File append successful for client %d", clientID)
-		resp = &pb.FileResponse{
-			Status:       pb.Status_OK,
-			ErrorMessage: "",
-		}
+		s.requestCache.Set(args.RequestId, resp)
+		return resp, nil
 	}
 
-	s.requestCache.Set(requestID, resp)
+	s.logger.Printf("FileAppend successful for client %d", args.ClientId)
+	resp := &pb.FileResponse{
+		Status: pb.Status_OK,
+	}
+	s.requestCache.Set(args.RequestId, resp)
 	return resp, nil
 }
 
 // RenewLease handles lease renewal RPC
 func (s *LockServer) RenewLease(ctx context.Context, args *pb.LeaseArgs) (*pb.LeaseResponse, error) {
+	// Check for split-brain condition if this server thinks it's primary
+	if s.isPrimary && s.checkPeerRole() {
+		// We've been demoted to secondary, reject the request
+		return &pb.LeaseResponse{
+			Status:       pb.Status_SECONDARY_MODE,
+			ErrorMessage: "This server was demoted to secondary to avoid split-brain",
+		}, nil
+	}
+
 	// Check if we're in secondary mode
 	if !s.isPrimary {
 		return &pb.LeaseResponse{
@@ -889,9 +981,10 @@ func (s *LockServer) Ping(ctx context.Context, req *pb.HeartbeatRequest) (*pb.He
 func (s *LockServer) ServerInfo(ctx context.Context, req *pb.ServerInfoRequest) (*pb.ServerInfoResponse, error) {
 	s.logger.Printf("Received ServerInfo request")
 
-	role := "primary"
-	if !s.isPrimary {
-		role = "secondary"
+	// Return the accurate role - "primary" if this server is currently primary, otherwise "secondary"
+	role := "secondary"
+	if s.isPrimary {
+		role = "primary"
 	}
 
 	return &pb.ServerInfoResponse{
@@ -1107,4 +1200,54 @@ func (s *LockServer) VerifyFileAccess(ctx context.Context, req *pb.FileAccessReq
 // GetMetrics returns the server's performance metrics tracker
 func (s *LockServer) GetMetrics() *PerformanceMetrics {
 	return s.metrics
+}
+
+// startSplitBrainChecker periodically checks if the peer has been promoted
+func (s *LockServer) startSplitBrainChecker() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	s.logger.Printf("Starting split-brain checker")
+
+	for range ticker.C {
+		// Stop if we're no longer primary
+		if !s.isPrimary {
+			s.logger.Printf("No longer primary, stopping split-brain checker")
+			return
+		}
+
+		// Attempt to connect to peer if not connected
+		if s.peerClient == nil {
+			if err := s.connectToPeer(); err != nil {
+				s.logger.Printf("Split-brain checker: Failed to connect to peer: %v", err)
+				continue
+			}
+		}
+
+		// Check if peer reports itself as primary
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := s.peerClient.ServerInfo(ctx, &pb.ServerInfoRequest{})
+		cancel()
+
+		if err != nil {
+			s.logger.Printf("Split-brain checker: Unable to check peer role: %v", err)
+			continue
+		}
+
+		// If peer reports itself as primary while we also think we're primary,
+		// demote ourselves to avoid split-brain
+		if resp.Role == "primary" {
+			s.logger.Printf("SPLIT-BRAIN DETECTED: Both this server and peer (ID %d) think they are primary!", resp.ServerId)
+			s.logger.Printf("SPLIT-BRAIN RESOLVED: Demoting self to secondary to avoid split-brain")
+
+			// Demote this server to secondary
+			s.isPrimary = false
+			s.role = SecondaryRole
+
+			// Start heartbeat sender to reconnect with the new primary
+			go s.startHeartbeatSender()
+
+			return
+		}
+	}
 }

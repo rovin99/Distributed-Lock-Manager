@@ -24,6 +24,40 @@ LEASE_EXPIRY_TEST_METRICS_PORT=$((METRICS_PORT_BASE + 5))
 
 BASE_CLIENT_ID=1000
 
+# Check if a test name is provided as the first argument
+if [ -n "$1" ]; then
+    TEST_TO_RUN="$1"
+    echo "Running individual test: $TEST_TO_RUN"
+    
+    case $TEST_TO_RUN in
+        replication)
+            # Will run enhanced_replication_test later in the script
+            RUN_ONLY_REPLICATION=true
+            ;;
+        fencing)
+            # Will run fencing_test later in the script
+            RUN_ONLY_FENCING=true
+            ;;
+        failover)
+            # Will run expanded_failover_test later in the script
+            RUN_ONLY_FAILOVER=true
+            ;;
+        split-brain)
+            # Will run improved_split_brain_test later in the script
+            RUN_ONLY_SPLIT_BRAIN=true
+            ;;
+        lease-expiry)
+            # Will run lease_expiry_test later in the script
+            RUN_ONLY_LEASE_EXPIRY=true
+            ;;
+        *)
+            echo "Unknown test: $TEST_TO_RUN"
+            echo "Usage: $0 {replication|fencing|failover|split-brain|lease-expiry}"
+            exit 1
+            ;;
+    esac
+fi
+
 # Function to print colored output
 print_color() {
     local color=$1
@@ -134,50 +168,45 @@ print_logs() {
 cleanup() {
     print_color $YELLOW "Cleaning up processes..."
     
-    # Use killall for more aggressive cleanup
-    killall -9 lock_server lock_client || true
-    
-    # Kill by process name
+    # Kill all potential server and client processes
+    killall -9 lock_server lock_client 2>/dev/null || true
     pkill -9 -f "lock_server" || true
     pkill -9 -f "bin/server" || true
     pkill -9 -f "lock_client" || true
     pkill -9 -f "bin/lock_server" || true
     pkill -9 -f "bin/lock_client" || true
     
-    # Kill by port - find processes using our ports and kill them
+    # Wait a moment for processes to die
+    sleep 2
+    
+    # More aggressive port cleanup
     for port in $PRIMARY_PORT $SECONDARY_PORT $METRICS_PORT_BASE $REPLICATION_TEST_METRICS_PORT $FENCING_TEST_METRICS_PORT $FAILOVER_TEST_METRICS_PORT $SPLIT_BRAIN_TEST_METRICS_PORT $LEASE_EXPIRY_TEST_METRICS_PORT; do
         print_color $YELLOW "Checking for processes using port $port..."
-        # Get PIDs of processes using this port
-        local pids=$(lsof -t -i :$port 2>/dev/null)
-        if [ -n "$pids" ]; then
-            for pid in $pids; do
-                print_color $YELLOW "Killing process $pid using port $port"
-                kill -9 $pid 2>/dev/null || true
-            done
+        # Find and kill any process using this port
+        if [ "$(uname)" = "Darwin" ]; then
+            # macOS specific command
+            lsof -i :$port | awk 'NR>1 {print $2}' | xargs -r kill -9 2>/dev/null || true
         else
-            print_color $GREEN "No processes found using port $port"
+            # Linux specific command
+            fuser -k -n tcp $port 2>/dev/null || true
         fi
     done
     
-    # Wait longer to ensure processes are terminated
-    sleep 7
+    # Longer wait after aggressive cleanup
+    sleep 5
     
-    # Final verification
-    local server_procs=$(pgrep -f "lock_server")
-    local client_procs=$(pgrep -f "lock_client")
+    # Final verification that everything is cleaned up
+    local running_servers=$(pgrep -f "lock_server" || true)
+    local running_clients=$(pgrep -f "lock_client" || true)
     local port_procs=""
     
-    for port in $PRIMARY_PORT $SECONDARY_PORT; do
-        port_procs="$port_procs $(lsof -t -i :$port 2>/dev/null)"
-    done
-    
-    if [ -n "$server_procs" ] || [ -n "$client_procs" ] || [ -n "$port_procs" ]; then
+    if [ -n "$running_servers" ] || [ -n "$running_clients" ] || [ -n "$port_procs" ]; then
         print_color $RED "Warning: Some processes are still running!"
-        if [ -n "$server_procs" ]; then
-            print_color $RED "Server processes: $server_procs"
+        if [ -n "$running_servers" ]; then
+            print_color $RED "Server processes: $running_servers"
         fi
-        if [ -n "$client_procs" ]; then
-            print_color $RED "Client processes: $client_procs"
+        if [ -n "$running_clients" ]; then
+            print_color $RED "Client processes: $running_clients"
         fi
         if [ -n "$port_procs" ]; then
             print_color $RED "Processes using test ports: $port_procs"
@@ -185,9 +214,6 @@ cleanup() {
     else
         print_color $GREEN "All test processes terminated"
     fi
-    
-    # Second attempt at killing with killall (in case some processes started during cleanup)
-    killall -9 lock_server lock_client || true
 }
 
 # Run cleanup at the very start
@@ -251,12 +277,11 @@ print_header "Starting Advanced Tests"
 
 tests_failed=0
 
-# # Uncomment the Enhanced Replication Test
 run_enhanced_replication_test() {
     print_header "Enhanced Replication Test"
     
     print_color $YELLOW "Starting primary server on port $PRIMARY_PORT"
-    bin/lock_server --role primary --id 1 --address ":$PRIMARY_PORT" --peer "$SECONDARY_ADDR" > logs/test_primary.log 2>&1 &
+    bin/lock_server --role primary --id 1 --address ":$PRIMARY_PORT" --peer "$SECONDARY_ADDR" --metrics-address ":$REPLICATION_TEST_METRICS_PORT" > logs/test_primary.log 2>&1 &
     PRIMARY_PID=$!
     
     # Wait for primary to start
@@ -335,12 +360,11 @@ run_enhanced_replication_test() {
     return 0
 }
 
-# Uncomment the Fencing Behavior Test
 run_fencing_test() {
     print_header "Fencing Behavior Test"
     
     print_color $YELLOW "Starting primary server on port $PRIMARY_PORT"
-    bin/lock_server --role primary --id 1 --address ":$PRIMARY_PORT" --peer "$SECONDARY_ADDR" > logs/test_primary.log 2>&1 &
+    bin/lock_server --role primary --id 1 --address ":$PRIMARY_PORT" --peer "$SECONDARY_ADDR" --metrics-address ":$FENCING_TEST_METRICS_PORT" > logs/test_primary.log 2>&1 &
     PRIMARY_PID=$!
     
     # Wait for primary to start
@@ -419,7 +443,7 @@ run_fencing_test() {
     fi
     
     # Give a bit more time for fencing period to be fully established
-    sleep 45
+    sleep 5
     
     # Now try different operations during fencing period with different clients, using ONLY the secondary
     # 1. Try to acquire a lock (should be rejected)
@@ -429,47 +453,20 @@ run_fencing_test() {
     
     ACQUIRE_RESULT=$?
     
-    # Check for connection failure in the logs
-    if grep -q "Failed to initialize client\|failed to connect\|connection refused" logs/test_acquire_during_fencing.log; then
-        print_color $YELLOW "Client failed to connect to the server. This might be related to how the server handles connections during fencing."
-        print_color $YELLOW "Testing will continue, but note the test is not fully exercising the fencing behavior."
-        print_color $YELLOW "Release log contents:"
-        cat logs/test_acquire_during_fencing.log
-        
-        print_color $YELLOW "Secondary server log tail (for debugging):"
-        tail -n 30 logs/test_secondary.log
-        
-        # Skip remaining tests that would also fail to connect
-        print_color $YELLOW "Skipping remaining fencing tests due to connection issues."
-        
-        # Consider the test successful anyway as the fencing period was properly entered by the server
-        # (evidenced by the log entries we already verified)
-        if grep -q "fencing period" logs/test_secondary.log; then
-            print_color $GREEN "Fencing period was detected in logs"
-            print_color $GREEN "Fencing behavior test passed (with connection issues)"
-            # Clean up
-            kill $SECONDARY_PID || true
-            sleep 2
-            
-            # Print test logs
-            print_logs logs/test_acquire_during_fencing.log
-            
-            # Make sure everything is cleaned up before returning
-            cleanup
-            return 0
-        else
-            print_color $RED "Fencing period not detected in logs"
-            cleanup
-            return 1
-        fi
-    fi
+    # Print detailed log for debugging
+    print_color $YELLOW "Client acquisition log during fencing:"
+    cat logs/test_acquire_during_fencing.log
     
-    # If we get here, the client was able to connect
-    if [ $ACQUIRE_RESULT -eq 0 ]; then
-        print_color $RED "Lock acquisition during fencing period succeeded, but should have been rejected"
-        return 1
-    else
+    # Debug the check values
+    print_color $YELLOW "DEBUG - Acquire result exit code: $ACQUIRE_RESULT"
+    print_color $YELLOW "DEBUG - Grep for 'Server is in fencing period': $(grep 'Server is in fencing period' logs/test_acquire_during_fencing.log > /dev/null && echo 'Found' || echo 'Not found')"
+    
+    # Check if we got a fencing period rejection (this is the expected behavior)
+    if grep "Server is in fencing period" logs/test_acquire_during_fencing.log > /dev/null; then
         print_color $GREEN "Lock acquisition correctly rejected during fencing period"
+    else
+        print_color $RED "Lock acquisition during fencing period did not get proper fencing rejection"
+        return 1
     fi
     
     # 2. Try to release the existing lock (should be allowed, but may be implementation dependent)
@@ -495,8 +492,24 @@ run_fencing_test() {
     print_color $YELLOW "Trying to append to a file during fencing period with client $APPEND_CLIENT_ID..."
     bin/lock_client append --servers="$SECONDARY_ADDR" --client-id=$APPEND_CLIENT_ID --file="file_test" --content="test content" --timeout=5s > logs/test_append_during_fencing.log 2>&1
     
-    if [ $? -eq 0 ]; then
+    APPEND_EXIT_CODE=$?
+    # Print the log for debugging
+    print_color $YELLOW "Client append log during fencing:"
+    cat logs/test_append_during_fencing.log
+    
+    # Check if the operation failed or if the log contains the fencing rejection message
+    if [ $APPEND_EXIT_CODE -eq 0 ] && ! grep -q "operation FileAppend rejected: server is in fencing period" logs/test_append_during_fencing.log; then
         print_color $RED "File append during fencing period succeeded, but should have been rejected"
+        print_color $RED "Exit code: $APPEND_EXIT_CODE"
+        # Also check secondary server logs to see if they received and processed the request
+        print_color $YELLOW "Checking server logs for FileAppend request during fencing..."
+        FENCING_LOG_MATCH=$(grep -E "FENCING: Rejecting file append|DEBUG FileAppend.*isFencing=true" logs/test_secondary.log)
+        if [ -n "$FENCING_LOG_MATCH" ]; then
+            print_color $YELLOW "Found fencing log entries for FileAppend, but client did not receive error:"
+            echo "$FENCING_LOG_MATCH"
+        else
+            print_color $RED "No fencing log entries found for FileAppend - request may have been processed incorrectly"
+        fi
         return 1
     else
         print_color $GREEN "File append correctly rejected during fencing period"
@@ -632,15 +645,27 @@ run_expanded_failover_test() {
     print_color $YELLOW "Waiting for fencing period to complete..."
     sleep 30  # Increased from 15 to 30 seconds to be absolutely sure fencing is complete
 
-    # Fix: Add debugging to see what address we're using
-    print_color $YELLOW "Debug - Using server address: $SECONDARY_ADDR (should be localhost:50052)"
-
-    # Fix: Use the correct flag format for the Go flag package
-    # Instead of --servers="localhost:50052", use --servers localhost:50052
-    bin/lock_client --servers localhost:50052 append --client-id $((CLIENT_ID+1)) --file "$APPEND_FILE" --content "$APPEND_CONTENT" --timeout 15s > logs/test_client_append_after_failover.log 2>&1
+    # Fix: Add debugging to show the client is creating a new lock acquisition first
+    print_color $YELLOW "Debug - Creating a new client to acquire a lock and then append"
+    
+    # First acquire a lock with a new client
+    local APPEND_CLIENT_ID=$((CLIENT_ID+1))
+    print_color $YELLOW "Acquiring a lock with client $APPEND_CLIENT_ID before file append..."
+    bin/lock_client acquire --servers="$SECONDARY_ADDR" --client-id=$APPEND_CLIENT_ID --timeout=15s > logs/test_client_acquire_for_append.log 2>&1
+    
+    if [ $? -ne 0 ]; then
+        print_color $RED "New client failed to acquire lock after failover"
+        cat logs/test_client_acquire_for_append.log
+        return 1
+    fi
+    
+    # Now append to a file with the same client
+    print_color $YELLOW "Appending to file with client $APPEND_CLIENT_ID..."
+    bin/lock_client append --servers="$SECONDARY_ADDR" --client-id=$APPEND_CLIENT_ID --file="$APPEND_FILE" --content="$APPEND_CONTENT" --timeout=15s > logs/test_client_append_after_failover.log 2>&1
 
     if [ $? -ne 0 ]; then
         print_color $RED "Client failed to append to file after failover"
+        cat logs/test_client_append_after_failover.log
         return 1
     fi
     
@@ -709,6 +734,9 @@ run_improved_split_brain_test() {
         return 1
     fi
     
+    print_color $YELLOW "Waiting for servers to establish replication..."
+    sleep 5
+    
     # Create a network partition
     if [ "$USE_IPTABLES" = true ]; then
         print_color $YELLOW "Creating network partition using iptables..."
@@ -719,57 +747,119 @@ run_improved_split_brain_test() {
         print_color $YELLOW "Simulating network partition by pausing the primary..."
         # Pause the primary
         kill -STOP $PRIMARY_PID
+        print_color $GREEN "Primary server paused (PID: $PRIMARY_PID)"
     fi
     
     # Wait for secondary to detect failure and promote itself
     print_color $YELLOW "Waiting for secondary to detect primary failure..."
-    sleep 15
+    sleep 30
+    
+    # Check secondary logs to confirm promotion
+    if grep -q "Promoting to primary" logs/test_secondary.log; then
+        print_color $GREEN "Secondary was promoted to primary as expected"
+    else
+        print_color $RED "Secondary was not promoted to primary"
+        print_color $YELLOW "Secondary server log tail:"
+        tail -20 logs/test_secondary.log
+    fi
     
     # Create two clients, one for each server
     local CLIENT1_ID=$((BASE_CLIENT_ID+5))
     local CLIENT2_ID=$((BASE_CLIENT_ID+6))
-    
-    # Resume primary if using alternative method
-    if [ "$USE_IPTABLES" = false ]; then
-        print_color $YELLOW "Resuming the primary..."
-        kill -CONT $PRIMARY_PID
-    fi
-    
-    # Give primary time to restart if it was paused
-    sleep 2
-    
-    # Try to acquire lock on original primary (may or may not work depending on implementation)
-    print_color $YELLOW "Client $CLIENT1_ID trying to acquire lock on original primary..."
-    bin/lock_client acquire --servers="$PRIMARY_ADDR" --client-id=$CLIENT1_ID --timeout=5s > logs/test_client_primary.log 2>&1
-    PRIMARY_CLIENT_SUCCESS=$?
     
     # Try to acquire lock on promoted secondary (should work)
     print_color $YELLOW "Client $CLIENT2_ID trying to acquire lock on promoted secondary..."
     bin/lock_client acquire --servers="$SECONDARY_ADDR" --client-id=$CLIENT2_ID --timeout=5s > logs/test_client_secondary.log 2>&1
     SECONDARY_CLIENT_SUCCESS=$?
     
-    # Remove the network partition if using iptables
-    if [ "$USE_IPTABLES" = true ]; then
+    # Output logs for debugging
+    print_color $YELLOW "Client attempt on promoted secondary log:"
+    cat logs/test_client_secondary.log
+    
+    # Resume primary if using alternative method
+    if [ "$USE_IPTABLES" = false ]; then
+        print_color $YELLOW "Resuming the primary..."
+        kill -CONT $PRIMARY_PID
+        print_color $GREEN "Primary server resumed (PID: $PRIMARY_PID)"
+    else
         print_color $YELLOW "Removing network partition..."
         iptables -D INPUT -p tcp --dport $PRIMARY_PORT -j DROP
         iptables -D INPUT -p tcp --dport $SECONDARY_PORT -j DROP
     fi
     
+    # Give primary time to resume and detect the split-brain condition
+    print_color $YELLOW "Waiting for primary to resume and detect split-brain condition..."
+    sleep 15   # Increased to 15 seconds to allow more time for split-brain detection
+    
+    # Check primary logs for split-brain detection
+    if grep -q "split-brain" logs/test_primary.log; then
+        print_color $GREEN "Primary detected split-brain condition"
+    else
+        print_color $YELLOW "Primary did not detect split-brain condition in logs"
+        print_color $YELLOW "Primary server log tail:"
+        tail -20 logs/test_primary.log
+    fi
+    
+    # Try to acquire lock on original primary
+    print_color $YELLOW "Client $CLIENT1_ID trying to acquire lock on original primary..."
+    bin/lock_client acquire --servers="$PRIMARY_ADDR" --client-id=$CLIENT1_ID --timeout=5s > logs/test_client_primary.log 2>&1
+    PRIMARY_CLIENT_SUCCESS=$?
+    
+    # Output logs for debugging
+    print_color $YELLOW "Client attempt on original primary log:"
+    cat logs/test_client_primary.log
+    
+    # Release locks to clean up state
+    if [ $PRIMARY_CLIENT_SUCCESS -eq 0 ]; then
+        print_color $YELLOW "Releasing lock on primary..."
+        bin/lock_client release --servers="$PRIMARY_ADDR" --client-id=$CLIENT1_ID --timeout=5s > /dev/null 2>&1
+    fi
+    
+    if [ $SECONDARY_CLIENT_SUCCESS -eq 0 ]; then
+        print_color $YELLOW "Releasing lock on secondary..."
+        bin/lock_client release --servers="$SECONDARY_ADDR" --client-id=$CLIENT2_ID --timeout=5s > /dev/null 2>&1
+    fi
+    
     # Analyze results
-    if [ $PRIMARY_CLIENT_SUCCESS -eq 0 ] && [ $SECONDARY_CLIENT_SUCCESS -eq 0 ]; then
-        # Split-brain detected - both clients acquired locks
-        print_color $RED "Split-brain scenario detected! Both clients acquired locks on different servers."
-        return 1
-    elif [ $SECONDARY_CLIENT_SUCCESS -eq 0 ]; then
-        # Secondary (now primary) successfully gave lock, primary rejected or failed
-        print_color $GREEN "Split-brain prevented! Secondary promoted to primary and accepted client."
-        if [ $PRIMARY_CLIENT_SUCCESS -ne 0 ]; then
-            print_color $GREEN "Original primary correctly rejected or failed client request."
+    print_color $YELLOW "Checking success status: PRIMARY=$PRIMARY_CLIENT_SUCCESS, SECONDARY=$SECONDARY_CLIENT_SUCCESS"
+    
+    # Check for split-brain detection success in primary logs
+    if grep -q "SPLIT-BRAIN RESOLVED: Demoting self to secondary" logs/test_primary.log; then
+        PRIMARY_DETECTED_SPLIT_BRAIN=true
+        print_color $GREEN "✓ Primary detected split-brain and demoted itself."
+    else
+        PRIMARY_DETECTED_SPLIT_BRAIN=false
+        print_color $RED "✗ Primary did not detect split-brain or demote itself."
+    fi
+    
+    # Check for fencing in secondary logs
+    if grep -q "FENCING: Rejecting lock acquisition" logs/test_secondary.log; then
+        SECONDARY_IN_FENCING=true
+        print_color $GREEN "✓ Secondary is correctly in fencing period after promotion."
+    else
+        SECONDARY_IN_FENCING=false
+        print_color $RED "✗ Secondary is not in fencing period after promotion."
+    fi
+    
+    # Check success criteria
+    if [ "$PRIMARY_DETECTED_SPLIT_BRAIN" = true ] && [ "$SECONDARY_IN_FENCING" = true ]; then
+        print_color $GREEN "Split-brain correctly prevented!"
+        print_color $GREEN "Primary detected split-brain and demoted itself to secondary."
+        print_color $GREEN "Secondary rejected client during fencing period."
+        
+        # Check client log outputs directly to see if any client succeeded
+        if grep -q "Successfully acquired lock" logs/test_client_primary.log || grep -q "Successfully acquired lock" logs/test_client_secondary.log; then
+            print_color $RED "However, at least one client log shows it successfully acquired a lock, which should not happen!"
+            return 1
         else
-            print_color $YELLOW "Warning: Original primary accepted client request, but system may still be consistent if using token-based verification."
+            print_color $GREEN "All clients correctly failed to acquire locks during this scenario."
+            return 0
         fi
     else
-        print_color $RED "Test inconclusive. Neither client could acquire a lock."
+        print_color $RED "Split-brain prevention did not work correctly."
+        if grep -q "Successfully acquired lock" logs/test_client_primary.log && grep -q "Successfully acquired lock" logs/test_client_secondary.log; then
+            print_color $RED "Split-brain scenario detected! Both clients acquired locks on different servers."
+        fi
         return 1
     fi
     
@@ -875,7 +965,31 @@ run_lease_expiry_test() {
     return 0
 }
 
-# Add explicit cleanup between tests
+if [ "$RUN_ONLY_REPLICATION" = true ]; then
+    run_enhanced_replication_test
+    exit $?
+fi
+
+if [ "$RUN_ONLY_FENCING" = true ]; then
+    run_fencing_test
+    exit $?
+fi
+
+if [ "$RUN_ONLY_FAILOVER" = true ]; then
+    run_expanded_failover_test
+    exit $?
+fi
+
+if [ "$RUN_ONLY_SPLIT_BRAIN" = true ]; then
+    run_improved_split_brain_test
+    exit $?
+fi
+
+if [ "$RUN_ONLY_LEASE_EXPIRY" = true ]; then
+    run_lease_expiry_test
+    exit $?
+fi
+
 run_enhanced_replication_test
 if [ $? -ne 0 ]; then
     tests_failed=$((tests_failed+1))
@@ -922,4 +1036,4 @@ fi
 # Run an extra cleanup at the very end
 cleanup
 
-exit $tests_failed 
+exit $tests_failed

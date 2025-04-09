@@ -23,6 +23,7 @@ func main() {
 		content     = flag.String("content", "test content", "Content to append to file (when using append command)")
 		repeat      = flag.Int("repeat", 1, "Number of times to repeat the operation")
 		interval    = flag.Duration("interval", 5*time.Second, "Interval between repeated operations")
+		verbose     = flag.Bool("verbose", false, "Enable verbose logging")
 	)
 
 	// Custom flag parsing to handle command in the middle
@@ -73,8 +74,8 @@ func main() {
 
 	// Debug flags after parsing
 	fmt.Printf("DEBUG - After flag.Parse(): servers=%s, command=%s\n", *serversFlag, command)
-	fmt.Printf("DEBUG - FLAGS: client-id=%d, file=%s, content=%s, timeout=%v\n",
-		*clientID, *filename, *content, *timeout)
+	fmt.Printf("DEBUG - FLAGS: client-id=%d, file=%s, content=%s, timeout=%v, verbose=%v\n",
+		*clientID, *filename, *content, *timeout, *verbose)
 
 	// Parse the server addresses
 	serverAddrs := strings.Split(*serversFlag, ",")
@@ -153,14 +154,16 @@ func main() {
 				err := c.AcquireLockWithRetry()
 				if err != nil {
 					fmt.Printf("Failed to acquire lock: %v\n", err)
-					close(done)
-					return
+					// Exit with non-zero status on failure
+					os.Exit(1)
 				}
 
 				fmt.Printf("Appending to file %s...\n", *filename)
 				err = c.FileAppend(*filename, []byte(*content))
 				if err != nil {
 					fmt.Printf("Failed to append to file: %v\n", err)
+					// Exit with non-zero status on failure
+					os.Exit(1)
 				} else {
 					fmt.Printf("Successfully appended to file\n")
 				}
@@ -168,9 +171,15 @@ func main() {
 				fmt.Printf("Releasing lock...\n")
 				if err := c.LockRelease(); err != nil {
 					fmt.Printf("Failed to release lock: %v\n", err)
+					// Exit with non-zero status on failure
+					os.Exit(1)
 				} else {
 					fmt.Printf("Lock released\n")
 				}
+
+				// Return without closing the done channel here
+				// It will be closed by the code below when i == *repeat-1
+				return
 
 			case "hold":
 				fmt.Printf("Acquiring lock and holding...\n")

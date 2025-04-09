@@ -71,33 +71,8 @@ func NewLockClientWithFailover(serverAddrs []string, clientID int32) (*LockClien
 		cancelRenewal:    make(chan struct{}),
 	}
 
-	fmt.Printf("DEBUG: Initial client struct created with serverAddrs=%v, currentServerIdx=%d\n",
-		client.serverAddrs, client.currentServerIdx)
-
-	// Try each server in the provided order until one succeeds
-	var lastErr error
-	connected := false
-
-	for i := 0; i < len(serverAddrs); i++ {
-		client.currentServerIdx = i
-		fmt.Printf("DEBUG: Attempting to connect to server at index %d (%s)\n",
-			client.currentServerIdx, serverAddrs[i])
-
-		if err := client.connectToCurrentServer(); err != nil {
-			lastErr = err
-			fmt.Printf("DEBUG: Failed to connect to server %s: %v, trying next...\n", serverAddrs[i], err)
-			continue
-		}
-		connected = true
-		fmt.Printf("DEBUG: Successfully connected to server at index %d (%s)\n",
-			client.currentServerIdx, serverAddrs[i])
-		break
-	}
-
-	if !connected {
-		fmt.Printf("DEBUG: Failed to connect to any server after trying all addresses\n")
-		return nil, fmt.Errorf("failed to connect to any server: %w", lastErr)
-	}
+	fmt.Printf("DEBUG: Client initialized with serverAddrs=%v (lazy connection will be established on first RPC call)\n",
+		client.serverAddrs)
 
 	return client, nil
 }
@@ -279,6 +254,21 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 	backoff := initialBackoff
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Check if we need to establish initial connection
+		if c.client == nil {
+			fmt.Printf("No active connection for %s operation, establishing connection first...\n", operation)
+			if err := c.connectToCurrentServer(); err != nil {
+				// If first server fails, try others
+				if attemptErr := c.tryNextServer(); attemptErr != nil {
+					return nil, &ServerUnavailableError{
+						Operation: operation,
+						Attempts:  1,
+						LastError: fmt.Errorf("failed to establish initial connection: %w", attemptErr),
+					}
+				}
+			}
+		}
+
 		// Create a context with timeout for this attempt
 		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
 
@@ -291,10 +281,11 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 			return resp, nil
 		}
 
-		// Handle server fencing error
+		// Handle server fencing error - Critically important!
 		if err == nil && resp.Status == pb.Status_SERVER_FENCING {
 			fmt.Printf("Server is in fencing period, operation rejected\n")
 			cancel()
+			// This is an error we should return immediately, not retry
 			return nil, &ServerFencingError{
 				Operation: operation,
 				Message:   resp.ErrorMessage,
@@ -364,6 +355,21 @@ func (c *LockClient) retryLeaseRenewal(operation string, rpcFunc func(context.Co
 	backoff := initialBackoff
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Check if we need to establish initial connection
+		if c.client == nil {
+			fmt.Printf("No active connection for %s operation, establishing connection first...\n", operation)
+			if err := c.connectToCurrentServer(); err != nil {
+				// If first server fails, try others
+				if attemptErr := c.tryNextServer(); attemptErr != nil {
+					return nil, &ServerUnavailableError{
+						Operation: operation,
+						Attempts:  1,
+						LastError: fmt.Errorf("failed to establish initial connection: %w", attemptErr),
+					}
+				}
+			}
+		}
+
 		// Create a context with timeout for this attempt
 		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
 
@@ -447,6 +453,21 @@ func (c *LockClient) retryFileAppend(operation string, rpcFunc func(context.Cont
 	backoff := initialBackoff
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Check if we need to establish initial connection
+		if c.client == nil {
+			fmt.Printf("No active connection for %s operation, establishing connection first...\n", operation)
+			if err := c.connectToCurrentServer(); err != nil {
+				// If first server fails, try others
+				if attemptErr := c.tryNextServer(); attemptErr != nil {
+					return nil, &ServerUnavailableError{
+						Operation: operation,
+						Attempts:  1,
+						LastError: fmt.Errorf("failed to establish initial connection: %w", attemptErr),
+					}
+				}
+			}
+		}
+
 		// Create a context with timeout for this attempt
 		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
 
@@ -634,13 +655,14 @@ func (c *LockClient) LockRelease() error {
 		RequestId: c.GenerateRequestID(),
 	}
 
+	fmt.Printf("DEBUG: LockRelease sending request with token: '%s'\n", args.Token)
+
 	_, err := c.retryRPC("LockRelease", func(ctx context.Context) (*pb.LockResponse, error) {
 		return c.client.LockRelease(ctx, args)
 	})
 
 	if err != nil {
-		// For server unavailability during release, we've already invalidated our lock state
-		// in the retryRPC function. Just return the error for application handling.
+		// Server unavailability or invalid token errors are already handled by retryRPC
 		return err
 	}
 
@@ -674,5 +696,22 @@ func (e *ServerFencingError) Error() string {
 // IsServerFencing checks if an error is a ServerFencingError
 func IsServerFencing(err error) bool {
 	_, ok := err.(*ServerFencingError)
+	return ok
+}
+
+// ServerUnavailableError is returned when all servers are unreachable
+type ServerUnavailableError struct {
+	Operation string
+	Attempts  int
+	LastError error
+}
+
+func (e *ServerUnavailableError) Error() string {
+	return fmt.Sprintf("operation %s failed after %d attempts: %v", e.Operation, e.Attempts, e.LastError)
+}
+
+// IsServerUnavailable checks if an error is a ServerUnavailableError
+func IsServerUnavailable(err error) bool {
+	_, ok := err.(*ServerUnavailableError)
 	return ok
 }
