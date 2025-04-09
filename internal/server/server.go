@@ -1103,3 +1103,8 @@ func (s *LockServer) VerifyFileAccess(ctx context.Context, req *pb.FileAccessReq
 		ActualContent: actualContent,
 	}, nil
 }
+
+// GetMetrics returns the server's performance metrics tracker
+func (s *LockServer) GetMetrics() *PerformanceMetrics {
+	return s.metrics
+}

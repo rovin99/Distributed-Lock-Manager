@@ -16,6 +16,7 @@ func main() {
 	// Define flags
 	address := flag.String("address", ":50051", "Address to listen on")
 	recoveryTimeout := flag.Duration("recovery-timeout", 30*time.Second, "Timeout for WAL recovery")
+	metricsAddress := flag.String("metrics-address", ":8080", "Address for metrics server (set to empty to disable)")
 
 	// Add replication flags
 	role := flag.String("role", "primary", "Server role: 'primary' or 'secondary'")
@@ -50,6 +51,12 @@ func main() {
 	}
 
 	pb.RegisterLockServiceServer(s, lockServer)
+
+	// Start metrics server if address is provided
+	if *metricsAddress != "" {
+		log.Printf("Starting metrics server at %s", *metricsAddress)
+		lockServer.GetMetrics().StartMetricsServer(*metricsAddress)
+	}
 
 	// Wait for WAL recovery to complete
 	log.Printf("Waiting for WAL recovery to complete...")
