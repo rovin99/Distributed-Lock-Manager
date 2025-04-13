@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"Distributed-Lock-Manager/internal/server"
@@ -20,8 +21,9 @@ func main() {
 
 	// Add replication flags
 	role := flag.String("role", "primary", "Server role: 'primary' or 'secondary'")
-	serverID := flag.Int("id", 1, "Server ID (1 for primary, 2 for secondary)")
-	peerAddress := flag.String("peer", "", "Address of peer server (e.g., 'localhost:50052')")
+	serverID := flag.Int("id", 1, "Server ID (1 for primary, 2+ for secondaries)")
+	peerAddress := flag.String("peer", "", "Address of peer server (legacy, single peer)")
+	peers := flag.String("peers", "", "Comma-separated list of all peer server addresses (e.g., 'host2:port,host3:port')")
 	skipVerifications := flag.Bool("skip-verifications", false, "Skip ID and filesystem verifications")
 
 	flag.Parse()
@@ -32,6 +34,17 @@ func main() {
 	// Create gRPC server
 	s := grpc.NewServer()
 
+	// Process peer addresses
+	var peerAddresses []string
+	if *peers != "" {
+		peerAddresses = strings.Split(*peers, ",")
+		log.Printf("Configured with %d peers: %v", len(peerAddresses), peerAddresses)
+	} else if *peerAddress != "" {
+		// Legacy mode with single peer
+		peerAddresses = []string{*peerAddress}
+		log.Printf("Legacy mode with single peer: %s", *peerAddress)
+	}
+
 	// Determine server role from flags
 	var lockServer *server.LockServer
 	if *role == "primary" || *role == "secondary" {
@@ -41,9 +54,16 @@ func main() {
 			serverRole = server.SecondaryRole
 		}
 
-		// Create replicated server
-		lockServer = server.NewReplicatedLockServer(serverRole, int32(*serverID), *peerAddress)
-		log.Printf("Starting as %s server (ID: %d) with peer: %s", *role, *serverID, *peerAddress)
+		// Create replicated server with new configuration function
+		if len(peerAddresses) > 0 {
+			// Multi-peer configuration
+			lockServer = server.NewReplicatedLockServerWithMultiPeers(serverRole, int32(*serverID), peerAddresses, server.DefaultHeartbeatConfig)
+			log.Printf("Starting as %s server (ID: %d) with %d peers", *role, *serverID, len(peerAddresses))
+		} else {
+			// Legacy with single peer
+			lockServer = server.NewReplicatedLockServer(serverRole, int32(*serverID), *peerAddress)
+			log.Printf("Starting as %s server (ID: %d) with peer: %s", *role, *serverID, *peerAddress)
+		}
 	} else {
 		// Create standalone server (backward compatibility)
 		lockServer = server.NewLockServer()
@@ -68,7 +88,7 @@ func main() {
 	}
 
 	// Perform verifications if this is a replicated setup
-	if *peerAddress != "" && !*skipVerifications {
+	if (len(peerAddresses) > 0 || *peerAddress != "") && !*skipVerifications {
 		// Verify server ID uniqueness
 		log.Printf("Verifying server ID uniqueness...")
 		if err := lockServer.VerifyUniqueServerID(); err != nil {

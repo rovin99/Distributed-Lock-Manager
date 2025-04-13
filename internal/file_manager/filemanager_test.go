@@ -1137,3 +1137,167 @@ func TestRecoveryWithProcessedRequests(t *testing.T) {
 		t.Errorf("Content was duplicated after recovery. Got %s, want %s", string(content), expectedContent)
 	}
 }
+
+func TestRollbackOnLeaseExpiry(t *testing.T) {
+	// Setup
+	tempDir, err := os.MkdirTemp("", "filemanager_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Change to temp directory
+	originalWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get current working directory: %v", err)
+	}
+	defer os.Chdir(originalWd)
+	os.Chdir(tempDir)
+
+	// Create data directory
+	if err := os.Mkdir("data", 0755); err != nil {
+		t.Fatalf("Failed to create data directory: %v", err)
+	}
+
+	// Create test file
+	testFile := filepath.Join("data", "file_0")
+	if err := os.WriteFile(testFile, []byte(""), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	// Initialize lock manager with short lease duration for testing
+	logger := log.New(os.Stdout, "[Test] ", log.LstdFlags)
+	lm := lock_manager.NewLockManagerWithLeaseDuration(logger, 1*time.Second)
+
+	// Initialize file manager
+	fm := NewFileManager(true, lm)
+
+	// Register for lease expiry
+	callbackCalled := make(chan string, 1) // Channel to track callback execution
+
+	lm.RegisterLeaseExpiryCallback(func(clientID int32, token string) {
+		err := fm.RollbackTokenOperations(token)
+		if err != nil {
+			t.Errorf("Error rolling back operations: %v", err)
+		}
+		callbackCalled <- token
+	})
+
+	// Test scenario
+	// 1. Client 1 acquires lock
+	clientID := int32(1)
+	acquired, token := lm.Acquire(clientID)
+	if !acquired {
+		t.Fatalf("Failed to acquire lock")
+	}
+
+	// 2. Client 1 appends 'A'
+	if err := fm.AppendToFile("file_0", []byte("A"), clientID, token); err != nil {
+		t.Fatalf("Failed to append to file: %v", err)
+	}
+
+	// Verify file contains 'A'
+	content, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+	if string(content) != "A" {
+		t.Fatalf("Expected file to contain 'A', got %q", string(content))
+	}
+
+	// 3. Wait for lease to expire and callback to be called
+	select {
+	case receivedToken := <-callbackCalled:
+		if receivedToken != token {
+			t.Errorf("Received unexpected token in callback: %s", receivedToken)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Timed out waiting for lease expiry callback")
+	}
+
+	// 4. Verify file was rolled back (content should be empty again)
+	content, err = os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("Failed to read file after rollback: %v", err)
+	}
+	if string(content) != "" {
+		t.Fatalf("Expected file to be empty after rollback, got %q", string(content))
+	}
+
+	// 5. Client 2 acquires lock
+	clientID2 := int32(2)
+	acquired, token2 := lm.Acquire(clientID2)
+	if !acquired {
+		t.Fatalf("Client 2 failed to acquire lock")
+	}
+
+	// 6. Client 2 appends 'B' twice
+	if err := fm.AppendToFile("file_0", []byte("B"), clientID2, token2); err != nil {
+		t.Fatalf("Failed to append 'B' to file: %v", err)
+	}
+	if err := fm.AppendToFile("file_0", []byte("B"), clientID2, token2); err != nil {
+		t.Fatalf("Failed to append second 'B' to file: %v", err)
+	}
+
+	// Verify file contains 'BB'
+	content, err = os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+	if string(content) != "BB" {
+		t.Fatalf("Expected file to contain 'BB', got %q", string(content))
+	}
+
+	// 7. Client 1 attempts to continue with old token (should fail)
+	err = fm.AppendToFile("file_0", []byte("A"), clientID, token)
+	if err == nil {
+		t.Fatalf("Expected Client 1's append to fail with old token, but it succeeded")
+	}
+
+	// For more reliable testing, manually release Client 2's lock to avoid waiting for expiry
+	if !lm.Release(clientID2, token2) {
+		t.Fatalf("Failed to release Client 2's lock")
+	}
+
+	// 8. Client 1 re-acquires lock
+	acquired, token3 := lm.Acquire(clientID)
+	if !acquired {
+		t.Fatalf("Client 1 failed to re-acquire lock")
+	}
+
+	// 9. Client 1 appends 'A' twice with new token
+	if err := fm.AppendToFile("file_0", []byte("A"), clientID, token3); err != nil {
+		t.Fatalf("Failed to append 'A' to file with new token: %v", err)
+	}
+	if err := fm.AppendToFile("file_0", []byte("A"), clientID, token3); err != nil {
+		t.Fatalf("Failed to append second 'A' to file with new token: %v", err)
+	}
+
+	// 10. Verify final file content is 'AA' (since we manually released Client 2's lock, no rollback occurred)
+	content, err = os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("Failed to read file at end of test: %v", err)
+	}
+	if string(content) != "BBAA" {
+		t.Fatalf("Expected final file content to be 'BBAA', got %q", string(content))
+	}
+
+	// Additional test: verify that after Client 1's lease expires, their operations are rolled back
+	select {
+	case receivedToken := <-callbackCalled:
+		if receivedToken != token3 {
+			t.Errorf("Received unexpected token in callback: %s", receivedToken)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Timed out waiting for second lease expiry callback")
+	}
+
+	// Verify only Client 1's operations were rolled back (file should still have "BB")
+	content, err = os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("Failed to read file after final rollback: %v", err)
+	}
+	if string(content) != "BB" {
+		t.Fatalf("Expected file to contain 'BB' after final rollback, got %q", string(content))
+	}
+}

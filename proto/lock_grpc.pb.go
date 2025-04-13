@@ -28,6 +28,7 @@ const (
 	LockService_Ping_FullMethodName                 = "/lock.LockService/Ping"
 	LockService_ServerInfo_FullMethodName           = "/lock.LockService/ServerInfo"
 	LockService_VerifyFileAccess_FullMethodName     = "/lock.LockService/VerifyFileAccess"
+	LockService_ProposePromotion_FullMethodName     = "/lock.LockService/ProposePromotion"
 )
 
 // LockServiceClient is the client API for LockService service.
@@ -54,6 +55,8 @@ type LockServiceClient interface {
 	ServerInfo(ctx context.Context, in *ServerInfoRequest, opts ...grpc.CallOption) (*ServerInfoResponse, error)
 	// Verify file access (to check shared filesystem)
 	VerifyFileAccess(ctx context.Context, in *FileAccessRequest, opts ...grpc.CallOption) (*FileAccessResponse, error)
+	// Leader election (propose becoming the leader)
+	ProposePromotion(ctx context.Context, in *ProposeRequest, opts ...grpc.CallOption) (*ProposeResponse, error)
 }
 
 type lockServiceClient struct {
@@ -154,6 +157,16 @@ func (c *lockServiceClient) VerifyFileAccess(ctx context.Context, in *FileAccess
 	return out, nil
 }
 
+func (c *lockServiceClient) ProposePromotion(ctx context.Context, in *ProposeRequest, opts ...grpc.CallOption) (*ProposeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProposeResponse)
+	err := c.cc.Invoke(ctx, LockService_ProposePromotion_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LockServiceServer is the server API for LockService service.
 // All implementations must embed UnimplementedLockServiceServer
 // for forward compatibility.
@@ -178,6 +191,8 @@ type LockServiceServer interface {
 	ServerInfo(context.Context, *ServerInfoRequest) (*ServerInfoResponse, error)
 	// Verify file access (to check shared filesystem)
 	VerifyFileAccess(context.Context, *FileAccessRequest) (*FileAccessResponse, error)
+	// Leader election (propose becoming the leader)
+	ProposePromotion(context.Context, *ProposeRequest) (*ProposeResponse, error)
 	mustEmbedUnimplementedLockServiceServer()
 }
 
@@ -214,6 +229,9 @@ func (UnimplementedLockServiceServer) ServerInfo(context.Context, *ServerInfoReq
 }
 func (UnimplementedLockServiceServer) VerifyFileAccess(context.Context, *FileAccessRequest) (*FileAccessResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method VerifyFileAccess not implemented")
+}
+func (UnimplementedLockServiceServer) ProposePromotion(context.Context, *ProposeRequest) (*ProposeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ProposePromotion not implemented")
 }
 func (UnimplementedLockServiceServer) mustEmbedUnimplementedLockServiceServer() {}
 func (UnimplementedLockServiceServer) testEmbeddedByValue()                     {}
@@ -398,6 +416,24 @@ func _LockService_VerifyFileAccess_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LockService_ProposePromotion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProposeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LockServiceServer).ProposePromotion(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LockService_ProposePromotion_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LockServiceServer).ProposePromotion(ctx, req.(*ProposeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LockService_ServiceDesc is the grpc.ServiceDesc for LockService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -440,6 +476,10 @@ var LockService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "VerifyFileAccess",
 			Handler:    _LockService_VerifyFileAccess_Handler,
+		},
+		{
+			MethodName: "ProposePromotion",
+			Handler:    _LockService_ProposePromotion_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

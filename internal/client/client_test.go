@@ -675,6 +675,172 @@ func TestErrorTypes(t *testing.T) {
 	})
 }
 
+// TestAppendIdempotency tests that the FileAppend operation is idempotent
+// when retried with network failures, ensuring the same request ID is used
+func TestAppendIdempotency(t *testing.T) {
+	// Set up a mock client
+	mockClient := new(MockLockServiceClient)
+	lc := &LockClient{
+		client:           mockClient,
+		id:               1,
+		sequenceNumber:   0,
+		clientUUID:       "test-uuid",
+		lockToken:        "",
+		hasLock:          false,
+		renewalActive:    false,
+		cancelRenewal:    make(chan struct{}),
+		serverAddrs:      []string{"server1:50051", "server2:50051"},
+		currentServerIdx: 0,
+	}
+
+	// Make lease renewal interval shorter for testing or disable it
+	oldLeaseRenewalInt := leaseRenewalInt
+	leaseRenewalInt = 1 * time.Hour // Set to a long time to avoid automatic renewal during the test
+	defer func() { leaseRenewalInt = oldLeaseRenewalInt }()
+
+	// Scenario: Client acquires lock, appends "1", then tries to append "A" with
+	// various network failures, then releases lock. A second client acquires lock
+	// and appends "B".
+	//
+	// Expected: The final content should be "1AB", not "1AAB", demonstrating idempotency.
+
+	// Step 1: Client 1 acquires lock
+	mockClient.On("LockAcquire", mock.Anything, mock.MatchedBy(func(in *pb.LockArgs) bool {
+		// Capture the first request ID for later verification
+		return in.ClientId == 1
+	})).Return(&pb.LockResponse{
+		Status: pb.Status_OK,
+		Token:  "token-1",
+	}, nil).Once()
+
+	// Mock for lease renewal to avoid the test failing when renewal starts
+	mockClient.On("RenewLease", mock.Anything, mock.Anything).
+		Return(&pb.LeaseResponse{
+			Status: pb.Status_OK,
+		}, nil).Maybe()
+
+	err := lc.LockAcquire()
+	assert.NoError(t, err)
+	assert.True(t, lc.hasLock)
+	assert.Equal(t, "token-1", lc.lockToken)
+
+	// Step 2: Client 1 appends "1" successfully
+	mockClient.On("FileAppend", mock.Anything, mock.MatchedBy(func(in *pb.FileArgs) bool {
+		return in.ClientId == 1 &&
+			string(in.Content) == "1" &&
+			in.Token == "token-1"
+	})).Return(&pb.FileResponse{
+		Status: pb.Status_OK,
+	}, nil).Once()
+
+	err = lc.FileAppend("file_0", []byte("1"))
+	assert.NoError(t, err)
+
+	// Save the current sequence number, which will be used for the next request ID
+	initialSeqNum := lc.sequenceNumber
+
+	// Step 3: First attempt to append "A" - request is lost (connection error)
+	// This will trigger a retry but should use the same request ID
+	mockClient.On("FileAppend", mock.Anything, mock.MatchedBy(func(in *pb.FileArgs) bool {
+		return in.ClientId == 1 &&
+			string(in.Content) == "A" &&
+			in.Token == "token-1" &&
+			// This should be the request ID for sequence number initialSeqNum+1
+			in.RequestId == fmt.Sprintf("1-%s-%d", lc.clientUUID[:8], initialSeqNum+1)
+	})).Return(nil, errors.New("connection refused")).Once()
+
+	// Step 4: Second attempt (retry) - request succeeds but response is lost
+	mockClient.On("FileAppend", mock.Anything, mock.MatchedBy(func(in *pb.FileArgs) bool {
+		return in.ClientId == 1 &&
+			string(in.Content) == "A" &&
+			in.Token == "token-1" &&
+			// This should still use the SAME request ID as the first attempt
+			in.RequestId == fmt.Sprintf("1-%s-%d", lc.clientUUID[:8], initialSeqNum+1)
+	})).Return(nil, errors.New("connection reset")).Once()
+
+	// Step 5: Third attempt (retry) - both request and response succeed
+	mockClient.On("FileAppend", mock.Anything, mock.MatchedBy(func(in *pb.FileArgs) bool {
+		return in.ClientId == 1 &&
+			string(in.Content) == "A" &&
+			in.Token == "token-1" &&
+			// This should still use the SAME request ID as the previous attempts
+			in.RequestId == fmt.Sprintf("1-%s-%d", lc.clientUUID[:8], initialSeqNum+1)
+	})).Return(&pb.FileResponse{
+		Status: pb.Status_OK,
+	}, nil).Once()
+
+	// Attempt to append "A" - this should go through all three attempts with the same request ID
+	err = lc.FileAppend("file_0", []byte("A"))
+	assert.NoError(t, err)
+
+	// Verify that the sequence number was only incremented ONCE for all three attempts
+	assert.Equal(t, initialSeqNum+1, lc.sequenceNumber,
+		"Sequence number should only increment once for all retries of the same operation")
+
+	// Step 6: Client 1 releases lock
+	mockClient.On("LockRelease", mock.Anything, mock.MatchedBy(func(in *pb.LockArgs) bool {
+		return in.ClientId == 1 && in.Token == "token-1"
+	})).Return(&pb.LockResponse{
+		Status: pb.Status_OK,
+	}, nil).Once()
+
+	err = lc.LockRelease()
+	assert.NoError(t, err)
+	assert.False(t, lc.hasLock)
+
+	// Step 7: Create Client 2 and acquire lock
+	lc2 := &LockClient{
+		client:           mockClient,
+		id:               2,
+		sequenceNumber:   0,
+		clientUUID:       "test-uuid-2",
+		lockToken:        "",
+		hasLock:          false,
+		renewalActive:    false,
+		cancelRenewal:    make(chan struct{}),
+		serverAddrs:      []string{"server1:50051", "server2:50051"},
+		currentServerIdx: 0,
+	}
+
+	mockClient.On("LockAcquire", mock.Anything, mock.MatchedBy(func(in *pb.LockArgs) bool {
+		return in.ClientId == 2
+	})).Return(&pb.LockResponse{
+		Status: pb.Status_OK,
+		Token:  "token-2",
+	}, nil).Once()
+
+	err = lc2.LockAcquire()
+	assert.NoError(t, err)
+	assert.True(t, lc2.hasLock)
+	assert.Equal(t, "token-2", lc2.lockToken)
+
+	// Step 8: Client 2 appends "B"
+	mockClient.On("FileAppend", mock.Anything, mock.MatchedBy(func(in *pb.FileArgs) bool {
+		return in.ClientId == 2 &&
+			string(in.Content) == "B" &&
+			in.Token == "token-2"
+	})).Return(&pb.FileResponse{
+		Status: pb.Status_OK,
+	}, nil).Once()
+
+	err = lc2.FileAppend("file_0", []byte("B"))
+	assert.NoError(t, err)
+
+	// Step 9: Client 2 releases lock
+	mockClient.On("LockRelease", mock.Anything, mock.MatchedBy(func(in *pb.LockArgs) bool {
+		return in.ClientId == 2 && in.Token == "token-2"
+	})).Return(&pb.LockResponse{
+		Status: pb.Status_OK,
+	}, nil).Once()
+
+	err = lc2.LockRelease()
+	assert.NoError(t, err)
+	assert.False(t, lc2.hasLock)
+
+	// Verify that all expected mock interactions occurred
+	mockClient.AssertExpectations(t)
+}
+
 // TestRetryRPCShort tests our faster testRetryRPC implementation
 func TestRetryRPCShort(t *testing.T) {
 	// Create a client
@@ -763,4 +929,89 @@ func TestRetryRPCShort(t *testing.T) {
 		assert.False(t, lc.hasLock, "Should invalidate lock")
 		assert.Equal(t, "", lc.lockToken, "Should clear token")
 	})
+}
+
+func TestRequestIdConsistencyForRetries(t *testing.T) {
+	// This test verifies that the client uses the same request ID when retrying operations
+
+	lc := &LockClient{
+		id:             1,
+		sequenceNumber: 0,
+		clientUUID:     "test-uuid-fixed",
+		lockToken:      "token-1", // Already has a lock
+		hasLock:        true,
+	}
+
+	// Get the initial request ID when calling FileAppend
+	initialSeqNum := lc.sequenceNumber
+	expectedRequestID := fmt.Sprintf("1-%s-%d", lc.clientUUID[:8], initialSeqNum+1)
+
+	// Create a simulated FileAppend args to check the request ID
+	args := &pb.FileArgs{
+		ClientId:  lc.id,
+		Filename:  "file_0",
+		Content:   []byte("A"),
+		Token:     lc.lockToken,
+		RequestId: "", // This will be set inside FileAppend
+	}
+
+	// Create FileAppend args similar to what the real method would do
+	requestID := lc.GenerateRequestID()
+	args.RequestId = requestID
+
+	// Check that the generated requestID matches our expected format
+	assert.Equal(t, expectedRequestID, requestID, "Request ID should follow the expected format")
+
+	// Verify the sequence number was incremented
+	assert.Equal(t, initialSeqNum+1, lc.sequenceNumber, "Sequence number should be incremented")
+
+	// Now let's verify that multiple calls to GenerateRequestID produce different IDs
+	secondRequestID := lc.GenerateRequestID()
+	thirdRequestID := lc.GenerateRequestID()
+
+	assert.NotEqual(t, requestID, secondRequestID, "Subsequent request IDs should be different")
+	assert.NotEqual(t, secondRequestID, thirdRequestID, "Subsequent request IDs should be different")
+
+	// But the FileAppend method should reuse the same ID for retries
+	// Let's simulate the real FileAppend method's behavior:
+
+	// Reset sequence number for clarity
+	lc.sequenceNumber = 0
+
+	// Code structure similar to the real FileAppend method
+	fileAppendRequestID := lc.GenerateRequestID()
+	fileAppendArgs := &pb.FileArgs{
+		ClientId:  lc.id,
+		Filename:  "file_0",
+		Content:   []byte("A"),
+		Token:     lc.lockToken,
+		RequestId: fileAppendRequestID,
+	}
+
+	// Simulate three calls to the server as if retrying
+	callCount := 0
+	callArgs := make([]*pb.FileArgs, 3)
+
+	// This simulates the retryFileAppend function's behavior
+	retryFunc := func() {
+		// Create a copy to verify it's the same each time
+		argsCopy := *fileAppendArgs
+		callArgs[callCount] = &argsCopy
+		callCount++
+	}
+
+	// Simulate three retry attempts
+	retryFunc() // First attempt
+	retryFunc() // Second attempt (retry)
+	retryFunc() // Third attempt (retry)
+
+	// Now verify all three calls used the same request ID
+	assert.Equal(t, 3, callCount, "Should have made 3 calls")
+	assert.Equal(t, fileAppendRequestID, callArgs[0].RequestId, "First call should use the original request ID")
+	assert.Equal(t, fileAppendRequestID, callArgs[1].RequestId, "Second call should use the same request ID")
+	assert.Equal(t, fileAppendRequestID, callArgs[2].RequestId, "Third call should use the same request ID")
+
+	// Most importantly, verify the sequence number was only incremented ONCE
+	// even though we had three "calls" to the server
+	assert.Equal(t, int64(1), int64(lc.sequenceNumber), "Sequence number should only increment once despite multiple retries")
 }

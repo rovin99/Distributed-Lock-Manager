@@ -120,4 +120,75 @@ tail -f logs/primary.log
 
 # Monitor secondary server
 tail -f logs/secondary.log
-``` 
+```
+
+# Enhanced Multi-Node Replication
+
+In addition to the basic primary-secondary model, the system now supports an enhanced multi-node replication mode with leader election and majority-based consensus.
+
+## Overview
+
+The enhanced replication system has the following characteristics:
+
+1. **Multiple Servers**: Supports 3 or more servers (odd number recommended for majority votes)
+2. **Server States**: Each server can be in one of three states:
+   - **Leader**: Processes client requests and broadcasts state updates
+   - **Follower**: Receives updates from the leader and monitors leader health
+   - **Candidate**: Temporary state when attempting to become the leader
+3. **Epoch-Based Leadership**: Uses monotonically increasing epoch numbers to track leadership terms
+4. **Leader Election**: Uses a simplified election protocol based on majority acknowledgment
+5. **Fencing Mechanism**: Preserved from the 2-node system to ensure safety during failover
+
+## Running Multi-Node Setup
+
+To run a 3-node cluster:
+
+```bash
+# Start Node 1 (initial leader)
+bin/lock_server --role primary --id 1 --address ":50051" --peers "localhost:50052,localhost:50053"
+
+# Start Node 2 (follower)
+bin/lock_server --role secondary --id 2 --address ":50052" --peers "localhost:50051,localhost:50053"
+
+# Start Node 3 (follower)
+bin/lock_server --role secondary --id 3 --address ":50053" --peers "localhost:50051,localhost:50052"
+```
+
+## Leader Election
+
+The leader election process works as follows:
+
+1. **Election Trigger**: If a follower doesn't receive heartbeats from the leader, it starts an election
+2. **Promotion Attempt**: 
+   - Server transitions to Candidate state
+   - Increments epoch and votes for itself
+   - Broadcasts ProposePromotion RPCs to all peers
+3. **Voting Rules**:
+   - A server votes only once per epoch
+   - Vote is granted if the candidate's epoch is >= the server's current epoch
+4. **Leadership Decision**:
+   - Candidate becomes Leader if it receives votes from a majority of servers
+   - Otherwise, it times out and tries again or steps down if it sees a higher epoch
+
+## Epoch-Based Safety
+
+Epochs provide a logical clock to order events:
+
+1. All messages include the epoch number
+2. Servers reject messages with epochs lower than their own
+3. If a server receives a message with a higher epoch, it updates its own epoch and becomes a Follower
+4. This prevents split-brain scenarios and ensures everyone follows the latest legitimate leader
+
+## Testing Multi-Node Replication
+
+Use the test script to verify the multi-node setup:
+
+```bash
+./test_advanced_replication.sh multi-node
+```
+
+The test script will:
+1. Start a 3-node cluster
+2. Verify basic operations 
+3. Test failover scenarios
+4. Ensure split-brain prevention works correctly 

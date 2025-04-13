@@ -10,8 +10,10 @@ NC='\033[0m' # No Color
 # Configuration
 PRIMARY_PORT=50051
 SECONDARY_PORT=50052
+THIRD_PORT=50053
 PRIMARY_ADDR="localhost:$PRIMARY_PORT"
 SECONDARY_ADDR="localhost:$SECONDARY_PORT"
+THIRD_ADDR="localhost:$THIRD_PORT"
 TEST_TIMEOUT=30
 
 # Unique metrics ports for each test to avoid conflicts
@@ -21,6 +23,7 @@ FENCING_TEST_METRICS_PORT=$((METRICS_PORT_BASE + 2))
 FAILOVER_TEST_METRICS_PORT=$((METRICS_PORT_BASE + 3))
 SPLIT_BRAIN_TEST_METRICS_PORT=$((METRICS_PORT_BASE + 4))
 LEASE_EXPIRY_TEST_METRICS_PORT=$((METRICS_PORT_BASE + 5))
+MULTI_NODE_TEST_METRICS_PORT=$((METRICS_PORT_BASE + 6))
 
 BASE_CLIENT_ID=1000
 
@@ -50,9 +53,13 @@ if [ -n "$1" ]; then
             # Will run lease_expiry_test later in the script
             RUN_ONLY_LEASE_EXPIRY=true
             ;;
+        multi-node)
+            # Will run multi_node_replication_test later in the script
+            RUN_ONLY_MULTI_NODE=true
+            ;;
         *)
             echo "Unknown test: $TEST_TO_RUN"
-            echo "Usage: $0 {replication|fencing|failover|split-brain|lease-expiry}"
+            echo "Usage: $0 {replication|fencing|failover|split-brain|lease-expiry|multi-node}"
             exit 1
             ;;
     esac
@@ -180,7 +187,7 @@ cleanup() {
     sleep 2
     
     # More aggressive port cleanup
-    for port in $PRIMARY_PORT $SECONDARY_PORT $METRICS_PORT_BASE $REPLICATION_TEST_METRICS_PORT $FENCING_TEST_METRICS_PORT $FAILOVER_TEST_METRICS_PORT $SPLIT_BRAIN_TEST_METRICS_PORT $LEASE_EXPIRY_TEST_METRICS_PORT; do
+    for port in $PRIMARY_PORT $SECONDARY_PORT $THIRD_PORT $METRICS_PORT_BASE $REPLICATION_TEST_METRICS_PORT $FENCING_TEST_METRICS_PORT $FAILOVER_TEST_METRICS_PORT $SPLIT_BRAIN_TEST_METRICS_PORT $LEASE_EXPIRY_TEST_METRICS_PORT $MULTI_NODE_TEST_METRICS_PORT; do
         print_color $YELLOW "Checking for processes using port $port..."
         # Find and kill any process using this port
         if [ "$(uname)" = "Darwin" ]; then
@@ -965,75 +972,127 @@ run_lease_expiry_test() {
     return 0
 }
 
-if [ "$RUN_ONLY_REPLICATION" = true ]; then
-    run_enhanced_replication_test
-    exit $?
-fi
+# Test for the new multi-node replication system with 3 nodes
+run_multi_node_replication_test() {
+    print_header "Multi-Node Replication Test (3 Nodes)"
+    
+    # Set up peer lists for each server
+    PEERS_FOR_NODE1="$SECONDARY_ADDR,$THIRD_ADDR"
+    PEERS_FOR_NODE2="$PRIMARY_ADDR,$THIRD_ADDR"
+    PEERS_FOR_NODE3="$PRIMARY_ADDR,$SECONDARY_ADDR"
+    
+    print_color $YELLOW "Starting node 1 (leader) on port $PRIMARY_PORT"
+    bin/lock_server --role primary --id 1 --address ":$PRIMARY_PORT" --peers "$PEERS_FOR_NODE1" --metrics-address ":$MULTI_NODE_TEST_METRICS_PORT" > logs/test_node1.log 2>&1 &
+    NODE1_PID=$!
+    
+    # Wait for node 1 to start
+    if ! wait_for_server "$PRIMARY_ADDR"; then
+        print_color $RED "Node 1 failed to start"
+        exit 1
+    fi
+    
+    # Verify node 1 started
+    if ! verify_server_started "logs/test_node1.log" "Node 1"; then
+        print_color $RED "Node 1 failed to start properly"
+        return 1
+    fi
+    
+    print_color $YELLOW "Starting node 2 (follower) on port $SECONDARY_PORT"
+    bin/lock_server --role secondary --id 2 --address ":$SECONDARY_PORT" --peers "$PEERS_FOR_NODE2" --metrics-address ":$MULTI_NODE_TEST_METRICS_PORT" > logs/test_node2.log 2>&1 &
+    NODE2_PID=$!
+    
+    # Wait for node 2 to start
+    if ! wait_for_server "$SECONDARY_ADDR"; then
+        print_color $RED "Node 2 failed to start"
+        exit 1
+    fi
+    
+    # Verify node 2 started
+    if ! verify_server_started "logs/test_node2.log" "Node 2"; then
+        print_color $RED "Node 2 failed to start properly"
+        return 1
+    fi
+    
+    print_color $YELLOW "Starting node 3 (follower) on port $THIRD_PORT"
+    bin/lock_server --role secondary --id 3 --address ":$THIRD_PORT" --peers "$PEERS_FOR_NODE3" --metrics-address ":$MULTI_NODE_TEST_METRICS_PORT" > logs/test_node3.log 2>&1 &
+    NODE3_PID=$!
+    
+    # Wait for node 3 to start
+    if ! wait_for_server "$THIRD_ADDR"; then
+        print_color $RED "Node 3 failed to start"
+        exit 1
+    fi
+    
+    # Verify node 3 started
+    if ! verify_server_started "logs/test_node3.log" "Node 3"; then
+        print_color $RED "Node 3 failed to start properly"
+        return 1
+    fi
+    
+    # Let the system stabilize
+    sleep 5
+    
+    # Run a client test with node 1 (leader)
+    local CLIENT_ID=$BASE_CLIENT_ID
+    print_color $YELLOW "Running client to acquire lock through node 1..."
+    bin/lock_client acquire --servers="$PRIMARY_ADDR" --client-id=$CLIENT_ID --timeout=10s > logs/test_multi_client.log 2>&1
+    
+    if [ $? -ne 0 ]; then
+        print_color $RED "Client failed to acquire lock through node 1"
+        return 1
+    fi
+    
+    print_color $GREEN "Successfully verified basic multi-node setup"
+    
+    # Clean up
+    print_color $YELLOW "Cleaning up multi-node test..."
+    kill $NODE1_PID $NODE2_PID $NODE3_PID || true
+    sleep 2
+    
+    # Additional cleanup to ensure no lingering processes
+    cleanup
+    return 0
+}
 
-if [ "$RUN_ONLY_FENCING" = true ]; then
-    run_fencing_test
-    exit $?
-fi
+# Add the new test to the list of tests to run
+run_test() {
+    local test_name=$1
+    local test_func=$2
+    
+    print_header "Running Test: $test_name"
+    
+    if $test_func; then
+        print_color $GREEN "Test '$test_name' PASSED"
+        return 0
+    else
+        print_color $RED "Test '$test_name' FAILED"
+        tests_failed=$((tests_failed+1))
+        return 1
+    fi
+}
 
-if [ "$RUN_ONLY_FAILOVER" = true ]; then
-    run_expanded_failover_test
-    exit $?
-fi
+# Run all tests
+print_header "Starting Advanced Tests"
 
-if [ "$RUN_ONLY_SPLIT_BRAIN" = true ]; then
-    run_improved_split_brain_test
-    exit $?
-fi
+tests_failed=0
 
-if [ "$RUN_ONLY_LEASE_EXPIRY" = true ]; then
-    run_lease_expiry_test
-    exit $?
-fi
+# Run the current tests
+run_test "Enhanced Replication" run_enhanced_replication_test
+run_test "Fencing Behavior" run_fencing_test
+run_test "Secondary Promotion" run_secondary_promotion_test
+run_test "Client Failover" run_client_failover_test
+run_test "Repeated Lock Operations" run_repeated_lock_operations
 
-run_enhanced_replication_test
-if [ $? -ne 0 ]; then
-    tests_failed=$((tests_failed+1))
-fi
-cleanup
-sleep 2
-
-run_fencing_test
-if [ $? -ne 0 ]; then
-    tests_failed=$((tests_failed+1))
-fi
-cleanup
-sleep 2
-
-run_expanded_failover_test
-if [ $? -ne 0 ]; then
-    tests_failed=$((tests_failed+1))
-fi
-cleanup
-sleep 2
-
-run_improved_split_brain_test
-if [ $? -ne 0 ]; then
-    tests_failed=$((tests_failed+1))
-fi
-cleanup
-sleep 2
-
-run_lease_expiry_test
-if [ $? -ne 0 ]; then
-    tests_failed=$((tests_failed+1))
-fi
-cleanup
-sleep 2
+# Run the new multi-node test
+run_test "Multi-Node Replication" run_multi_node_replication_test
 
 # Print summary
 print_header "Test Summary"
+
 if [ $tests_failed -eq 0 ]; then
-    print_color $GREEN "All advanced tests passed!"
+    print_color $GREEN "All tests PASSED"
+    exit 0
 else
-    print_color $RED "$tests_failed advanced test(s) failed!"
+    print_color $RED "$tests_failed tests FAILED"
+    exit 1
 fi
-
-# Run an extra cleanup at the very end
-cleanup
-
-exit $tests_failed

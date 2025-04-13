@@ -34,6 +34,9 @@ service LockService {
   
   // Verify file access (to check shared filesystem)
   rpc VerifyFileAccess(FileAccessRequest) returns (FileAccessResponse);
+
+  // Leader election (propose becoming the leader)
+  rpc ProposePromotion(ProposeRequest) returns (ProposeResponse) {}
 }
 
 // Client initialization arguments
@@ -92,26 +95,42 @@ message lease_response {
 
 // Replicated state message for primary -> secondary communication
 message replicated_state {
-  int32 lock_holder = 1;    // ID of lock holder (-1 if free)
-  string lock_token = 2;    // Current lock token
+  int32 lock_holder = 1;      // ID of lock holder (-1 if free)
+  string lock_token = 2;      // Current lock token
   int64 expiry_timestamp = 3; // Expiry time as unix timestamp
+  int64 epoch = 4;            // Epoch number of the leader
 }
 
 // Response to replication update
 message replication_response {
   Status status = 1;
   string error_message = 2;
+  int64 current_epoch = 3;    // Current epoch of the responding server
 }
 
 // Heartbeat request (secondary -> primary)
 message heartbeat_request {
   int32 server_id = 1;  // ID of the secondary server
+  int64 epoch = 2;      // Current epoch of the sending server
 }
 
 // Heartbeat response
 message heartbeat_response {
   Status status = 1;
   string error_message = 2;
+  int64 current_epoch = 3; // Current epoch of the responding server
+}
+
+// Leadership proposal request
+message ProposeRequest {
+  int32 candidate_id = 1;       // ID of the server proposing to be leader
+  int64 proposed_epoch = 2;     // Proposed new epoch number
+}
+
+// Leadership proposal response
+message ProposeResponse {
+  int64 current_epoch = 1;      // Current epoch of the responding server
+  bool vote_granted = 2;        // Whether vote was granted for this promotion
 }
 
 // ServerInfo request
@@ -121,11 +140,12 @@ message ServerInfoRequest {}
 message ServerInfoResponse {
   int32 server_id = 1;
   string role = 2;
+  int64 current_epoch = 3;     // Current epoch of the server
 }
 
 // File access verification request
 message FileAccessRequest {
-  string file_path = 1;    // Path to the file to check
+  string file_path = 1;         // Path to the file to check
   string expected_content = 2;  // Content that should be in the file
 }
 
@@ -142,10 +162,11 @@ enum Status {
   ERROR = 1;
   LOCK_HELD = 2;
   LOCK_NOT_HELD = 3;
-  INVALID_TOKEN = 4;  // New status for token validation failures
-  PERMISSION_DENIED = 5;  // New status for permission-related errors
-  SERVER_FENCING = 6;  // Server is in fencing period after promotion
-  SECONDARY_MODE = 7;  // Server is in secondary mode and can't process client requests
+  INVALID_TOKEN = 4;        // Token validation failures
+  PERMISSION_DENIED = 5;    // Permission-related errors
+  SERVER_FENCING = 6;       // Server is in fencing period after promotion
+  SECONDARY_MODE = 7;       // Server is in secondary mode and can't process client requests
   DUPLICATE_SERVER_ID = 8;  // Server detected duplicate server ID
-  FILESYSTEM_ERROR = 9;  // Error accessing shared filesystem
+  FILESYSTEM_ERROR = 9;     // Error accessing shared filesystem
+  STALE_EPOCH = 10;         // Message has a stale epoch number
 } 

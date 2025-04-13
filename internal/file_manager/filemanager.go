@@ -16,6 +16,14 @@ import (
 	"Distributed-Lock-Manager/internal/wal"
 )
 
+// FileOperation represents a file operation performed with a specific token
+type FileOperation struct {
+	Filename  string
+	StartPos  int64
+	DataSize  int64
+	Timestamp time.Time
+}
+
 // FileManager handles all file-related operations
 type FileManager struct {
 	openFiles          map[string]*os.File // Tracks open file handles
@@ -29,6 +37,9 @@ type FileManager struct {
 	recoveryErr        error                     // Stores any error during recovery
 	processedRequests  map[string]bool           // Set of request IDs that have been processed
 	processedRequestFP *os.File                  // File pointer for processed requests log
+
+	// Track operations by token for potential rollback
+	tokenOperations map[string][]FileOperation // Maps token to operations performed with it
 }
 
 // NewFileManager initializes a new file manager
@@ -57,6 +68,7 @@ func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool, lockManager *lock_
 		recoveryDone:      false,
 		recoveryErr:       nil,
 		processedRequests: make(map[string]bool),
+		tokenOperations:   make(map[string][]FileOperation),
 	}
 
 	// Ensure the data directory exists
@@ -305,6 +317,14 @@ func (fm *FileManager) AppendToFileWithRequestID(filename string, content []byte
 		// even if the server crashes immediately after.
 	}
 
+	// Get the current file size before appending (for potential rollback)
+	fullPath := filepath.Join("data", filename)
+	var startPos int64 = 0
+
+	if fileInfo, err := os.Stat(fullPath); err == nil {
+		startPos = fileInfo.Size()
+	}
+
 	// --- Step 3: Perform the Actual File Append ---
 	// If this fails, the commit marker is already in the WAL. Recovery will handle it.
 	if err := fm.appendToFileInternal(filename, content, true); err != nil {
@@ -314,6 +334,17 @@ func (fm *FileManager) AppendToFileWithRequestID(filename string, content []byte
 		// Return the error, but the state is recoverable.
 		return err
 	}
+
+	// Record this operation for potential rollback
+	fm.mu.Lock()
+	operation := FileOperation{
+		Filename:  filename,
+		StartPos:  startPos,
+		DataSize:  int64(len(content)),
+		Timestamp: time.Now(),
+	}
+	fm.tokenOperations[token] = append(fm.tokenOperations[token], operation)
+	fm.mu.Unlock()
 
 	// --- Step 4: Record as Processed (for runtime idempotency and skipping replay) ---
 	// Now that the file write has succeeded, record it durably.
@@ -528,4 +559,96 @@ func (fm *FileManager) ClearProcessedRequests() error {
 
 	fm.processedRequestFP = fp
 	return nil
+}
+
+// RollbackTokenOperations removes all file operations performed with the given token
+func (fm *FileManager) RollbackTokenOperations(token string) error {
+	fm.mu.Lock()
+	operations, exists := fm.tokenOperations[token]
+	if !exists || len(operations) == 0 {
+		fm.mu.Unlock()
+		return nil // No operations to roll back
+	}
+
+	// Make a copy and remove from the map before unlocking
+	opsCopy := make([]FileOperation, len(operations))
+	copy(opsCopy, operations)
+	delete(fm.tokenOperations, token)
+	fm.mu.Unlock()
+
+	fm.logger.Printf("Rolling back %d operations for token %s", len(opsCopy), token)
+
+	// Process operations in reverse order (most recent first)
+	for i := len(opsCopy) - 1; i >= 0; i-- {
+		op := opsCopy[i]
+		if err := fm.rollbackFileOperation(op); err != nil {
+			fm.logger.Printf("Error rolling back operation on %s: %v", op.Filename, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// rollbackFileOperation truncates a file to remove an appended segment
+func (fm *FileManager) rollbackFileOperation(op FileOperation) error {
+	fullPath := filepath.Join("data", op.Filename)
+
+	// Open the file for reading and writing
+	file, err := os.OpenFile(fullPath, os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open file for rollback: %w", err)
+	}
+	defer file.Close()
+
+	// Get current file size
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file stats for rollback: %w", err)
+	}
+
+	currentSize := info.Size()
+
+	// Calculate expected size after operation
+	expectedSize := op.StartPos + op.DataSize
+
+	// Only truncate if the file size matches our expectation
+	// This prevents accidental truncation if something else modified the file
+	if currentSize >= expectedSize {
+		// Truncate the file to remove this operation
+		if err := file.Truncate(op.StartPos); err != nil {
+			return fmt.Errorf("failed to truncate file: %w", err)
+		}
+
+		// Ensure data is synced to disk
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync file after truncate: %w", err)
+		}
+
+		fm.logger.Printf("Successfully rolled back append operation on %s (removed %d bytes)",
+			op.Filename, op.DataSize)
+	} else {
+		fm.logger.Printf("Skipping rollback for %s: file size (%d) doesn't match expected size (%d)",
+			op.Filename, currentSize, expectedSize)
+	}
+
+	return nil
+}
+
+// RegisterForLeaseExpiry registers with the lock manager to be notified of lease expiries
+func (fm *FileManager) RegisterForLeaseExpiry() {
+	if fm.lockManager == nil {
+		fm.logger.Printf("Warning: Cannot register for lease expiry notifications - no lock manager")
+		return
+	}
+
+	// Setup a callback for when leases expire
+	fm.lockManager.RegisterLeaseExpiryCallback(func(clientID int32, token string) {
+		fm.logger.Printf("Lease expired for client %d with token %s, rolling back operations",
+			clientID, token)
+
+		if err := fm.RollbackTokenOperations(token); err != nil {
+			fm.logger.Printf("Error during rollback for token %s: %v", token, err)
+		}
+	})
 }

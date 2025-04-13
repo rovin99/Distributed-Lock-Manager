@@ -36,6 +36,10 @@ type LockManager struct {
 
 	// Field for persistence
 	stateFilePath string // Path to store the lock state
+
+	// Callback for lease expiry notification
+	leaseExpiryCallbacks []func(clientID int32, token string)
+	callbacksMu          sync.RWMutex // Separate mutex for callbacks to avoid deadlocks
 }
 
 const defaultStateFilePath = "./data/lock_state.json"
@@ -52,15 +56,16 @@ func NewLockManagerWithLeaseDuration(logger *log.Logger, leaseDuration time.Dura
 	}
 
 	lm := &LockManager{
-		lockHolder:    -1, // -1 means no one has the lock
-		lockToken:     "",
-		leaseExpires:  time.Time{},
-		leaseDuration: leaseDuration,
-		mu:            sync.Mutex{},
-		logger:        logger,
-		queue:         make([]int32, 0),
-		waitingSet:    make(map[int32]bool),
-		stateFilePath: defaultStateFilePath,
+		lockHolder:           -1, // -1 means no one has the lock
+		lockToken:            "",
+		leaseExpires:         time.Time{},
+		leaseDuration:        leaseDuration,
+		mu:                   sync.Mutex{},
+		logger:               logger,
+		queue:                make([]int32, 0),
+		waitingSet:           make(map[int32]bool),
+		stateFilePath:        defaultStateFilePath,
+		leaseExpiryCallbacks: make([]func(clientID int32, token string), 0),
 	}
 	lm.cond = sync.NewCond(&lm.mu)
 
@@ -88,15 +93,16 @@ func NewLockManagerWithStateFile(logger *log.Logger, leaseDuration time.Duration
 	}
 
 	lm := &LockManager{
-		lockHolder:    -1, // -1 means no one has the lock
-		lockToken:     "",
-		leaseExpires:  time.Time{},
-		leaseDuration: leaseDuration,
-		mu:            sync.Mutex{},
-		logger:        logger,
-		queue:         make([]int32, 0),
-		waitingSet:    make(map[int32]bool),
-		stateFilePath: stateFile,
+		lockHolder:           -1, // -1 means no one has the lock
+		lockToken:            "",
+		leaseExpires:         time.Time{},
+		leaseDuration:        leaseDuration,
+		mu:                   sync.Mutex{},
+		logger:               logger,
+		queue:                make([]int32, 0),
+		waitingSet:           make(map[int32]bool),
+		stateFilePath:        stateFile,
+		leaseExpiryCallbacks: make([]func(clientID int32, token string), 0),
 	}
 	lm.cond = sync.NewCond(&lm.mu)
 
@@ -133,9 +139,28 @@ func (lm *LockManager) monitorLeases() {
 		if lm.lockHolder != -1 && !lm.leaseExpires.IsZero() && time.Now().After(lm.leaseExpires) {
 			// Lease has expired, release the lock
 			expiredHolder := lm.lockHolder
+			expiredToken := lm.lockToken
 			lm.logger.Printf("Lease expired for client %d, releasing lock", expiredHolder)
-			// Use the combined method which also saves state
+
+			// Call registered callbacks before releasing the lock
+			lm.callbacksMu.RLock()
+			callbacks := make([]func(clientID int32, token string), len(lm.leaseExpiryCallbacks))
+			copy(callbacks, lm.leaseExpiryCallbacks)
+			lm.callbacksMu.RUnlock()
+
+			// Release lock now - must happen within the mutex
 			lm.releaseLockAndSaveState()
+
+			// Call callbacks AFTER releasing the lock to avoid deadlocks
+			lm.mu.Unlock()
+			for _, callback := range callbacks {
+				// Execute callback outside of any mutex to avoid deadlocks
+				// Each callback is responsible for its own synchronization
+				if callback != nil {
+					callback(expiredHolder, expiredToken)
+				}
+			}
+			continue // Skip the lm.mu.Unlock() at the end of the loop
 		}
 		lm.mu.Unlock()
 	}
@@ -862,4 +887,29 @@ func (lm *LockManager) GetQueueLength() int {
 	defer lm.mu.Unlock()
 
 	return len(lm.queue)
+}
+
+// RegisterLeaseExpiryCallback registers a function to be called when a lease expires
+func (lm *LockManager) RegisterLeaseExpiryCallback(callback func(clientID int32, token string)) {
+	if callback == nil {
+		lm.logger.Printf("Warning: Attempted to register nil lease expiry callback")
+		return
+	}
+
+	lm.callbacksMu.Lock()
+	defer lm.callbacksMu.Unlock()
+
+	lm.leaseExpiryCallbacks = append(lm.leaseExpiryCallbacks, callback)
+	lm.logger.Printf("Registered new lease expiry callback, total callbacks: %d",
+		len(lm.leaseExpiryCallbacks))
+}
+
+// UnregisterAllLeaseExpiryCallbacks removes all registered callbacks
+func (lm *LockManager) UnregisterAllLeaseExpiryCallbacks() {
+	lm.callbacksMu.Lock()
+	defer lm.callbacksMu.Unlock()
+
+	callbackCount := len(lm.leaseExpiryCallbacks)
+	lm.leaseExpiryCallbacks = nil
+	lm.logger.Printf("Unregistered all %d lease expiry callbacks", callbackCount)
 }
