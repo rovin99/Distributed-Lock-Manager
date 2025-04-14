@@ -204,3 +204,18 @@ func (rc *RequestCache) cleanup() {
 		rc.mu.Unlock()
 	}
 }
+
+// Clear removes all entries from the request cache
+// This is useful during server role transitions to avoid stale state
+func (rc *RequestCache) Clear() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	// Clear all maps
+	rc.cache = make(map[string]interface{})
+	rc.expires = make(map[string]time.Time)
+	rc.inProgress = make(map[string]bool)
+
+	// Signal any waiting goroutines
+	rc.inProgressCond.Broadcast()
+}

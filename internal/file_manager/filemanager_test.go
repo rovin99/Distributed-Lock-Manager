@@ -63,6 +63,16 @@ func setupTestEnvironment(t *testing.T) (string, func()) {
 	os.MkdirAll(rootDataDir, 0755)
 	os.Symlink(filepath.Join(tempDir, "data"), "data")
 
+	// Ensure all files within the data directory are empty to avoid contamination
+	for i := 0; i < 100; i++ {
+		filename := fmt.Sprintf("file_%d", i)
+		// Create empty files
+		err := os.WriteFile(filepath.Join("data", filename), []byte{}, 0644)
+		if err != nil {
+			t.Logf("Warning: Failed to create empty file %s: %v", filename, err)
+		}
+	}
+
 	// Return cleanup function
 	cleanup := func() {
 		os.Remove("data") // Remove the symlink
@@ -1165,23 +1175,18 @@ func TestRollbackOnLeaseExpiry(t *testing.T) {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
 
-	// Initialize lock manager with short lease duration for testing
+	// Initialize lock manager with a long lease duration to avoid automatic expiry during test
 	logger := log.New(os.Stdout, "[Test] ", log.LstdFlags)
-	lm := lock_manager.NewLockManagerWithLeaseDuration(logger, 1*time.Second)
+	lm := lock_manager.NewLockManagerWithLeaseDuration(logger, 30*time.Second)
 
 	// Initialize file manager
 	fm := NewFileManager(true, lm)
 
-	// Register for lease expiry
-	callbackCalled := make(chan string, 1) // Channel to track callback execution
+	// Channel to track when rollback operations are completed
+	rollbackCh := make(chan string, 2)
 
-	lm.RegisterLeaseExpiryCallback(func(clientID int32, token string) {
-		err := fm.RollbackTokenOperations(token)
-		if err != nil {
-			t.Errorf("Error rolling back operations: %v", err)
-		}
-		callbackCalled <- token
-	})
+	// Register for lease expiry with notification
+	fm.RegisterForLeaseExpiryWithNotification(rollbackCh)
 
 	// Test scenario
 	// 1. Client 1 acquires lock
@@ -1205,14 +1210,17 @@ func TestRollbackOnLeaseExpiry(t *testing.T) {
 		t.Fatalf("Expected file to contain 'A', got %q", string(content))
 	}
 
-	// 3. Wait for lease to expire and callback to be called
+	// 3. Manually force lease expiry
+	lm.ForceExpireLease()
+
+	// Wait for rollback notification
 	select {
-	case receivedToken := <-callbackCalled:
+	case receivedToken := <-rollbackCh:
 		if receivedToken != token {
-			t.Errorf("Received unexpected token in callback: %s", receivedToken)
+			t.Errorf("Received unexpected token in rollback: %s, expected: %s", receivedToken, token)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatalf("Timed out waiting for lease expiry callback")
+		t.Fatalf("Timed out waiting for rollback completion")
 	}
 
 	// 4. Verify file was rolled back (content should be empty again)
@@ -1273,7 +1281,7 @@ func TestRollbackOnLeaseExpiry(t *testing.T) {
 		t.Fatalf("Failed to append second 'A' to file with new token: %v", err)
 	}
 
-	// 10. Verify final file content is 'AA' (since we manually released Client 2's lock, no rollback occurred)
+	// 10. Verify file content is 'BBAA'
 	content, err = os.ReadFile(testFile)
 	if err != nil {
 		t.Fatalf("Failed to read file at end of test: %v", err)
@@ -1282,17 +1290,20 @@ func TestRollbackOnLeaseExpiry(t *testing.T) {
 		t.Fatalf("Expected final file content to be 'BBAA', got %q", string(content))
 	}
 
-	// Additional test: verify that after Client 1's lease expires, their operations are rolled back
+	// 11. Force expire Client 1's lease
+	lm.ForceExpireLease()
+
+	// Wait for rollback notification
 	select {
-	case receivedToken := <-callbackCalled:
+	case receivedToken := <-rollbackCh:
 		if receivedToken != token3 {
-			t.Errorf("Received unexpected token in callback: %s", receivedToken)
+			t.Errorf("Received unexpected token in rollback: %s, expected: %s", receivedToken, token3)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatalf("Timed out waiting for second lease expiry callback")
+		t.Fatalf("Timed out waiting for second rollback completion")
 	}
 
-	// Verify only Client 1's operations were rolled back (file should still have "BB")
+	// 12. Verify only Client 1's operations were rolled back (file should still have "BB")
 	content, err = os.ReadFile(testFile)
 	if err != nil {
 		t.Fatalf("Failed to read file after final rollback: %v", err)

@@ -5,6 +5,8 @@ bin/
 # Data files
 data/
 
+internal/file_manager/data_backup/
+
 # Logs
 logs/
 

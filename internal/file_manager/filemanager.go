@@ -647,8 +647,42 @@ func (fm *FileManager) RegisterForLeaseExpiry() {
 		fm.logger.Printf("Lease expired for client %d with token %s, rolling back operations",
 			clientID, token)
 
+		// Execute rollback synchronously to ensure atomicity with lock expiration
+		// The LockManager already runs callbacks in a separate goroutine to avoid blocking
+		// the lease monitoring loop, so we don't need another goroutine here
 		if err := fm.RollbackTokenOperations(token); err != nil {
 			fm.logger.Printf("Error during rollback for token %s: %v", token, err)
+		}
+	})
+}
+
+// RegisterForLeaseExpiryWithNotification registers with the lock manager to be notified of lease expiries
+// and sends the token to the provided notification channel when rollback completes
+func (fm *FileManager) RegisterForLeaseExpiryWithNotification(notificationCh chan<- string) {
+	if fm.lockManager == nil {
+		fm.logger.Printf("Warning: Cannot register for lease expiry notifications - no lock manager")
+		return
+	}
+
+	// Setup a callback for when leases expire
+	fm.lockManager.RegisterLeaseExpiryCallback(func(clientID int32, token string) {
+		fm.logger.Printf("Lease expired for client %d with token %s, rolling back operations",
+			clientID, token)
+
+		// Execute rollback synchronously to ensure atomicity with lock expiration
+		if err := fm.RollbackTokenOperations(token); err != nil {
+			fm.logger.Printf("Error during rollback for token %s: %v", token, err)
+		}
+
+		// Notify that the rollback is complete
+		if notificationCh != nil {
+			select {
+			case notificationCh <- token:
+				// Successfully sent notification
+			default:
+				// Channel was full or closed, log but don't block
+				fm.logger.Printf("Warning: Could not send rollback notification for token %s", token)
+			}
 		}
 	})
 }

@@ -152,14 +152,24 @@ func (lm *LockManager) monitorLeases() {
 			lm.releaseLockAndSaveState()
 
 			// Call callbacks AFTER releasing the lock to avoid deadlocks
-			lm.mu.Unlock()
-			for _, callback := range callbacks {
-				// Execute callback outside of any mutex to avoid deadlocks
-				// Each callback is responsible for its own synchronization
-				if callback != nil {
-					callback(expiredHolder, expiredToken)
+			go func(cbs []func(clientID int32, token string), cid int32, tok string) {
+				for _, callback := range cbs {
+					// Execute callback outside of any mutex to avoid deadlocks
+					// Each callback is responsible for its own synchronization
+					if callback != nil {
+						func() {
+							// Recover from panics in callbacks to prevent crashing the whole system
+							defer func() {
+								if r := recover(); r != nil {
+									lm.logger.Printf("ERROR: Panic in lease expiry callback: %v", r)
+								}
+							}()
+							callback(cid, tok)
+						}()
+					}
 				}
-			}
+			}(callbacks, expiredHolder, expiredToken)
+
 			continue // Skip the lm.mu.Unlock() at the end of the loop
 		}
 		lm.mu.Unlock()
@@ -838,7 +848,7 @@ func (lm *LockManager) ForceClearLockState() error {
 	originalHolder := lm.lockHolder
 	originalToken := lm.lockToken
 
-	// Clear state
+	// Clear state (but preserve callbacks)
 	lm.lockHolder = -1
 	lm.lockToken = ""
 	lm.leaseExpires = time.Time{}
@@ -912,4 +922,48 @@ func (lm *LockManager) UnregisterAllLeaseExpiryCallbacks() {
 	callbackCount := len(lm.leaseExpiryCallbacks)
 	lm.leaseExpiryCallbacks = nil
 	lm.logger.Printf("Unregistered all %d lease expiry callbacks", callbackCount)
+}
+
+// ForceExpireLease forcibly releases the lock and triggers lease expiry callbacks
+// This method is intended for TESTING ONLY
+func (lm *LockManager) ForceExpireLease() {
+	lm.mu.Lock()
+
+	// Skip if there's no lock holder
+	if lm.lockHolder == -1 {
+		lm.mu.Unlock()
+		return
+	}
+
+	// Capture the lock holder and token before releasing
+	expiredHolder := lm.lockHolder
+	expiredToken := lm.lockToken
+	lm.logger.Printf("Force expiring lease for client %d", expiredHolder)
+
+	// Get callbacks while holding the main mutex
+	lm.callbacksMu.RLock()
+	callbacks := make([]func(clientID int32, token string), len(lm.leaseExpiryCallbacks))
+	copy(callbacks, lm.leaseExpiryCallbacks)
+	lm.callbacksMu.RUnlock()
+
+	// Release the lock
+	lm.releaseLockAndSaveState()
+
+	// Release the main mutex before calling callbacks
+	lm.mu.Unlock()
+
+	// Call the callbacks in the same way as monitorLeases does
+	for _, callback := range callbacks {
+		if callback != nil {
+			func() {
+				// Recover from panics in callbacks
+				defer func() {
+					if r := recover(); r != nil {
+						lm.logger.Printf("ERROR: Panic in lease expiry callback: %v", r)
+					}
+				}()
+				callback(expiredHolder, expiredToken)
+			}()
+		}
+	}
 }

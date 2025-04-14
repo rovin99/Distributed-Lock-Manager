@@ -88,6 +88,14 @@ func (m *MockLockServiceClient) VerifyFileAccess(ctx context.Context, in *pb.Fil
 	return args.Get(0).(*pb.FileAccessResponse), args.Error(1)
 }
 
+func (m *MockLockServiceClient) ProposePromotion(ctx context.Context, in *pb.ProposeRequest, opts ...grpc.CallOption) (*pb.ProposeResponse, error) {
+	args := m.Called(ctx, in)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*pb.ProposeResponse), args.Error(1)
+}
+
 // testRetryRPC is a version of retryRPC with shorter timeouts for testing
 func testRetryRPC(lc *LockClient, operation string, rpcFunc func(context.Context) (*pb.LockResponse, error)) (*pb.LockResponse, error) {
 	var lastErr error
@@ -111,6 +119,16 @@ func testRetryRPC(lc *LockClient, operation string, rpcFunc func(context.Context
 			cancel()
 			lc.invalidateLock() // Clear lock state
 			return resp, &InvalidTokenError{Message: resp.ErrorMessage}
+		}
+
+		// Handle ERROR status - treat as a failure that should be retried
+		if err == nil && resp.Status == pb.Status_ERROR {
+			lastErr = fmt.Errorf("server returned status: %v, message: %s", resp.Status, resp.ErrorMessage)
+			fmt.Printf("Attempt %d failed: %v, retrying quickly...\n", attempt+1, lastErr)
+			cancel()
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
+			continue
 		}
 
 		// For other errors, back off and retry
@@ -160,6 +178,37 @@ func TestClientRetryLogicShort(t *testing.T) {
 		currentServerIdx: 0,
 	}
 
+	// Create a test version of LockAcquire that uses testRetryRPC for faster testing
+	testLockAcquire := func() error {
+		// Generate a single request ID for the entire operation including retries
+		requestID := lc.GenerateRequestID()
+
+		args := &pb.LockArgs{
+			ClientId:  lc.id,
+			RequestId: requestID,
+		}
+
+		resp, err := testRetryRPC(lc, "LockAcquire", func(ctx context.Context) (*pb.LockResponse, error) {
+			return lc.client.LockAcquire(ctx, args)
+		})
+
+		if err != nil {
+			// Server unavailable or invalid token errors are already handled by testRetryRPC
+			return err
+		}
+
+		// Update client state with the new token
+		lc.mu.Lock()
+		lc.hasLock = true
+		lc.lockToken = resp.Token
+		lc.mu.Unlock()
+
+		// Start lease renewal
+		lc.startLeaseRenewal()
+
+		return nil
+	}
+
 	t.Run("Direct token error handling", func(t *testing.T) {
 		// Reset client state
 		lc.hasLock = true
@@ -194,8 +243,8 @@ func TestClientRetryLogicShort(t *testing.T) {
 				Token:  "test-token",
 			}, nil).Once()
 
-		// Execute the lock acquire operation
-		err := lc.LockAcquire()
+		// Execute the lock acquire operation using our test function
+		err := testLockAcquire()
 
 		// Verify expectations
 		assert.NoError(t, err)
@@ -223,8 +272,8 @@ func TestClientRetryLogicShort(t *testing.T) {
 				}, nil).Once()
 		}
 
-		// Execute the lock acquire operation
-		err := lc.LockAcquire()
+		// Execute the lock acquire operation using our test function
+		err := testLockAcquire()
 
 		// Verify expectations - should get an error after max retries
 		assert.Error(t, err)

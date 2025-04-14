@@ -141,6 +141,7 @@ message ServerInfoResponse {
   int32 server_id = 1;
   string role = 2;
   int64 current_epoch = 3;     // Current epoch of the server
+  string leader_address = 4;   // Address of the current leader if this server is a follower
 }
 
 // File access verification request

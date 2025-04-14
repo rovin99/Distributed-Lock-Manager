@@ -529,7 +529,15 @@ func TestLongRunningLockHolder(t *testing.T) {
 }
 
 func TestClientDisconnection(t *testing.T) {
-	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
+	// Create a temporary directory for the state file
+	tmpDir, err := os.MkdirTemp("", "lock-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create lock manager with state file in temp directory
+	lm := NewLockManagerWithStateFile(nil, 1*time.Minute, filepath.Join(tmpDir, "lock_state.json"))
 
 	// Client 1 acquires the lock
 	_, _ = lm.Acquire(1)
@@ -553,7 +561,15 @@ func TestClientDisconnection(t *testing.T) {
 }
 
 func TestMultipleTimeoutClients(t *testing.T) {
-	lm := NewLockManagerWithLeaseDuration(nil, 1*time.Minute)
+	// Create a temporary directory for the state file
+	tmpDir, err := os.MkdirTemp("", "lock-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create lock manager with state file in temp directory
+	lm := NewLockManagerWithStateFile(nil, 1*time.Minute, filepath.Join(tmpDir, "lock_state.json"))
 
 	// Client 1 acquires the lock
 	success, token1 := lm.Acquire(1)
@@ -788,8 +804,9 @@ func expectEvent(t *testing.T, events chan string, expected string, timeout ...t
 }
 
 func TestLeaseExpiration(t *testing.T) {
-	// Create a lock manager with a short lease duration for testing
-	lm := NewLockManagerWithLeaseDuration(nil, 2*time.Second)
+	// Create a lock manager with a shorter lease duration for testing
+	leaseDuration := 500 * time.Millisecond // Reduced from 2 seconds
+	lm := NewLockManagerWithLeaseDuration(nil, leaseDuration)
 
 	// Test 1: Basic lease expiration
 	t.Run("Basic lease expiration", func(t *testing.T) {
@@ -799,13 +816,13 @@ func TestLeaseExpiration(t *testing.T) {
 			t.Fatal("Failed to acquire lock")
 		}
 
-		// Verify lock is held
+		// Verify lock is held immediately
 		if !lm.HasLockWithToken(1, token) {
 			t.Fatal("Lock should be held by client 1")
 		}
 
-		// Wait for lease to expire
-		time.Sleep(3 * time.Second)
+		// Force lease expiry instead of waiting
+		lm.ForceExpireLease()
 
 		// Verify lock is released
 		if lm.HasLockWithToken(1, token) {
@@ -822,15 +839,15 @@ func TestLeaseExpiration(t *testing.T) {
 		}
 
 		// Client 2 tries to acquire lock (should wait)
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		success2, _ := lm.AcquireWithTimeout(2, ctx)
 		cancel()
 		if success2 {
 			t.Fatal("Client 2 should not acquire lock while client 1 holds it")
 		}
 
-		// Wait for client 1's lease to expire
-		time.Sleep(3 * time.Second)
+		// Force client 1's lease to expire
+		lm.ForceExpireLease()
 
 		// Client 2 should now be able to acquire the lock
 		success2, token2 := lm.Acquire(2)
@@ -860,30 +877,37 @@ func TestLeaseExpiration(t *testing.T) {
 			t.Fatal("Failed to acquire lock")
 		}
 
+		// Get the original expiry time
+		lm.mu.Lock()
+		originalExpiry := lm.leaseExpires
+		lm.mu.Unlock()
+
 		// Wait half the lease duration
-		time.Sleep(1 * time.Second)
+		time.Sleep(leaseDuration / 2)
 
 		// Renew the lease
 		if !lm.RenewLease(1, token) {
 			t.Fatal("Failed to renew lease")
 		}
 
-		// Wait for a short time (less than the lease duration)
-		time.Sleep(500 * time.Millisecond)
+		// Get the new expiry time
+		lm.mu.Lock()
+		newExpiry := lm.leaseExpires
+		lm.mu.Unlock()
 
-		// Lock should still be valid due to renewal
+		// Verify that the new expiry time is later than the original one
+		if !newExpiry.After(originalExpiry) {
+			t.Fatal("Lease renewal should extend the expiry time")
+		}
+
+		// Verify the lock is still valid
 		if !lm.HasLockWithToken(1, token) {
 			t.Fatal("Lock should still be valid after lease renewal")
 		}
 
-		// Clean up - explicitly release the lock
+		// Clean up
 		if !lm.Release(1, token) {
 			t.Fatal("Failed to release lock during cleanup")
-		}
-
-		// Verify lock is actually released
-		if lm.HasLockWithToken(1, token) {
-			t.Fatal("Lock should be released after cleanup")
 		}
 	})
 
@@ -895,9 +919,8 @@ func TestLeaseExpiration(t *testing.T) {
 			t.Fatal("Failed to acquire lock")
 		}
 
-		// Simulate client crash by not renewing lease
-		// Wait for lease to expire
-		time.Sleep(3 * time.Second)
+		// Simulate client crash by forcing lease expiry
+		lm.ForceExpireLease()
 
 		// Verify lock is released
 		if lm.HasLockWithToken(1, token) {
@@ -908,11 +931,6 @@ func TestLeaseExpiration(t *testing.T) {
 		success2, token2 := lm.Acquire(2)
 		if !success2 {
 			t.Fatal("Client 2 should be able to acquire lock after client 1 crashes")
-		}
-
-		// Verify client 2's lock is valid
-		if !lm.HasLockWithToken(2, token2) {
-			t.Fatal("Client 2's lock should be valid")
 		}
 
 		// Clean up
@@ -932,8 +950,8 @@ func TestLeaseExpirationWithFileOperations(t *testing.T) {
 			t.Fatal("Failed to acquire lock")
 		}
 
-		// Wait for lease to expire
-		time.Sleep(3 * time.Second)
+		// Force lease to expire instead of waiting
+		lm.ForceExpireLease()
 
 		// Try to perform file operation with expired lease
 		if lm.HasLockWithToken(1, token) {

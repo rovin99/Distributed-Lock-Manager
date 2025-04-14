@@ -248,105 +248,189 @@ func (c *LockClient) stopLeaseRenewal() {
 	c.mu.Unlock()
 }
 
-// retryRPC is a generic function that executes an RPC with retries and exponential backoff
+// retryRPC handles retrying an RPC operation with failover to other servers
 func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*pb.LockResponse, error)) (*pb.LockResponse, error) {
-	var lastErr error
+	var lastError error
+	var lastResponse *pb.LockResponse
+	retries := 0
 	backoff := initialBackoff
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Check if we need to establish initial connection
+	// Try the current server first
+	for retries < maxRetries {
 		if c.client == nil {
-			fmt.Printf("No active connection for %s operation, establishing connection first...\n", operation)
 			if err := c.connectToCurrentServer(); err != nil {
-				// If first server fails, try others
-				if attemptErr := c.tryNextServer(); attemptErr != nil {
+				fmt.Printf("Failed to connect to current server: %v. Trying next server...\n", err)
+				if err := c.tryNextServer(); err != nil {
 					return nil, &ServerUnavailableError{
 						Operation: operation,
-						Attempts:  1,
-						LastError: fmt.Errorf("failed to establish initial connection: %w", attemptErr),
+						Attempts:  retries + 1,
+						LastError: err,
 					}
 				}
+				continue
 			}
 		}
 
-		// Create a context with timeout for this attempt
+		// Create context with timeout
 		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
-
-		// Execute the RPC
 		resp, err := rpcFunc(ctx)
+		cancel()
 
-		// Check for success
-		if err == nil && resp.Status == pb.Status_OK {
-			cancel() // Remember to cancel the context on success
+		if err == nil {
+			// Handle SECONDARY_MODE responses with leader redirection
+			if resp.Status == pb.Status_SECONDARY_MODE {
+				// Check if the error message contains leader address info (e.g., "...current leader: host:port")
+				leaderAddrInfo := c.extractLeaderAddress(resp.ErrorMessage)
+				if leaderAddrInfo != "" {
+					fmt.Printf("Got SECONDARY_MODE with leader info: %s\n", leaderAddrInfo)
+					// Try to add this address to our server list if it's not already there
+					c.addServerIfMissing(leaderAddrInfo)
+					// Try to connect to this server next
+					if err := c.tryConnectToServer(leaderAddrInfo); err != nil {
+						return nil, err
+					}
+					continue
+				}
+
+				// No leader info, try the next server
+				fmt.Printf("Got SECONDARY_MODE without leader info, trying next server\n")
+				if err := c.tryNextServer(); err != nil {
+					return nil, &ServerUnavailableError{
+						Operation: operation,
+						Attempts:  retries + 1,
+						LastError: fmt.Errorf("all servers in SECONDARY_MODE"),
+					}
+				}
+				continue
+			}
+
+			// For SERVER_FENCING, we should retry with exponential backoff
+			if resp.Status == pb.Status_SERVER_FENCING {
+				fmt.Printf("Server is fencing - retrying in %v...\n", backoff)
+				lastResponse = resp
+				time.Sleep(backoff)
+				backoff *= 2 // exponential backoff
+				retries++
+				continue
+			}
+
+			// Handle ERROR status - treat as a failure that should be retried
+			if resp.Status == pb.Status_ERROR {
+				fmt.Printf("Server returned ERROR status: %s - retrying in %v...\n", resp.ErrorMessage, backoff)
+				lastResponse = resp
+				lastError = fmt.Errorf("server returned status: %v, message: %s", resp.Status, resp.ErrorMessage)
+				time.Sleep(backoff)
+				backoff *= 2 // exponential backoff
+				retries++
+				continue
+			}
+
+			// For other status codes, return the response
 			return resp, nil
 		}
 
-		// Handle server fencing error - Critically important!
-		if err == nil && resp.Status == pb.Status_SERVER_FENCING {
-			fmt.Printf("Server is in fencing period, operation rejected\n")
-			cancel()
-			// This is an error we should return immediately, not retry
-			return nil, &ServerFencingError{
+		// Handle error
+		fmt.Printf("RPC error: %v. Attempting to reconnect...\n", err)
+		lastError = err
+
+		// Try to connect to another server
+		if err := c.tryNextServer(); err != nil {
+			return nil, &ServerUnavailableError{
 				Operation: operation,
-				Message:   resp.ErrorMessage,
+				Attempts:  retries + 1,
+				LastError: err,
 			}
 		}
 
-		// Handle secondary mode error (server is not primary)
-		if err == nil && resp.Status == pb.Status_SECONDARY_MODE {
-			fmt.Printf("Server is in secondary mode, trying next server...\n")
-			cancel()
-
-			// Try next server
-			if reconnErr := c.tryNextServer(); reconnErr != nil {
-				lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
-				break // No more servers to try
-			}
-			continue // Try with new server
-		}
-
-		// Handle connection errors (server might be down)
-		if err != nil && (strings.Contains(err.Error(), "connection") ||
-			strings.Contains(err.Error(), "Unavailable") ||
-			strings.Contains(err.Error(), "DeadlineExceeded")) {
-
-			fmt.Printf("Connection error on attempt %d: %v, trying next server...\n", attempt+1, err)
-			cancel()
-
-			// Try next server
-			if reconnErr := c.tryNextServer(); reconnErr != nil {
-				lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
-				break // No more servers to try
-			}
-			continue // Try with new server
-		}
-
-		// Handle token validation errors
-		if err == nil && (resp.Status == pb.Status_INVALID_TOKEN || resp.Status == pb.Status_PERMISSION_DENIED) {
-			cancel()
-			c.invalidateLock() // Clear lock state
-			return resp, &InvalidTokenError{Message: resp.ErrorMessage}
-		}
-
-		// For other errors, back off and retry
-		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("server returned status: %v, message: %s", resp.Status, resp.ErrorMessage)
-		}
-
-		fmt.Printf("Attempt %d failed: %v, retrying in %v...\n", attempt+1, lastErr, backoff)
-		cancel()
-		time.Sleep(backoff)
-		backoff *= 2 // Exponential backoff
+		retries++
 	}
 
-	// All retries failed
+	// If we have a SERVER_FENCING response and exhausted retries
+	if lastResponse != nil && lastResponse.Status == pb.Status_SERVER_FENCING {
+		return nil, &ServerFencingError{
+			Operation: operation,
+			Message:   lastResponse.ErrorMessage,
+		}
+	}
+
+	// If we have an ERROR response and exhausted retries
+	if lastResponse != nil && lastResponse.Status == pb.Status_ERROR {
+		return nil, &ServerUnavailableError{
+			Operation: operation,
+			Attempts:  retries,
+			LastError: fmt.Errorf("server returned ERROR: %s", lastResponse.ErrorMessage),
+		}
+	}
+
+	// We exhausted all retries
 	return nil, &ServerUnavailableError{
 		Operation: operation,
-		Attempts:  maxRetries,
-		LastError: lastErr,
+		Attempts:  retries,
+		LastError: lastError,
 	}
+}
+
+// extractLeaderAddress parses an error message to extract leader address information
+// Example: "Server is not the leader (current leader: 10.0.0.1:50051)"
+func (c *LockClient) extractLeaderAddress(errMsg string) string {
+	if strings.Contains(errMsg, "current leader:") {
+		parts := strings.Split(errMsg, "current leader:")
+		if len(parts) >= 2 {
+			return strings.TrimSpace(parts[1])
+		}
+	}
+	return ""
+}
+
+// addServerIfMissing adds a server address to our list if not already present
+func (c *LockClient) addServerIfMissing(serverAddr string) {
+	c.serverMu.Lock()
+	defer c.serverMu.Unlock()
+
+	// Check if the address is already in our list
+	for _, addr := range c.serverAddrs {
+		if addr == serverAddr {
+			return // Already in the list
+		}
+	}
+
+	// Add to our list
+	c.serverAddrs = append(c.serverAddrs, serverAddr)
+	fmt.Printf("Added new server address to failover list: %s\n", serverAddr)
+}
+
+// tryConnectToServer attempts to connect to a specific server
+func (c *LockClient) tryConnectToServer(serverAddr string) error {
+	c.serverMu.Lock()
+	defer c.serverMu.Unlock()
+
+	// Close existing connection if there is one
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+		c.client = nil
+	}
+
+	fmt.Printf("Attempting to connect to server %s\n", serverAddr)
+	conn, err := grpc.Dial(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		fmt.Printf("grpc.Dial(%s) failed with error: %v\n", serverAddr, err)
+		return fmt.Errorf("failed to connect to server %s: %w", serverAddr, err)
+	}
+
+	c.conn = conn
+	c.client = pb.NewLockServiceClient(conn)
+
+	// Update the currentServerIdx to match this server if it's in our list
+	for i, addr := range c.serverAddrs {
+		if addr == serverAddr {
+			c.currentServerIdx = i
+			break
+		}
+	}
+
+	fmt.Printf("Successfully connected to server at %s\n", serverAddr)
+	return nil
 }
 
 // retryLeaseRenewal is similar to retryRPC but for lease renewal operations
@@ -729,4 +813,54 @@ func (e *ServerUnavailableError) Error() string {
 func IsServerUnavailable(err error) bool {
 	_, ok := err.(*ServerUnavailableError)
 	return ok
+}
+
+// GetServerInfo retrieves information about the server
+func (c *LockClient) GetServerInfo() (map[string]interface{}, error) {
+	// Ensure we have a connection
+	if c.client == nil {
+		if err := c.connectToCurrentServer(); err != nil {
+			return nil, fmt.Errorf("failed to connect to server: %v", err)
+		}
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
+	defer cancel()
+
+	// Call ServerInfo RPC
+	resp, err := c.client.ServerInfo(ctx, &pb.ServerInfoRequest{})
+	if err != nil {
+		// Try next server on connection error
+		if reconnErr := c.tryNextServer(); reconnErr != nil {
+			return nil, fmt.Errorf("failed to get server info: %v, reconnect error: %v", err, reconnErr)
+		}
+
+		// Try again with new server
+		ctx, cancel := context.WithTimeout(context.Background(), initialTimeout)
+		resp, err = c.client.ServerInfo(ctx, &pb.ServerInfoRequest{})
+		cancel()
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to get server info after server switch: %v", err)
+		}
+	}
+
+	// Create a map to return
+	info := map[string]interface{}{
+		"server_id":      resp.ServerId,
+		"role":           resp.Role,
+		"current_epoch":  resp.CurrentEpoch,
+		"leader_address": "", // May be filled later if available in the response
+	}
+
+	// Add leader address if available (depends on your proto definition)
+	if field, ok := any(resp).(interface{ GetLeaderAddress() string }); ok {
+		leader := field.GetLeaderAddress()
+		if leader != "" {
+			info["leader_address"] = leader
+		}
+	}
+
+	return info, nil
 }

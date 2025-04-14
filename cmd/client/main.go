@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -31,9 +32,9 @@ func main() {
 	var cmdArgs []string
 	var cmdPos int
 
-	// Find the position of the command (acquire, release, append, hold)
+	// Find the position of the command (acquire, release, append, hold, info)
 	for i, arg := range os.Args {
-		if arg == "acquire" || arg == "release" || arg == "append" || arg == "hold" {
+		if arg == "acquire" || arg == "release" || arg == "append" || arg == "hold" || arg == "info" {
 			command = arg
 			cmdPos = i
 			break
@@ -68,6 +69,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  release    Release a lock\n")
 		fmt.Fprintf(os.Stderr, "  append     Append to a file (requires lock)\n")
 		fmt.Fprintf(os.Stderr, "  hold       Acquire a lock and hold it until program is terminated\n")
+		fmt.Fprintf(os.Stderr, "  info       Get information about the server\n")
 		fmt.Fprintf(os.Stderr, "\nFlags:\n")
 		flag.PrintDefaults()
 	}
@@ -91,10 +93,13 @@ func main() {
 	}
 	defer c.Close()
 
-	// Initialize the client session
-	if err := c.ClientInit(); err != nil {
-		fmt.Printf("Failed to initialize client: %v\n", err)
-		os.Exit(1)
+	// For info command, we don't need to initialize the client session
+	if command != "info" {
+		// Initialize the client session
+		if err := c.ClientInit(); err != nil {
+			fmt.Printf("Failed to initialize client: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Set up a timeout for the overall operation
@@ -110,6 +115,29 @@ func main() {
 			}
 
 			switch command {
+			case "info":
+				fmt.Printf("Getting server info...\n")
+				info, err := c.GetServerInfo()
+				if err != nil {
+					fmt.Printf("Failed to get server info: %v\n", err)
+					close(done)
+					os.Exit(1)
+					return
+				}
+
+				// Format the info as JSON
+				jsonInfo, err := json.MarshalIndent(info, "", "  ")
+				if err != nil {
+					fmt.Printf("Error formatting server info: %v\n", err)
+					close(done)
+					os.Exit(1)
+					return
+				}
+
+				fmt.Println(string(jsonInfo))
+				close(done)
+				return
+
 			case "acquire":
 				fmt.Printf("Acquiring lock...\n")
 				err := c.AcquireLockWithRetry()

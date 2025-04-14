@@ -129,8 +129,8 @@ func TestLockManagerPersistence(t *testing.T) {
 	t.Run("Expired lease recovery", func(t *testing.T) {
 		stateFile := filepath.Join(testDir, "test3.json")
 
-		// Create a lock manager with short lease duration
-		lm1 := NewLockManagerWithLeaseDuration(createLogger(), 1*time.Second)
+		// Create a lock manager with a normal lease duration
+		lm1 := NewLockManagerWithLeaseDuration(createLogger(), 30*time.Second)
 		lm1.SetStateFilePath(stateFile)
 
 		// Acquire a lock
@@ -139,12 +139,18 @@ func TestLockManagerPersistence(t *testing.T) {
 			t.Fatal("Failed to acquire lock")
 		}
 
-		// Wait for the lease to expire
-		time.Sleep(2 * time.Second)
+		// Manually modify the state file to have an expired lease
+		// This is better than waiting for an actual expiry
+		lm1.mu.Lock()
+		lm1.leaseExpires = time.Now().Add(-1 * time.Second) // Set to 1 second in the past
+		if err := lm1.saveState(); err != nil {
+			t.Fatalf("Failed to save modified state: %v", err)
+		}
+		lm1.mu.Unlock()
 
 		// Create a new lock manager to simulate restart
 		// It should detect the expired lease and release the lock
-		lm2 := NewLockManagerWithLeaseDuration(createLogger(), 1*time.Second)
+		lm2 := NewLockManagerWithLeaseDuration(createLogger(), 30*time.Second)
 		lm2.SetStateFilePath(stateFile)
 
 		// Verify the expired lock was released
@@ -261,8 +267,8 @@ func TestLockManagerPersistence(t *testing.T) {
 	t.Run("Persistence on lease expiration", func(t *testing.T) {
 		stateFile := filepath.Join(testDir, "test6.json")
 
-		// Create lock manager with very short lease
-		lm := NewLockManagerWithLeaseDuration(createLogger(), 1*time.Second)
+		// Create lock manager with a lease that won't expire during the test
+		lm := NewLockManagerWithLeaseDuration(createLogger(), 30*time.Second)
 		lm.SetStateFilePath(stateFile)
 
 		// Acquire a lock
@@ -276,8 +282,8 @@ func TestLockManagerPersistence(t *testing.T) {
 			t.Fatal("Token should be valid immediately after acquisition")
 		}
 
-		// Wait for lease to expire
-		time.Sleep(2 * time.Second)
+		// Force lease expiry instead of waiting
+		lm.ForceExpireLease()
 
 		// Token should no longer be valid
 		if lm.IsTokenValid(token) {

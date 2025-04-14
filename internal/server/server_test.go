@@ -31,6 +31,9 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 	// Create the required files first - this creates data/file_0 through data/file_99
 	fm.CreateFiles()
 
+	// Clean up existing content to ensure test starts with empty file
+	os.WriteFile("data/"+testFile, []byte(""), 0644)
+
 	server := &LockServer{
 		lockManager:  lm,
 		fileManager:  fm,
@@ -39,6 +42,9 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 		isPrimary:    true,
 		metrics:      NewPerformanceMetrics(logger),
 	}
+
+	// Initialize the serverState atomic value
+	server.serverState.Store(LeaderState)
 
 	// Step 1: C1 acquires lock T1
 	acquireResp1, err := server.LockAcquire(context.Background(), &proto.LockArgs{
