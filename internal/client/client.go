@@ -277,6 +277,15 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 		cancel()
 
 		if err == nil {
+			// Handle successful RPC with response
+
+			// Check for invalid token first
+			if resp.Status == pb.Status_INVALID_TOKEN || resp.Status == pb.Status_PERMISSION_DENIED {
+				// Invalid token, clear lock state and return specific error
+				c.invalidateLock()
+				return resp, &InvalidTokenError{Message: resp.ErrorMessage}
+			}
+
 			// Handle SECONDARY_MODE responses with leader redirection
 			if resp.Status == pb.Status_SECONDARY_MODE {
 				// Check if the error message contains leader address info (e.g., "...current leader: host:port")
@@ -325,24 +334,34 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 				continue
 			}
 
-			// For other status codes, return the response
+			// For other status codes (like OK), return the response
 			return resp, nil
-		}
+		} else {
+			// RPC failed with network error
+			fmt.Printf("RPC error: %v. Attempting retry...\n", err)
+			lastError = err
 
-		// Handle error
-		fmt.Printf("RPC error: %v. Attempting to reconnect...\n", err)
-		lastError = err
-
-		// Try to connect to another server
-		if err := c.tryNextServer(); err != nil {
-			return nil, &ServerUnavailableError{
-				Operation: operation,
-				Attempts:  retries + 1,
-				LastError: err,
+			// First try retrying on the same server a few times (for transient network issues)
+			// Only switch servers after 2 consecutive failures on the same server
+			if retries%2 == 1 {
+				// After two failed attempts on same server, try another
+				fmt.Printf("Multiple failures on current server, trying next server...\n")
+				if err := c.tryNextServer(); err != nil {
+					return nil, &ServerUnavailableError{
+						Operation: operation,
+						Attempts:  retries + 1,
+						LastError: err,
+					}
+				}
+			} else {
+				// For first failure, just back off and retry same server
+				time.Sleep(backoff)
+				backoff *= 2 // exponential backoff
 			}
-		}
 
-		retries++
+			retries++
+			continue
+		}
 	}
 
 	// If we have a SERVER_FENCING response and exhausted retries
@@ -363,6 +382,7 @@ func (c *LockClient) retryRPC(operation string, rpcFunc func(context.Context) (*
 	}
 
 	// We exhausted all retries
+	c.invalidateLock() // Reset lock state on persistent errors
 	return nil, &ServerUnavailableError{
 		Operation: operation,
 		Attempts:  retries,
@@ -466,6 +486,13 @@ func (c *LockClient) retryLeaseRenewal(operation string, rpcFunc func(context.Co
 			return resp, nil
 		}
 
+		// Handle token validation errors - do this first for consistency
+		if err == nil && (resp.Status == pb.Status_INVALID_TOKEN || resp.Status == pb.Status_PERMISSION_DENIED) {
+			cancel()
+			c.invalidateLock() // Clear lock state
+			return resp, &InvalidTokenError{Message: resp.ErrorMessage}
+		}
+
 		// Handle server fencing error (similar to retryRPC)
 		if err == nil && resp.Status == pb.Status_SERVER_FENCING {
 			fmt.Printf("Server is in fencing period, operation rejected\n")
@@ -489,34 +516,33 @@ func (c *LockClient) retryLeaseRenewal(operation string, rpcFunc func(context.Co
 		}
 
 		// Handle connection errors (server might be down)
-		if err != nil && (strings.Contains(err.Error(), "connection") ||
-			strings.Contains(err.Error(), "Unavailable") ||
-			strings.Contains(err.Error(), "DeadlineExceeded")) {
-
-			fmt.Printf("Connection error on attempt %d: %v, trying next server...\n", attempt+1, err)
-			cancel()
-
-			if reconnErr := c.tryNextServer(); reconnErr != nil {
-				lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
-				break
-			}
-			continue
-		}
-
-		// Handle token validation errors
-		if err == nil && (resp.Status == pb.Status_INVALID_TOKEN || resp.Status == pb.Status_PERMISSION_DENIED) {
-			cancel()
-			c.invalidateLock() // Clear lock state
-			return resp, &InvalidTokenError{Message: resp.ErrorMessage}
-		}
-
-		// For other errors, back off and retry
 		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("server returned status: %v, message: %s", resp.Status, resp.ErrorMessage)
+			fmt.Printf("Error on attempt %d: %v\n", attempt+1, err)
+			cancel()
+
+			// First try retrying on the same server a few times (for transient network issues)
+			// Only switch servers after 2 consecutive failures on the same server
+			if attempt%2 == 1 && (strings.Contains(err.Error(), "connection") ||
+				strings.Contains(err.Error(), "Unavailable") ||
+				strings.Contains(err.Error(), "DeadlineExceeded")) {
+				// After two failed attempts on same server, try another
+				fmt.Printf("Multiple connection failures on current server, trying next server...\n")
+				if reconnErr := c.tryNextServer(); reconnErr != nil {
+					lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
+					break
+				}
+				continue
+			} else {
+				// Just back off and retry same server
+				lastErr = err
+				time.Sleep(backoff)
+				backoff *= 2 // Exponential backoff
+				continue
+			}
 		}
 
+		// For other response errors, back off and retry
+		lastErr = fmt.Errorf("server returned status: %v, message: %s", resp.Status, resp.ErrorMessage)
 		fmt.Printf("Attempt %d failed: %v, retrying in %v...\n", attempt+1, lastErr, backoff)
 		cancel()
 		time.Sleep(backoff)
@@ -524,6 +550,7 @@ func (c *LockClient) retryLeaseRenewal(operation string, rpcFunc func(context.Co
 	}
 
 	// All retries failed
+	c.invalidateLock() // Reset lock state on persistent errors
 	return nil, &ServerUnavailableError{
 		Operation: operation,
 		Attempts:  maxRetries,
@@ -564,6 +591,13 @@ func (c *LockClient) retryFileAppend(operation string, rpcFunc func(context.Cont
 			return resp, nil
 		}
 
+		// Handle token validation errors - do this first for consistency
+		if err == nil && (resp.Status == pb.Status_INVALID_TOKEN || resp.Status == pb.Status_PERMISSION_DENIED) {
+			cancel()
+			c.invalidateLock() // Clear lock state
+			return resp, &InvalidTokenError{Message: resp.ErrorMessage}
+		}
+
 		// Handle server fencing error
 		if err == nil && resp.Status == pb.Status_SERVER_FENCING {
 			fmt.Printf("Server is in fencing period, operation rejected\n")
@@ -587,34 +621,33 @@ func (c *LockClient) retryFileAppend(operation string, rpcFunc func(context.Cont
 		}
 
 		// Handle connection errors
-		if err != nil && (strings.Contains(err.Error(), "connection") ||
-			strings.Contains(err.Error(), "Unavailable") ||
-			strings.Contains(err.Error(), "DeadlineExceeded")) {
-
-			fmt.Printf("Connection error on attempt %d: %v, trying next server...\n", attempt+1, err)
-			cancel()
-
-			if reconnErr := c.tryNextServer(); reconnErr != nil {
-				lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
-				break
-			}
-			continue
-		}
-
-		// Handle token validation errors
-		if err == nil && (resp.Status == pb.Status_INVALID_TOKEN || resp.Status == pb.Status_PERMISSION_DENIED) {
-			cancel()
-			c.invalidateLock() // Clear lock state
-			return resp, &InvalidTokenError{Message: resp.ErrorMessage}
-		}
-
-		// For other errors, back off and retry
 		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("server returned status: %v, message: %s", resp.Status, resp.ErrorMessage)
+			fmt.Printf("Error on attempt %d: %v\n", attempt+1, err)
+			cancel()
+
+			// First try retrying on the same server a few times (for transient network issues)
+			// Only switch servers after 2 consecutive failures on the same server
+			if attempt%2 == 1 && (strings.Contains(err.Error(), "connection") ||
+				strings.Contains(err.Error(), "Unavailable") ||
+				strings.Contains(err.Error(), "DeadlineExceeded")) {
+				// After two failed attempts on same server, try another
+				fmt.Printf("Multiple connection failures on current server, trying next server...\n")
+				if reconnErr := c.tryNextServer(); reconnErr != nil {
+					lastErr = fmt.Errorf("failed to connect to another server: %w", reconnErr)
+					break
+				}
+				continue
+			} else {
+				// Just back off and retry same server
+				lastErr = err
+				time.Sleep(backoff)
+				backoff *= 2 // Exponential backoff
+				continue
+			}
 		}
 
+		// For other response errors, back off and retry
+		lastErr = fmt.Errorf("server returned status: %v, message: %s", resp.Status, resp.ErrorMessage)
 		fmt.Printf("Attempt %d failed: %v, retrying in %v...\n", attempt+1, lastErr, backoff)
 		cancel()
 		time.Sleep(backoff)
@@ -622,6 +655,7 @@ func (c *LockClient) retryFileAppend(operation string, rpcFunc func(context.Cont
 	}
 
 	// All retries failed
+	c.invalidateLock() // Reset lock state on persistent errors
 	return nil, &ServerUnavailableError{
 		Operation: operation,
 		Attempts:  maxRetries,

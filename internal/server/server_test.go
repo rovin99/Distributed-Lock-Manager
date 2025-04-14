@@ -39,7 +39,7 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 		fileManager:  fm,
 		requestCache: NewRequestCache(5 * time.Minute),
 		logger:       logger,
-		isPrimary:    true,
+		
 		metrics:      NewPerformanceMetrics(logger),
 	}
 

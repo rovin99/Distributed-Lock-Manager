@@ -48,20 +48,16 @@ func main() {
 	// Determine server role from flags
 	var lockServer *server.LockServer
 	if *role == "primary" || *role == "secondary" {
-		// Convert role string to ServerRole type
-		serverRole := server.PrimaryRole
-		if *role == "secondary" {
-			serverRole = server.SecondaryRole
-		}
+
 
 		// Create replicated server with new configuration function
 		if len(peerAddresses) > 0 {
 			// Multi-peer configuration
-			lockServer = server.NewReplicatedLockServerWithMultiPeers(serverRole, int32(*serverID), peerAddresses, server.DefaultHeartbeatConfig)
+			lockServer = server.NewReplicatedLockServerWithMultiPeers(int32(*serverID), peerAddresses, server.DefaultHeartbeatConfig)
 			log.Printf("Starting as %s server (ID: %d) with %d peers", *role, *serverID, len(peerAddresses))
 		} else {
 			// Legacy with single peer
-			lockServer = server.NewReplicatedLockServer(serverRole, int32(*serverID), *peerAddress)
+			lockServer = server.NewReplicatedLockServer(int32(*serverID), *peerAddress)
 			log.Printf("Starting as %s server (ID: %d) with peer: %s", *role, *serverID, *peerAddress)
 		}
 	} else {

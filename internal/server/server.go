@@ -13,18 +13,8 @@ import (
 	"Distributed-Lock-Manager/internal/lock_manager"
 	pb "Distributed-Lock-Manager/proto"
 
-	"google.golang.org/grpc"
 )
 
-// ServerRole defines the role of the server (legacy)
-type ServerRole string
-
-const (
-	// PrimaryRole indicates a primary server that accepts client requests
-	PrimaryRole ServerRole = "primary"
-	// SecondaryRole indicates a secondary server that replicates from primary
-	SecondaryRole ServerRole = "secondary"
-)
 
 // ServerState defines the state of the server in the cluster
 type ServerState string
@@ -62,13 +52,9 @@ type LockServer struct {
 	recoveryDone bool                // Indicates if WAL recovery is complete
 	metrics      *PerformanceMetrics // Added metrics for monitoring
 
-	// Replication-related fields
-	role        ServerRole           // Legacy: Current role (primary or secondary)
-	isPrimary   bool                 // Legacy: Is this server the primary?
 	serverID    int32                // ID of this server
 	peerAddress string               // Legacy: Address of the peer server
-	peerClient  pb.LockServiceClient // Legacy: gRPC client for peer communication
-	peerConn    *grpc.ClientConn     // Legacy: gRPC connection to peer
+	
 
 	// Enhanced replication fields
 	serverState   atomic.Value                    // Current state (Leader/Follower/Candidate)
@@ -96,6 +82,8 @@ type LockServer struct {
 }
 
 // NewLockServer initializes a new lock server
+// Deprecated: This constructor is maintained only for backward compatibility.
+// New code should use NewReplicatedLockServerWithMultiPeers instead.
 func NewLockServer() *LockServer {
 	logger := log.New(os.Stdout, "[LockServer] ", log.LstdFlags)
 
@@ -114,8 +102,6 @@ func NewLockServer() *LockServer {
 		requestCache: NewRequestCacheWithSize(10*time.Minute, 10000),
 		logger:       logger,
 		recoveryDone: fm.IsRecoveryComplete(),
-		role:         PrimaryRole, // Default to primary role
-		isPrimary:    true,        // Default to primary
 		serverID:     1,           // Default ID
 		metrics:      NewPerformanceMetrics(logger),
 		peerClients:  make(map[string]pb.LockServiceClient),
@@ -129,84 +115,27 @@ func NewLockServer() *LockServer {
 	return s
 }
 
-// NewReplicatedLockServer initializes a lock server with replication configuration
-func NewReplicatedLockServer(role ServerRole, serverID int32, peerAddress string) *LockServer {
-	return NewReplicatedLockServerWithConfig(role, serverID, peerAddress, DefaultHeartbeatConfig)
-}
-
-// NewReplicatedLockServerWithConfig initializes a lock server with replication and custom heartbeat config
-func NewReplicatedLockServerWithConfig(role ServerRole, serverID int32, peerAddress string, hbConfig HeartbeatConfig) *LockServer {
-	logger := log.New(os.Stdout, fmt.Sprintf("[LockServer-%d] ", serverID), log.LstdFlags)
-
-	// Initialize lock manager with lease duration
-	lm := lock_manager.NewLockManagerWithLeaseDuration(logger, 30*time.Second)
-
-	// Initialize file manager with lock manager for token validation
-	fm := file_manager.NewFileManagerWithWAL(true, true, lm)
-
-	// Register file manager for lease expiry callbacks
-	fm.RegisterForLeaseExpiry()
-
-	isPrimary := role == PrimaryRole
-
-	// Set initial server state based on role
-	var initialState ServerState
-	if isPrimary {
-		initialState = LeaderState
-	} else {
-		initialState = FollowerState
-	}
-
-	s := &LockServer{
-		lockManager:      lm,
-		fileManager:      fm,
-		requestCache:     NewRequestCacheWithSize(10*time.Minute, 10000),
-		logger:           logger,
-		recoveryDone:     fm.IsRecoveryComplete(),
-		role:             role,
-		isPrimary:        isPrimary,
-		serverID:         serverID,
-		peerAddress:      peerAddress,
-		heartbeatConfig:  hbConfig,
-		fencingBuffer:    5 * time.Second, // Default 5s buffer for fencing
-		replicationQueue: make([]*pb.ReplicatedState, 0),
-		metrics:          NewPerformanceMetrics(logger),
-		peerClients:      make(map[string]pb.LockServiceClient),
-	}
-
-	// Initialize atomic values
-	s.serverState.Store(initialState)
-	s.currentEpoch.Store(0)
-	s.votedInEpoch.Store(-1)
-
-	// If peerAddress is provided, add it to peerAddresses
+// NewReplicatedLockServer initializes a lock server with a single peer
+// Deprecated: This constructor is maintained only for backward compatibility with 2-node setup.
+// New code should use NewReplicatedLockServerWithMultiPeers instead.
+func NewReplicatedLockServer(serverID int32, peerAddress string) *LockServer {
+	// Convert to multi-peer format with a single peer
+	peerAddresses := []string{}
 	if peerAddress != "" {
-		s.peerAddresses = []string{peerAddress}
-
-		// Legacy: Connect to peer if address is provided
-		if err := s.connectToPeer(); err != nil {
-			s.logger.Printf("Warning: Failed to connect to peer at %s: %v", peerAddress, err)
-		}
+		peerAddresses = []string{peerAddress}
 	}
 
-	// Start heartbeat sender if this is a secondary/follower
-	if !isPrimary && peerAddress != "" {
-		go s.startHeartbeatSender()
-	}
+	// Create server with default heartbeat config
+	server := NewReplicatedLockServerWithMultiPeers( serverID, peerAddresses, DefaultHeartbeatConfig)
 
-	// Start background replication worker for reliable updates
-	if isPrimary && peerAddress != "" {
-		go s.startReplicationWorker()
+	// Set the legacy peerAddress field for backward compatibility
+	server.peerAddress = peerAddress
 
-		// Start periodic split-brain check for primaries
-		go s.startSplitBrainChecker()
-	}
-
-	return s
+	return server
 }
 
 // NewReplicatedLockServerWithMultiPeers initializes a lock server with multiple peer configuration
-func NewReplicatedLockServerWithMultiPeers(role ServerRole, serverID int32, peerAddresses []string, hbConfig HeartbeatConfig) *LockServer {
+func NewReplicatedLockServerWithMultiPeers(serverID int32, peerAddresses []string, hbConfig HeartbeatConfig) *LockServer {
 	logger := log.New(os.Stdout, fmt.Sprintf("[LockServer-%d] ", serverID), log.LstdFlags)
 
 	// Initialize lock manager with lease duration
@@ -218,15 +147,11 @@ func NewReplicatedLockServerWithMultiPeers(role ServerRole, serverID int32, peer
 	// Register file manager for lease expiry callbacks
 	fm.RegisterForLeaseExpiry()
 
-	isPrimary := role == PrimaryRole
 
 	// Set initial server state based on role
 	var initialState ServerState
-	if isPrimary {
-		initialState = LeaderState
-	} else {
-		initialState = FollowerState
-	}
+	initialState = LeaderState
+
 
 	s := &LockServer{
 		lockManager:      lm,
@@ -234,8 +159,6 @@ func NewReplicatedLockServerWithMultiPeers(role ServerRole, serverID int32, peer
 		requestCache:     NewRequestCacheWithSize(10*time.Minute, 10000),
 		logger:           logger,
 		recoveryDone:     fm.IsRecoveryComplete(),
-		role:             role,
-		isPrimary:        isPrimary,
 		serverID:         serverID,
 		peerAddresses:    peerAddresses,
 		heartbeatConfig:  hbConfig,
@@ -254,14 +177,13 @@ func NewReplicatedLockServerWithMultiPeers(role ServerRole, serverID int32, peer
 	s.logger.Printf("Initialized server with %d peer addresses", len(peerAddresses))
 
 	// Start heartbeat sender if this is a follower
-	if !isPrimary && len(peerAddresses) > 0 {
+	if initialState == FollowerState && len(peerAddresses) > 0 {
 		go s.startHeartbeatSender()
 	}
 
-	// If this is a leader and we have peers, start the replication worker and split-brain checker
-	if isPrimary && len(peerAddresses) > 0 {
+	// If this is a leader and we have peers, start the replication worker
+	if initialState == LeaderState && len(peerAddresses) > 0 {
 		go s.startReplicationWorker()
-		go s.startSplitBrainChecker()
 	}
 
 	return s
@@ -686,14 +608,7 @@ func (s *LockServer) ServerInfo(ctx context.Context, req *pb.ServerInfoRequest) 
 		role = string(FollowerState)
 	} else if s.isCandidate() {
 		role = string(CandidateState)
-	} else {
-		// Legacy role mapping
-		if s.isPrimary {
-			role = string(PrimaryRole)
-		} else {
-			role = string(SecondaryRole)
-		}
-	}
+	} 
 
 	// Get the leader address if this server is not the leader
 	leaderAddr := ""
@@ -740,8 +655,8 @@ func (s *LockServer) Cleanup() {
 
 // VerifyUniqueServerID checks for duplicate server IDs with retry
 func (s *LockServer) VerifyUniqueServerID() error {
-	if s.peerAddress == "" {
-		// No peer to check against
+	if len(s.peerAddresses) == 0 {
+		// No peers to check against
 		return nil
 	}
 
@@ -749,52 +664,55 @@ func (s *LockServer) VerifyUniqueServerID() error {
 	maxRetries := 5
 	retryDelay := 1 * time.Second
 
+	// Check against all peers to ensure unique server ID
 	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Ensure we have a connection to the peer
-		if s.peerClient == nil {
-			if err := s.connectToPeer(); err != nil {
-				lastErr = fmt.Errorf("failed to connect to peer for ID verification: %w", err)
+	for _, peerAddress := range s.peerAddresses {
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			// Get or connect to the peer
+			client, err := s.getOrConnectPeer(peerAddress)
+			if err != nil {
+				lastErr = fmt.Errorf("failed to connect to peer %s for ID verification: %w", peerAddress, err)
 				s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
 				time.Sleep(retryDelay)
 				continue
 			}
+
+			// Use ServerInfo RPC to check peer's ID
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			resp, err := client.ServerInfo(ctx, &pb.ServerInfoRequest{})
+			cancel()
+
+			if err != nil {
+				lastErr = fmt.Errorf("unable to verify peer server ID with %s: %w", peerAddress, err)
+				s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
+				time.Sleep(retryDelay)
+				continue
+			}
+
+			// Successfully got peer info - check for duplicate ID
+			if resp.ServerId == s.serverID {
+				errMsg := fmt.Sprintf("Duplicate server ID detected! This server and peer at %s both have ID %d",
+					peerAddress, s.serverID)
+				s.logger.Printf("ERROR: %s", errMsg)
+				return fmt.Errorf(errMsg)
+			}
+
+			s.logger.Printf("Verified unique server ID with peer at %s: local=%d, peer=%d",
+				peerAddress, s.serverID, resp.ServerId)
+
+			// We were able to verify with this peer, move to the next one
+			break
 		}
-
-		// Use ServerInfo RPC to check peer's ID
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp, err := s.peerClient.ServerInfo(ctx, &pb.ServerInfoRequest{})
-		cancel()
-
-		if err != nil {
-			lastErr = fmt.Errorf("unable to verify peer server ID: %w", err)
-			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
-			time.Sleep(retryDelay)
-			continue
-		}
-
-		// Successfully got peer info - check for duplicate ID
-		if resp.ServerId == s.serverID {
-			errMsg := fmt.Sprintf("Duplicate server ID detected! This server and peer both have ID %d", s.serverID)
-			s.logger.Printf("ERROR: %s", errMsg)
-			return fmt.Errorf(errMsg)
-		}
-
-		// Success!
-		s.logger.Printf("Verified unique server ID: local=%d, peer=%d", s.serverID, resp.ServerId)
-		return nil
 	}
 
-	// If we reach here, we failed after all retries
-	s.logger.Printf("WARNING: Could not verify server ID uniqueness after %d attempts: %v", maxRetries, lastErr)
-	s.logger.Printf("Continuing startup, but be aware that duplicate IDs may cause issues")
-	return nil // Allow startup to continue despite verification failure
+	s.logger.Printf("Successfully verified unique server ID with all peers")
+	return nil
 }
 
 // VerifySharedFilesystem checks if the shared filesystem is properly accessible with retry
 func (s *LockServer) VerifySharedFilesystem() error {
-	if s.peerAddress == "" {
-		// No peer to verify with
+	if len(s.peerAddresses) == 0 {
+		// No peers to verify with
 		return nil
 	}
 
@@ -813,69 +731,86 @@ func (s *LockServer) VerifySharedFilesystem() error {
 	}
 	defer os.Remove(lockStatePath + ".test")
 
-	// Verify through peer with retries
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Ensure we have a connection to the peer
-		if s.peerClient == nil {
-			if err := s.connectToPeer(); err != nil {
-				lastErr = fmt.Errorf("failed to connect to peer for filesystem verification: %w", err)
+	// Create a test file with random content
+	testFileName := fmt.Sprintf("./data/fs_verify_%d.tmp", time.Now().UnixNano())
+	testContentStr := fmt.Sprintf("Filesystem verification from server %d at %s",
+		s.serverID, time.Now().Format(time.RFC3339))
+	testContent = []byte(testContentStr)
+
+	// Write test content to file
+	if err := os.WriteFile(testFileName, testContent, 0644); err != nil {
+		return fmt.Errorf("failed to write test file for filesystem verification: %w", err)
+	}
+	defer os.Remove(testFileName) // Clean up the test file when done
+
+	// Check with each peer
+	var verificationSuccessful bool
+
+	for _, peerAddress := range s.peerAddresses {
+		var peerSuccess bool
+		var lastErr error
+
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			// Get or connect to the peer
+			client, err := s.getOrConnectPeer(peerAddress)
+			if err != nil {
+				lastErr = fmt.Errorf("failed to connect to peer %s: %w", peerAddress, err)
 				s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
 				time.Sleep(retryDelay)
 				continue
 			}
+
+			// Ask peer to read the file
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			resp, err := client.VerifyFileAccess(ctx, &pb.FileAccessRequest{
+				FilePath:        testFileName,
+				ExpectedContent: testContentStr,
+			})
+			cancel()
+
+			if err != nil {
+				lastErr = fmt.Errorf("RPC error with peer %s: %w", peerAddress, err)
+				s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
+				time.Sleep(retryDelay)
+				continue
+			}
+
+			if resp.Status != pb.Status_OK {
+				lastErr = fmt.Errorf("verification failed with peer %s: %s", peerAddress, resp.ErrorMessage)
+				s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
+				time.Sleep(retryDelay)
+				continue
+			}
+
+			if resp.ActualContent != testContentStr {
+				lastErr = fmt.Errorf("content mismatch with peer %s: expected '%s', got '%s'",
+					peerAddress, testContentStr, resp.ActualContent)
+				s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
+				time.Sleep(retryDelay)
+				continue
+			}
+
+			// Success with this peer!
+			s.logger.Printf("Filesystem verification successful with peer at %s", peerAddress)
+			peerSuccess = true
+			verificationSuccessful = true
+			break
 		}
 
-		// Create a test file with random content
-		testFileName := fmt.Sprintf("./data/fs_verify_%d.tmp", time.Now().UnixNano())
-		testContent := fmt.Sprintf("Filesystem verification from server %d at %s",
-			s.serverID, time.Now().Format(time.RFC3339))
-
-		// Write test content to file
-		if err := os.WriteFile(testFileName, []byte(testContent), 0644); err != nil {
-			return fmt.Errorf("failed to write test file for filesystem verification: %w", err)
+		if !peerSuccess {
+			s.logger.Printf("WARNING: Could not verify shared filesystem with peer %s after %d attempts: %v",
+				peerAddress, maxRetries, lastErr)
 		}
-		defer os.Remove(testFileName) // Clean up the test file when done
-
-		// Ask peer to read the file
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp, err := s.peerClient.VerifyFileAccess(ctx, &pb.FileAccessRequest{
-			FilePath:        testFileName,
-			ExpectedContent: testContent,
-		})
-		cancel()
-
-		if err != nil {
-			lastErr = fmt.Errorf("filesystem verification failed - error calling peer: %w", err)
-			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
-			time.Sleep(retryDelay)
-			continue
-		}
-
-		if resp.Status != pb.Status_OK {
-			lastErr = fmt.Errorf("filesystem verification failed: %s", resp.ErrorMessage)
-			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
-			time.Sleep(retryDelay)
-			continue
-		}
-
-		if resp.ActualContent != testContent {
-			lastErr = fmt.Errorf("filesystem verification failed - content mismatch: expected '%s', got '%s'",
-				testContent, resp.ActualContent)
-			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
-			time.Sleep(retryDelay)
-			continue
-		}
-
-		// Success!
-		s.logger.Printf("Shared filesystem verification successful")
-		return nil
 	}
 
-	// If we reach here, we failed after all retries
-	s.logger.Printf("WARNING: Could not verify shared filesystem after %d attempts: %v", maxRetries, lastErr)
-	s.logger.Printf("Continuing startup, but be aware that filesystem sharing may not be working correctly")
-	return nil // Allow startup to continue despite verification failure
+	if !verificationSuccessful {
+		s.logger.Printf("WARNING: Could not verify shared filesystem with any peers")
+		s.logger.Printf("Continuing startup, but be aware that filesystem sharing may not be working correctly")
+	} else {
+		s.logger.Printf("Shared filesystem verification successful with at least one peer")
+	}
+
+	return nil
 }
 
 // VerifyFileAccess implements the RPC to check file access from a peer

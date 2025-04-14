@@ -101,28 +101,6 @@ func (s *LockServer) getOrConnectPeer(peerAddress string) (pb.LockServiceClient,
 	return client, nil
 }
 
-// connectToPeer establishes a connection to the peer (legacy method)
-func (s *LockServer) connectToPeer() error {
-	if s.peerAddress == "" {
-		return fmt.Errorf("no peer address configured")
-	}
-
-	// Create gRPC connection
-	conn, err := grpc.Dial(s.peerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("failed to connect to peer: %w", err)
-	}
-
-	// Create client
-	client := pb.NewLockServiceClient(conn)
-
-	s.peerConn = conn
-	s.peerClient = client
-	s.logger.Printf("Connected to peer at %s", s.peerAddress)
-
-	return nil
-}
-
 // replicateStateToFollowers sends the current lock state to all followers
 func (s *LockServer) replicateStateToFollowers() {
 	// Skip if not leader
@@ -231,9 +209,9 @@ func (s *LockServer) startReplicationWorker() {
 		defer ticker.Stop()
 
 		for {
-			// Stop if we're no longer leader/primary
-			if (!s.isPrimary && !s.isLeader()) || s.isFollower() {
-				s.logger.Printf("No longer leader/primary, stopping replication worker")
+			// Stop if we're no longer leader
+			if !s.isLeader() {
+				s.logger.Printf("No longer leader, stopping replication worker")
 				return
 			}
 
@@ -247,8 +225,8 @@ func (s *LockServer) startReplicationWorker() {
 
 // processReplicationQueue processes pending updates in the replication queue
 func (s *LockServer) processReplicationQueue() {
-	// Skip if not leader/primary
-	if (!s.isPrimary && !s.isLeader()) || s.isFollower() {
+	// Skip if not leader
+	if !s.isLeader() {
 		return
 	}
 
@@ -267,10 +245,22 @@ func (s *LockServer) processReplicationQueue() {
 	// Replicate to all followers
 	var wg sync.WaitGroup
 	var failedAddresses []string
-	var mu sync.Mutex // to protect failedAddresses
+	var mu sync.Mutex // to protect shared variables
+	successCount := 0
+
+	// Count the peers in the peerAddresses list (excluding duplicates)
+	uniqueAddrs := make(map[string]struct{})
+	totalPeers := 0
+	for _, addr := range s.peerAddresses {
+		if _, exists := uniqueAddrs[addr]; !exists {
+			uniqueAddrs[addr] = struct{}{}
+			totalPeers++
+		}
+	}
 
 	sendToAddress := func(address string) {
 		defer wg.Done()
+
 		// Get or establish connection to this peer
 		client, err := s.getOrConnectPeer(address)
 		if err != nil {
@@ -281,55 +271,66 @@ func (s *LockServer) processReplicationQueue() {
 			return
 		}
 
-		// Try to send the update
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		// Try to send the update with retry
+		maxRetries := 3
+		for retryCount := 0; retryCount < maxRetries; retryCount++ {
+			// Create a context with timeout
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
 
-		resp, err := client.UpdateSecondaryState(ctx, update)
-		if err != nil {
-			s.logger.Printf("Failed to replicate to follower at %s: %v", address, err)
-			mu.Lock()
-			failedAddresses = append(failedAddresses, address)
-			mu.Unlock()
-			return
-		}
+			resp, err := client.UpdateSecondaryState(ctx, update)
+			if err != nil {
+				s.logger.Printf("Failed to replicate to follower at %s (attempt %d/%d): %v",
+					address, retryCount+1, maxRetries, err)
 
-		// Process response
-		if resp.Status == pb.Status_STALE_EPOCH {
-			s.logger.Printf("Follower at %s reported our epoch %d is stale (their epoch: %d)",
-				address, update.Epoch, resp.CurrentEpoch)
+				if retryCount == maxRetries-1 {
+					// Last attempt failed
+					mu.Lock()
+					failedAddresses = append(failedAddresses, address)
+					mu.Unlock()
+				} else {
+					// Wait before retry
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+			} else {
+				// Process response
+				if resp.Status == pb.Status_STALE_EPOCH {
+					s.logger.Printf("Follower at %s reported our epoch %d is stale (their epoch: %d)",
+						address, update.Epoch, resp.CurrentEpoch)
 
-			// If follower has higher epoch, step down
-			if resp.CurrentEpoch > s.currentEpoch.Load() {
-				s.logger.Printf("Follower has higher epoch, stepping down")
-				s.currentEpoch.Store(resp.CurrentEpoch)
-				s.setServerState(FollowerState)
-				s.isPrimary = false
-				s.setLeaderAddress(address)
-				return
+					// If follower has higher epoch, step down
+					if resp.CurrentEpoch > s.currentEpoch.Load() {
+						s.logger.Printf("Follower has higher epoch, stepping down")
+						s.currentEpoch.Store(resp.CurrentEpoch)
+						s.setServerState(FollowerState)
+						s.setLeaderAddress(address)
+						return
+					}
+				} else if resp.Status != pb.Status_OK {
+					s.logger.Printf("Follower at %s returned error: %s", address, resp.ErrorMessage)
+					if retryCount == maxRetries-1 {
+						mu.Lock()
+						failedAddresses = append(failedAddresses, address)
+						mu.Unlock()
+					} else {
+						// Wait before retry
+						time.Sleep(100 * time.Millisecond)
+						continue
+					}
+				} else {
+					s.logger.Printf("Successfully replicated to follower at %s", address)
+					mu.Lock()
+					successCount++
+					mu.Unlock()
+					break // Success, exit retry loop
+				}
 			}
-		} else if resp.Status != pb.Status_OK {
-			s.logger.Printf("Follower at %s returned error: %s", address, resp.ErrorMessage)
-			mu.Lock()
-			failedAddresses = append(failedAddresses, address)
-			mu.Unlock()
-		} else {
-			s.logger.Printf("Successfully replicated to follower at %s", address)
 		}
 	}
 
-	// First, handle the legacy path if we have a peerClient
-	if s.peerClient != nil && s.peerAddress != "" {
-		wg.Add(1)
-		go sendToAddress(s.peerAddress)
-	}
-
-	// Then handle all the peers in the peerAddresses list
+	// Handle all the peers in the peerAddresses list
 	for _, addr := range s.peerAddresses {
-		// Skip if it's the same as the legacy peerAddress
-		if addr == s.peerAddress {
-			continue
-		}
 		wg.Add(1)
 		go sendToAddress(addr)
 	}
@@ -337,15 +338,25 @@ func (s *LockServer) processReplicationQueue() {
 	// Wait for all replication attempts to complete
 	wg.Wait()
 
-	// If we failed to replicate to some followers, leave update in the queue
-	if len(failedAddresses) > 0 {
-		s.logger.Printf("Failed to replicate to %d followers, will retry later", len(failedAddresses))
-		return
-	}
+	// Count the leader itself in the quorum calculation (totalPeers + 1 for leader)
+	totalParticipants := totalPeers + 1
 
-	// Success - remove the update from the queue
-	s.dequeueProcessedUpdate(update)
-	s.logger.Printf("Successfully processed pending replication update to all followers")
+	// If we have a majority of successful replications, consider it a success
+	// We need (N/2 + 1) nodes in total, and the leader counts as 1
+	quorumSize := (totalParticipants / 2) + 1
+
+	// The leader always has the update, so we need (quorumSize - 1) successful followers
+	neededFollowers := quorumSize - 1
+
+	if successCount >= neededFollowers {
+		// Success - remove the update from the queue
+		s.dequeueProcessedUpdate(update)
+		s.logger.Printf("Successfully processed replication to quorum (%d/%d followers, needed %d for quorum)",
+			successCount, totalPeers, neededFollowers)
+	} else if len(failedAddresses) > 0 {
+		s.logger.Printf("Failed to replicate to %d followers, only %d/%d successful (need %d for quorum), will retry later",
+			len(failedAddresses), successCount, totalPeers, neededFollowers)
+	}
 }
 
 // startHeartbeatSender periodically sends heartbeats to the leader
@@ -366,31 +377,23 @@ func (s *LockServer) startHeartbeatSender() {
 			return
 		}
 
-		// Target the current leader address if known, otherwise use the legacy peerAddress
+		// Target the current leader address if known
 		targetAddr := s.getLeaderAddress()
 		if targetAddr == "" {
-			targetAddr = s.peerAddress
+			s.logger.Printf("No known leader address, skipping heartbeat")
+			continue
 		}
 
-		var peerClient pb.LockServiceClient
-		var err error
-
 		// Get or establish connection to the target address
-		if targetAddr == s.peerAddress && s.peerClient != nil {
-			// Use legacy connection
-			peerClient = s.peerClient
-		} else {
-			// Use the new getOrConnectPeer method
-			peerClient, err = s.getOrConnectPeer(targetAddr)
-			if err != nil {
-				s.logger.Printf("Failed to connect to leader at %s: %v", targetAddr, err)
-				failureCount++
-				// Process failure
-				if checkAndHandleHeartbeatFailure(s, failureCount, maxFailures) {
-					return // Exit the heartbeat loop after promotion
-				}
-				continue
+		peerClient, err := s.getOrConnectPeer(targetAddr)
+		if err != nil {
+			s.logger.Printf("Failed to connect to leader at %s: %v", targetAddr, err)
+			failureCount++
+			// Process failure
+			if checkAndHandleHeartbeatFailure(s, failureCount, maxFailures) {
+				return // Exit the heartbeat loop after promotion
 			}
+			continue
 		}
 
 		// Create heartbeat request with current epoch
@@ -443,20 +446,16 @@ func checkAndHandleHeartbeatFailure(s *LockServer, failureCount, maxFailures int
 	if failureCount >= maxFailures {
 		s.logger.Printf("Leader heartbeat failed %d times in a row, initiating promotion", failureCount)
 
-		// For backward compatibility, if we're in legacy mode, use the legacy promotion approach
-		if s.getServerStateString() == "" {
-			// Legacy promotion
-			s.promoteToPrimary()
-		} else {
-			// New promotion approach - start an election
-			s.startPromotionAttempt()
+		// If we're already a leader or candidate, don't try to promote
+		if s.isLeader() || s.isCandidate() {
+			return false
 		}
 
-		return true // Promotion initiated
-	} else {
-		s.logger.Printf("Heartbeat failure count: %d/%d", failureCount, maxFailures)
-		return false // Continue sending heartbeats
+		// Start the promotion attempt (leader election)
+		s.startPromotionAttempt()
+		return true
 	}
+	return false
 }
 
 // startPromotionAttempt begins the process of attempting to become the leader
@@ -552,70 +551,6 @@ func (s *LockServer) startPromotionAttempt() {
 			}
 		}(peerAddr)
 	}
-
-	// 10. For backward compatibility, also request vote from legacy peer
-	if s.peerClient != nil && s.peerAddress != "" {
-		// Skip if it's already in peerAddresses
-		found := false
-		for _, addr := range s.peerAddresses {
-			if addr == s.peerAddress {
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				defer cancel()
-
-				resp, err := s.peerClient.ProposePromotion(ctx, req)
-				if err != nil {
-					s.logger.Printf("Failed to send vote request to legacy peer %s: %v",
-						s.peerAddress, err)
-					return
-				}
-
-				processVoteResponse(resp, s.peerAddress)
-
-				if resp.CurrentEpoch > newEpoch {
-					s.logger.Printf("Stepping down due to higher epoch %d from legacy peer",
-						resp.CurrentEpoch)
-					s.currentEpoch.Store(resp.CurrentEpoch)
-					s.setServerState(FollowerState)
-					s.resetElectionTimer()
-				}
-			}()
-		}
-	}
-}
-
-// promoteToPrimary promotes this server from secondary to primary
-// Legacy function for backward compatibility
-func (s *LockServer) promoteToPrimary() {
-	s.logger.Printf("Promoting server %d from secondary to primary (legacy method)", s.serverID)
-
-	s.isPrimary = true
-	s.role = PrimaryRole
-
-	// Start fencing period with detailed logging
-	leaseDuration := s.lockManager.GetLeaseDuration()
-	fencingDuration := leaseDuration + s.fencingBuffer
-	s.fencingEndTime = time.Now().Add(fencingDuration)
-	s.isFencing.Store(true)
-
-	// Log all the timing details
-	now := time.Now()
-	s.logger.Printf("DEBUG FENCING SETUP: Now=%v, FencingEndTime=%v, Duration=%v, LeaseDuration=%v, Buffer=%v",
-		now, s.fencingEndTime, fencingDuration, leaseDuration, s.fencingBuffer)
-	s.logger.Printf("Entering fencing period for %v (until %v)",
-		fencingDuration, s.fencingEndTime)
-
-	// Attempt to log the current lock state before fencing
-	s.logCurrentLockState("Before fencing")
-
-	// Start a goroutine to end the fencing period
-	go s.waitForFencingEnd()
 }
 
 // becomeLeader transitions this server to the leader state after winning an election
@@ -629,8 +564,6 @@ func (s *LockServer) becomeLeader(epoch int64) {
 
 	// Update state
 	s.setServerState(LeaderState)
-	s.isPrimary = true
-	s.role = PrimaryRole
 
 	// Clear the request cache to avoid stale responses
 	if s.requestCache != nil {
@@ -665,9 +598,6 @@ func (s *LockServer) becomeLeader(epoch int64) {
 
 	// Start periodic heartbeats to followers to maintain leadership
 	go s.startLeaderHeartbeats()
-
-	// Start the split-brain checker to detect potential split-brain scenarios
-	go s.startSplitBrainChecker()
 }
 
 // startLeaderHeartbeats sends periodic heartbeats to followers to maintain leadership
@@ -716,7 +646,6 @@ func (s *LockServer) startLeaderHeartbeats() {
 						addr, resp.CurrentEpoch, currentEpoch)
 					s.currentEpoch.Store(resp.CurrentEpoch)
 					s.setServerState(FollowerState)
-					s.isPrimary = false
 					s.setLeaderAddress(addr)
 					s.resetElectionTimer()
 				}
@@ -761,135 +690,7 @@ func (s *LockServer) waitForFencingEnd() {
 	// Log the lock state after clearing
 	s.logCurrentLockState("After forced clear")
 
-	s.logger.Printf("Server is now fully operational as primary")
-}
-
-// checkPeerRole checks the role of all peers to detect split-brain scenarios
-func (s *LockServer) checkPeerRole() bool {
-	// Skip if we're not a leader
-	if !s.isLeader() {
-		return false
-	}
-
-	// Create a copy of peer addresses to avoid holding the lock during RPC calls
-	var peerAddresses []string
-	s.peerClientsMu.RLock()
-	for addr := range s.peerClients {
-		peerAddresses = append(peerAddresses, addr)
-	}
-	// Also check the addresses from the peerAddresses slice
-	for _, addr := range s.peerAddresses {
-		peerAddresses = append(peerAddresses, addr)
-	}
-	s.peerClientsMu.RUnlock()
-
-	// Remove duplicates
-	addrSet := make(map[string]struct{})
-	var uniqueAddresses []string
-	for _, addr := range peerAddresses {
-		if _, exists := addrSet[addr]; !exists {
-			addrSet[addr] = struct{}{}
-			uniqueAddresses = append(uniqueAddresses, addr)
-		}
-	}
-
-	// If no peers configured, nothing to check
-	if len(uniqueAddresses) == 0 {
-		return false
-	}
-
-	splitBrainDetected := false
-
-	// Check each peer's role
-	for _, peerAddr := range uniqueAddresses {
-		// Get or connect to the peer
-		client, err := s.getOrConnectPeer(peerAddr)
-		if err != nil {
-			s.logger.Printf("Unable to connect to peer %s: %v", peerAddr, err)
-			continue
-		}
-
-		// Create a timeout context
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-
-		// Call ServerInfo RPC to check peer's role
-		resp, err := client.ServerInfo(ctx, &pb.ServerInfoRequest{})
-		cancel()
-
-		if err != nil {
-			s.logger.Printf("Unable to check peer role for %s: %v", peerAddr, err)
-			continue
-		}
-
-		// Check if the peer reports itself as leader
-		if resp.Role == string(LeaderState) || resp.Role == string(PrimaryRole) {
-			peerEpoch := resp.CurrentEpoch
-			currentEpoch := s.currentEpoch.Load()
-
-			s.logger.Printf("SPLIT-BRAIN DETECTION: Peer server %s (ID %d) reports itself as leader with epoch %d (our epoch: %d)!",
-				peerAddr, resp.ServerId, peerEpoch, currentEpoch)
-
-			// If the peer has a higher or equal epoch, demote ourselves
-			if peerEpoch >= currentEpoch {
-				splitBrainDetected = true
-				s.logger.Printf("SPLIT-BRAIN RESOLVED: Demoting self to follower due to peer with higher/equal epoch %d", peerEpoch)
-
-				// Demote this server to follower
-				s.setServerState(FollowerState)
-				s.isPrimary = false
-				if s.role == PrimaryRole {
-					s.role = SecondaryRole
-				}
-
-				// Update epoch if peer's is higher
-				if peerEpoch > currentEpoch {
-					s.currentEpoch.Store(peerEpoch)
-				}
-
-				// Set leader address to this peer
-				s.setLeaderAddress(peerAddr)
-
-				// Start heartbeat sender to monitor the new leader
-				go s.startHeartbeatSender()
-
-				return true
-			}
-		}
-	}
-
-	return splitBrainDetected
-}
-
-// startSplitBrainChecker periodically checks if any peers have been promoted
-func (s *LockServer) startSplitBrainChecker() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	s.logger.Printf("Starting multi-peer split-brain checker")
-
-	for range ticker.C {
-		// Stop if we're no longer leader/primary
-		if (!s.isPrimary && !s.isLeader()) || s.isFollower() {
-			s.logger.Printf("No longer leader/primary, stopping split-brain checker")
-			return
-		}
-
-		// Check all peers' roles
-		if s.checkPeerRole() {
-			// If split-brain was detected and resolved, stop the checker
-			s.logger.Printf("Split-brain was detected and resolved, stopping checker")
-			return
-		}
-	}
-}
-
-// getRandomElectionTimeout returns a random election timeout with jitter
-// to prevent multiple servers from starting elections simultaneously
-func getRandomElectionTimeout() time.Duration {
-	// Base timeout between 150-300ms with jitter
-	minTimeout := 150 * time.Millisecond
-	jitter := time.Duration(rand.Intn(150)) * time.Millisecond
-	return minTimeout + jitter
+	s.logger.Printf("Server is now fully operational as leader")
 }
 
 // resetElectionTimer resets the election timer with a random timeout
@@ -916,48 +717,43 @@ func (s *LockServer) resetElectionTimer() {
 
 // RPC Handlers
 
-// UpdateSecondaryState handles replication from primary to secondary
+// UpdateSecondaryState receives state updates from the leader
 func (s *LockServer) UpdateSecondaryState(ctx context.Context, state *pb.ReplicatedState) (*pb.ReplicationResponse, error) {
-	// This should only be called on the secondary
-	if s.isPrimary {
-		s.logger.Printf("Warning: Primary received UpdateSecondaryState call")
-		return &pb.ReplicationResponse{
-			Status:       pb.Status_ERROR,
-			ErrorMessage: "Cannot update state on primary server",
-			CurrentEpoch: s.currentEpoch.Load(),
-		}, nil
+	// Log peer information if available
+	if pr, ok := peer.FromContext(ctx); ok {
+		s.logger.Printf("Received state update from %s with epoch %d (holder=%d, token=%s, expiry=%v)",
+			pr.Addr, state.Epoch, state.LockHolder, state.LockToken,
+			time.Unix(state.ExpiryTimestamp, 0))
 	}
 
-	remoteEpoch := state.Epoch
+	// Get the current epoch
 	currentEpoch := s.currentEpoch.Load()
 
-	s.logger.Printf("Received state update from leader: holder=%d, expiry=%v, remote epoch=%d, current epoch=%d",
-		state.LockHolder, time.Unix(state.ExpiryTimestamp, 0), remoteEpoch, currentEpoch)
-
-	// Check epochs
-	if remoteEpoch < currentEpoch {
-		// Reject updates from lower epochs
-		s.logger.Printf("Rejecting state update with stale epoch %d < %d", remoteEpoch, currentEpoch)
+	// Check epochs - only accept updates from same or higher epoch
+	if state.Epoch < currentEpoch {
+		s.logger.Printf("Rejected state update with stale epoch %d (current epoch: %d)",
+			state.Epoch, currentEpoch)
 		return &pb.ReplicationResponse{
 			Status:       pb.Status_STALE_EPOCH,
-			ErrorMessage: fmt.Sprintf("Stale epoch: remote=%d, local=%d", remoteEpoch, currentEpoch),
 			CurrentEpoch: currentEpoch,
+			ErrorMessage: fmt.Sprintf("Stale epoch %d < %d", state.Epoch, currentEpoch),
 		}, nil
-	} else if remoteEpoch > currentEpoch {
-		// Update our epoch and transition to follower
-		s.logger.Printf("Received higher epoch %d > %d, updating and applying state", remoteEpoch, currentEpoch)
-		s.currentEpoch.Store(remoteEpoch)
-		s.setServerState(FollowerState)
-		s.isPrimary = false
-
-		// Get leader address from context metadata if available
-		if peer, ok := peer.FromContext(ctx); ok {
-			leaderAddr := peer.Addr.String()
-			s.setLeaderAddress(leaderAddr)
-			s.logger.Printf("Updated leader address to %s", leaderAddr)
-		}
 	}
-	// If epochs match, just apply the state
+
+	// If this server thinks it's a leader but gets an update from same or higher epoch,
+	// it needs to step down
+	if s.isLeader() && state.Epoch >= currentEpoch {
+		s.logger.Printf("Stepping down from leader due to update from same/higher epoch %d >= %d",
+			state.Epoch, currentEpoch)
+		s.setServerState(FollowerState)
+	}
+
+	// Update our epoch if we received a higher one
+	if state.Epoch > currentEpoch {
+		s.logger.Printf("Updating epoch from %d to %d based on replicated state",
+			currentEpoch, state.Epoch)
+		s.currentEpoch.Store(state.Epoch)
+	}
 
 	// Apply the replicated state to our lock manager
 	err := s.lockManager.ApplyReplicatedState(
@@ -975,14 +771,16 @@ func (s *LockServer) UpdateSecondaryState(ctx context.Context, state *pb.Replica
 		}, nil
 	}
 
+	s.logger.Printf("Applied replicated state: holder=%d, token=%s, expiry=%v",
+		state.LockHolder, state.LockToken, time.Unix(state.ExpiryTimestamp, 0))
+
 	return &pb.ReplicationResponse{
 		Status:       pb.Status_OK,
-		ErrorMessage: "",
 		CurrentEpoch: s.currentEpoch.Load(),
 	}, nil
 }
 
-// Ping handles heartbeat requests from secondary
+// Ping handles heartbeat requests from followers
 func (s *LockServer) Ping(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	// Basic logging for all Ping requests
 	remoteEpoch := req.Epoch
@@ -997,10 +795,10 @@ func (s *LockServer) Ping(ctx context.Context, req *pb.HeartbeatRequest) (*pb.He
 		s.logger.Printf("Incoming heartbeat has higher epoch %d > %d, stepping down", remoteEpoch, currentEpoch)
 		s.currentEpoch.Store(remoteEpoch)
 
-		// If we're currently the primary, step down
-		if s.isPrimary || s.isLeader() {
+		// If we're currently the leader, step down
+		if s.isLeader() {
 			s.setServerState(FollowerState)
-			s.isPrimary = false
+
 			// Get sender address from context metadata if available
 			if peer, ok := peer.FromContext(ctx); ok {
 				leaderAddr := peer.Addr.String()
@@ -1032,8 +830,8 @@ func (s *LockServer) Ping(ctx context.Context, req *pb.HeartbeatRequest) (*pb.He
 	}
 
 	// Only check the role for informational purposes
-	if !s.isPrimary && !s.isLeader() {
-		s.logger.Printf("Warning: Non-primary/non-leader received heartbeat from server %d", req.ServerId)
+	if !s.isLeader() {
+		s.logger.Printf("Warning: Non-leader received heartbeat from server %d", req.ServerId)
 	}
 
 	// Return our current status and epoch
@@ -1108,4 +906,13 @@ func (s *LockServer) ProposePromotion(ctx context.Context, req *pb.ProposeReques
 		CurrentEpoch: s.currentEpoch.Load(),
 		VoteGranted:  true,
 	}, nil
+}
+
+// getRandomElectionTimeout returns a random election timeout with jitter
+// to prevent multiple servers from starting elections simultaneously
+func getRandomElectionTimeout() time.Duration {
+	// Base timeout between 150-300ms with jitter
+	minTimeout := 150 * time.Millisecond
+	jitter := time.Duration(rand.Intn(150)) * time.Millisecond
+	return minTimeout + jitter
 }
