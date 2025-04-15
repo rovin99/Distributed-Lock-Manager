@@ -49,9 +49,13 @@ if [ -n "$1" ]; then
             # Will run secondary_failure_test later in the script
             RUN_ONLY_SECONDARY_FAILURE=true
             ;;
+        replica-failure-recovery)
+            # Will run replica_failure_fast_recovery_test later in the script
+            RUN_ONLY_REPLICA_FAILURE_RECOVERY=true
+            ;;
         *)
             echo "Unknown test: $TEST_TO_RUN"
-            echo "Usage: $0 {failover|split-brain|majority-failure|secondary-failure}"
+            echo "Usage: $0 {failover|split-brain|majority-failure|secondary-failure|replica-failure-recovery}"
             exit 1
             ;;
     esac
@@ -277,7 +281,7 @@ start_node() {
     local log_file="logs/node${node_id}.log"
     touch "$log_file"
     
-    bin/lock_server --role $role --id $node_id --address ":$port" --peers "$peers" --metrics-address ":$metrics_port" > "$log_file" 2>&1 &
+    bin/lock_server --role $role --id $node_id --address ":$port" --peers "$peers" --metrics-address ":$metrics_port" --skip-verifications > "$log_file" 2>&1 &
     local pid=$!
     
     # Verify it's a valid PID
@@ -792,6 +796,293 @@ run_secondary_failure_test() {
     return 0
 }
 
+# Function to verify a client can append to a file
+verify_client_file_append() {
+    local addr=$1
+    local client_id=$2
+    local filename=$3
+    local content=$4
+    
+    print_color $YELLOW "Client $client_id trying to append '$content' to $filename through $addr..." >&2
+    
+    # Use a temporary file to capture output
+    local tmp_output=$(mktemp)
+    
+    # Try to append to file with a timeout
+    bin/lock_client append --servers="$addr" --client-id=$client_id --file="$filename" --content="$content" --timeout=10s > "$tmp_output" 2>&1
+    local exit_code=$?
+    
+    # Display the output for debugging
+    cat "$tmp_output" >&2
+    
+    # Check for success patterns in the output
+    if grep -q "Successfully appended to file" "$tmp_output" || [ $exit_code -eq 0 ]; then
+        print_color $GREEN "Client $client_id successfully appended '$content' to $filename through $addr" >&2
+        rm -f "$tmp_output"
+        return 0
+    else
+        print_color $RED "Client $client_id failed to append to $filename through $addr" >&2
+        print_color $RED "Exit code: $exit_code" >&2
+        rm -f "$tmp_output"
+        return 1
+    fi
+}
+
+# Function to verify file contents
+verify_file_contents() {
+    local filename=$1
+    local expected_content=$2
+    
+    local full_path="data/$filename"
+    
+    if [ ! -f "$full_path" ]; then
+        print_color $RED "Test file $filename does not exist"
+        return 1
+    fi
+    
+    local content=$(cat "$full_path")
+    
+    if [ "$content" = "$expected_content" ]; then
+        print_color $GREEN "File content verified: $content"
+        return 0
+    else
+        print_color $RED "File content mismatch in $filename"
+        print_color $RED "Expected: $expected_content"
+        print_color $RED "Actual: $content"
+        return 1
+    fi
+}
+
+# Function to release client lock
+release_client_lock() {
+    local addr=$1
+    local client_id=$2
+    
+    print_color $YELLOW "Client $client_id releasing lock through $addr..." >&2
+    
+    # Use a temporary file to capture output
+    local tmp_output=$(mktemp)
+    
+    # Try to release the lock
+    bin/lock_client release --servers="$addr" --client-id=$client_id > "$tmp_output" 2>&1
+    local exit_code=$?
+    
+    # Display the output for debugging
+    cat "$tmp_output" >&2
+    
+    # Check for success patterns in the output
+    if grep -q "Successfully released lock" "$tmp_output" || [ $exit_code -eq 0 ]; then
+        print_color $GREEN "Client $client_id successfully released lock through $addr" >&2
+        rm -f "$tmp_output"
+        return 0
+    else
+        print_color $RED "Client $client_id failed to release lock through $addr" >&2
+        print_color $RED "Exit code: $exit_code" >&2
+        rm -f "$tmp_output"
+        return 1
+    fi
+}
+
+# Test 5: Replica Node Failure with Fast Recovery Test
+run_replica_failure_fast_recovery_test() {
+    print_header "Replica Node Failure with Fast Recovery Test"
+    print_color $YELLOW "Testing behavior when a replica node fails and recovers quickly during file operations"
+    
+    # Start 3 nodes
+    PEERS_FOR_NODE1="$NODE2_ADDR,$NODE3_ADDR"
+    PEERS_FOR_NODE2="$NODE1_ADDR,$NODE3_ADDR"
+    PEERS_FOR_NODE3="$NODE1_ADDR,$NODE2_ADDR"
+    
+    # Start initial leader (Server 1)
+    print_color $YELLOW "Starting Server 1 (Primary)..."
+    local node1_pid=$(start_node 1 $NODE1_PORT "primary" $NODE1_METRICS_PORT "$PEERS_FOR_NODE1")
+    if [ -z "$node1_pid" ]; then
+        return 1
+    fi
+    
+    # Start replica nodes (Server 2 and Server 3)
+    print_color $YELLOW "Starting Server 2 (Replica)..."
+    local node2_pid=$(start_node 2 $NODE2_PORT "secondary" $NODE2_METRICS_PORT "$PEERS_FOR_NODE2")
+    if [ -z "$node2_pid" ]; then
+        kill $node1_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    print_color $YELLOW "Starting Server 3 (Replica)..."
+    local node3_pid=$(start_node 3 $NODE3_PORT "secondary" $NODE3_METRICS_PORT "$PEERS_FOR_NODE3")
+    if [ -z "$node3_pid" ]; then
+        kill $node1_pid $node2_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Let the system stabilize
+    print_color $YELLOW "Letting the cluster stabilize..."
+    sleep 5
+    
+    # Clean up test files
+    rm -f data/file_1 data/file_2 data/file_3 2>/dev/null || true
+    
+    # Step 1: Client 1 acquires lock
+    print_color $YELLOW "Step 1: Client 1 acquires lock"
+    local client1_id=$((BASE_CLIENT_ID + 10))
+    if ! verify_client_lock_acquire "$NODE1_ADDR" $client1_id; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Step 2: Client 1 appends 'A' to file_1
+    print_color $YELLOW "Step 2: Client 1 appends 'A' to file_1"
+    if ! verify_client_file_append "$NODE1_ADDR" $client1_id "file_1" "A"; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Step 3: Client 1 begins appending to file_2
+    print_color $YELLOW "Step 3: Client 1 appends 'A' to file_2"
+    if ! verify_client_file_append "$NODE1_ADDR" $client1_id "file_2" "A"; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Step 4: Server 2 (follower) fails during the operation
+    print_color $YELLOW "Step 4: Server 2 (follower) fails"
+    kill_server_by_port $NODE2_PORT "Server 2 (follower)"
+    sleep 2
+    
+    # Step 5: Client 1 continues with append to file_3
+    print_color $YELLOW "Step 5: Client 1 appends 'A' to file_3 with Server 2 down"
+    if ! verify_client_file_append "$NODE1_ADDR" $client1_id "file_3" "A"; then
+        kill $node1_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Step 6: Quickly restart Server 2
+    print_color $YELLOW "Step 6: Quickly restarting Server 2..."
+    node2_pid=$(start_node 2 $NODE2_PORT "secondary" $NODE2_METRICS_PORT "$PEERS_FOR_NODE2")
+    if [ -z "$node2_pid" ]; then
+        kill $node1_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Wait for Server 2 to recover and sync state
+    print_color $YELLOW "Waiting for Server 2 to recover and sync state..."
+    sleep 10
+    
+    # Step 7: Client 1 releases lock
+    print_color $YELLOW "Step 7: Client 1 releases lock"
+    if ! release_client_lock "$NODE1_ADDR" $client1_id; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Step 8: Client 2 acquires lock
+    print_color $YELLOW "Step 8: Client 2 acquires lock"
+    local client2_id=$((BASE_CLIENT_ID + 20))
+    if ! verify_client_lock_acquire "$NODE1_ADDR" $client2_id; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Step 9: Client 2 appends 'B' to all three files
+    print_color $YELLOW "Step 9: Client 2 appends 'B' to file_1"
+    if ! verify_client_file_append "$NODE1_ADDR" $client2_id "file_1" "B"; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    print_color $YELLOW "Step 10: Client 2 appends 'B' to file_2"
+    if ! verify_client_file_append "$NODE1_ADDR" $client2_id "file_2" "B"; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    print_color $YELLOW "Step 11: Client 2 appends 'B' to file_3"
+    if ! verify_client_file_append "$NODE1_ADDR" $client2_id "file_3" "B"; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Step 12: Client 2 releases lock
+    print_color $YELLOW "Step 12: Client 2 releases lock"
+    if ! release_client_lock "$NODE1_ADDR" $client2_id; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Step 13: Verify the contents of all three files
+    print_color $YELLOW "Step 13: Verifying file contents"
+    local expected_content="AB"
+    
+    print_color $YELLOW "Verifying file_1 contents..."
+    if ! verify_file_contents "file_1" "$expected_content"; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    print_color $YELLOW "Verifying file_2 contents..."
+    if ! verify_file_contents "file_2" "$expected_content"; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    print_color $YELLOW "Verifying file_3 contents..."
+    if ! verify_file_contents "file_3" "$expected_content"; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Step 14: Verify all servers are in sync by checking from each server
+    print_color $YELLOW "Step 14: Verifying all servers are in sync"
+    
+    # Acquire lock through each server and check consistency
+    local client3_id=$((BASE_CLIENT_ID + 30))
+    
+    print_color $YELLOW "Verifying lock acquisition through Server 1..."
+    if ! verify_client_lock_acquire "$NODE1_ADDR" $client3_id; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Release the lock
+    if ! release_client_lock "$NODE1_ADDR" $client3_id; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    local client4_id=$((BASE_CLIENT_ID + 40))
+    print_color $YELLOW "Verifying lock acquisition through Server 2 (recovered node)..."
+    if ! verify_client_lock_acquire "$NODE2_ADDR" $client4_id; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Release the lock
+    if ! release_client_lock "$NODE2_ADDR" $client4_id; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    local client5_id=$((BASE_CLIENT_ID + 50))
+    print_color $YELLOW "Verifying lock acquisition through Server 3..."
+    if ! verify_client_lock_acquire "$NODE3_ADDR" $client5_id; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Release the lock
+    if ! release_client_lock "$NODE3_ADDR" $client5_id; then
+        kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+        return 1
+    fi
+    
+    # Clean up
+    kill $node1_pid $node2_pid $node3_pid 2>/dev/null || true
+    sleep 2
+    
+    print_color $GREEN "Replica Node Failure with Fast Recovery test succeeded"
+    return 0
+}
+
 # Function to run a test if it was specified
 run_test() {
     local test_name=$1
@@ -819,17 +1110,19 @@ run_test() {
 tests_failed=0
 
 # Check if individual tests were specified
-if [ -n "$RUN_ONLY_FAILOVER" ] || [ -n "$RUN_ONLY_SPLIT_BRAIN" ] || [ -n "$RUN_ONLY_MAJORITY_FAILURE" ] || [ -n "$RUN_ONLY_SECONDARY_FAILURE" ]; then
+if [ -n "$RUN_ONLY_FAILOVER" ] || [ -n "$RUN_ONLY_SPLIT_BRAIN" ] || [ -n "$RUN_ONLY_MAJORITY_FAILURE" ] || [ -n "$RUN_ONLY_SECONDARY_FAILURE" ] || [ -n "$RUN_ONLY_REPLICA_FAILURE_RECOVERY" ]; then
     run_test "Failover Test" run_failover_test "$RUN_ONLY_FAILOVER"
     run_test "Split-Brain Test" run_split_brain_test "$RUN_ONLY_SPLIT_BRAIN"
     run_test "Majority Failure Test" run_majority_failure_test "$RUN_ONLY_MAJORITY_FAILURE"
     run_test "Secondary Failure Test" run_secondary_failure_test "$RUN_ONLY_SECONDARY_FAILURE"
+    run_test "Replica Node Failure with Fast Recovery Test" run_replica_failure_fast_recovery_test "$RUN_ONLY_REPLICA_FAILURE_RECOVERY"
 else
     # Run all tests
     run_test "Failover Test" run_failover_test "true"
     run_test "Split-Brain Test" run_split_brain_test "true"
     run_test "Majority Failure Test" run_majority_failure_test "true"
     run_test "Secondary Failure Test" run_secondary_failure_test "true"
+    run_test "Replica Node Failure with Fast Recovery Test" run_replica_failure_fast_recovery_test "true"
 fi
 
 # Print summary

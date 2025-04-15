@@ -1,136 +1,168 @@
 syntax = "proto3";
 
+// LockService Protocol
+// This file defines the protocol buffers and services for the distributed lock manager.
+//
+// IMPORTANT: RPC Naming Migration Plan
+// -------------------------------------
+// Some RPC names in this file reflect older primary/secondary terminology.
+// In the future, these should be migrated to reflect the leader/follower terminology:
+//
+// - UpdateSecondaryState → ReplicateLockState (leader → follower replication)
+// - Ping → HeartbeatPing (server to server heartbeats)
+//
+// For backward compatibility, the old names are kept for now. When updating,
+// be sure to regenerate proto code and update all clients.
+
 package lock;
 
 option go_package = "Distributed-Lock-Manager/proto";
 
 // The lock service definition
 service LockService {
+  // Client API RPCs
+  
   // Initialize a new client
-  rpc ClientInit (client_init_args) returns (client_init_response) {}
+  rpc ClientInit (ClientInitArgs) returns (ClientInitResponse) {}
   
   // Acquire a lock
-  rpc LockAcquire (lock_args) returns (lock_response) {}
+  rpc LockAcquire (LockArgs) returns (LockResponse) {}
   
   // Release a lock
-  rpc LockRelease (lock_args) returns (lock_response) {}
+  rpc LockRelease (LockArgs) returns (LockResponse) {}
   
   // Append to a file
-  rpc FileAppend (file_args) returns (file_response) {}
+  rpc FileAppend (FileArgs) returns (FileResponse) {}
   
   // Renew lease for a lock
-  rpc RenewLease (lease_args) returns (lease_response) {}
+  rpc RenewLease (LeaseArgs) returns (LeaseResponse) {}
   
-  // Server-to-server replication RPCs
-  
-  // Update the secondary server's lock state (Primary -> Secondary)
-  rpc UpdateSecondaryState (replicated_state) returns (replication_response) {}
-  
-  // Heartbeat to check if primary is alive (Secondary -> Primary)
-  rpc Ping (heartbeat_request) returns (heartbeat_response) {}
+  // Server-to-server replication and coordination RPCs
 
-  // Server info (for duplicate ID detection)
-  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+  // Get server information (used for cluster coordination and ID verification)
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse) {}
   
-  // Verify file access (to check shared filesystem)
-  rpc VerifyFileAccess(FileAccessRequest) returns (FileAccessResponse);
+  // Verify file access (used to check shared filesystem)
+  rpc VerifyFileAccess(FileAccessRequest) returns (FileAccessResponse) {}
 
-  // Leader election (propose becoming the leader)
+  // LEGACY NAME: Will be renamed to ReplicateLockState in future versions
+  // Updates lock state on follower servers
+  rpc UpdateSecondaryState(ReplicatedState) returns (ReplicationResponse) {}
+  
+  // LEGACY NAME: Will be renamed to HeartbeatPing in future versions
+  // Sends heartbeat between servers for failure detection and leader awareness
+  rpc Ping(HeartbeatRequest) returns (HeartbeatResponse) {}
+
+  // Leadership election (propose becoming the leader)
   rpc ProposePromotion(ProposeRequest) returns (ProposeResponse) {}
 }
 
 // Client initialization arguments
-message client_init_args {
+message ClientInitArgs {
   int32 client_id = 1;
-  string request_id = 2;  // Added for request tracking
+  string request_id = 2;  // For request idempotence
 }
 
 // Client initialization response
-message client_init_response {
+message ClientInitResponse {
   Status status = 1;
   string error_message = 2;
 }
 
 // Lock operation arguments
-message lock_args {
+message LockArgs {
   int32 client_id = 1;
-  string token = 2;  // Token for lock validation
-  string request_id = 3;  // Added for request tracking
+  string token = 2;       // Token for lock validation
+  string request_id = 3;  // For request idempotence
 }
 
 // Lock operation response
-message lock_response {
+message LockResponse {
   Status status = 1;
   string error_message = 2;
-  string token = 3;  // Token for future operations
+  string token = 3;       // Token for future operations
 }
 
 // File operation arguments
-message file_args {
+message FileArgs {
   int32 client_id = 1;
   string filename = 2;
   bytes content = 3;
-  string token = 4;  // Token for permission validation
-  string request_id = 5;  // Added for request tracking
+  string token = 4;       // Token for permission validation
+  string request_id = 5;  // For request idempotence
 }
 
 // File operation response
-message file_response {
+message FileResponse {
   Status status = 1;
   string error_message = 2;
 }
 
 // Lease renewal arguments
-message lease_args {
+message LeaseArgs {
   int32 client_id = 1;
-  string token = 2;  // Token for lease validation
-  string request_id = 3;  // Added for request tracking
+  string token = 2;       // Token for lease validation
+  string request_id = 3;  // For request idempotence
 }
 
 // Lease renewal response
-message lease_response {
+message LeaseResponse {
   Status status = 1;
   string error_message = 2;
 }
 
-// Replicated state message for primary -> secondary communication
-message replicated_state {
-  int32 lock_holder = 1;      // ID of lock holder (-1 if free)
-  string lock_token = 2;      // Current lock token
-  int64 expiry_timestamp = 3; // Expiry time as unix timestamp
-  int64 epoch = 4;            // Epoch number of the leader
+// Replicated state message for leader → follower replication
+// This message is used by leaders to replicate the current lock state to followers.
+// It contains the current lock holder, token, expiry time, and the leader's epoch.
+// Followers apply this state to maintain consistency across the cluster.
+message ReplicatedState {
+  int32 lock_holder = 1;       // ID of lock holder (-1 if free)
+  string lock_token = 2;       // Current lock token
+  int64 expiry_timestamp = 3;  // Expiry time as unix timestamp
+  int64 epoch = 4;             // Epoch number of the leader
 }
 
 // Response to replication update
-message replication_response {
+// This message is sent by followers in response to a ReplicatedState update.
+// It includes the follower's current epoch for leader awareness.
+message ReplicationResponse {
   Status status = 1;
   string error_message = 2;
-  int64 current_epoch = 3;    // Current epoch of the responding server
+  int64 current_epoch = 3;     // Current epoch of the responding server
 }
 
-// Heartbeat request (secondary -> primary)
-message heartbeat_request {
-  int32 server_id = 1;  // ID of the secondary server
-  int64 epoch = 2;      // Current epoch of the sending server
+// Heartbeat request (between servers in the cluster)
+// Used for regular communication between servers to:
+// 1. Detect server failures
+// 2. Propagate leader information
+// 3. Prevent unnecessary elections
+// 4. Synchronize epoch information
+message HeartbeatRequest {
+  int32 server_id = 1;         // ID of the sending server
+  int64 epoch = 2;             // Current epoch of the sending server
+  bool is_leader = 3;          // Whether the sender is the leader
+  string leader_address = 4;   // Address of the leader (if sender is leader or knows it)
 }
 
 // Heartbeat response
-message heartbeat_response {
+// Sent in response to heartbeat requests to acknowledge receipt and
+// provide information about the responding server's state.
+message HeartbeatResponse {
   Status status = 1;
   string error_message = 2;
-  int64 current_epoch = 3; // Current epoch of the responding server
+  int64 current_epoch = 3;     // Current epoch of the responding server
 }
 
 // Leadership proposal request
 message ProposeRequest {
-  int32 candidate_id = 1;       // ID of the server proposing to be leader
-  int64 proposed_epoch = 2;     // Proposed new epoch number
+  int32 candidate_id = 1;      // ID of the server proposing to be leader
+  int64 proposed_epoch = 2;    // Proposed new epoch number
 }
 
 // Leadership proposal response
 message ProposeResponse {
-  int64 current_epoch = 1;      // Current epoch of the responding server
-  bool vote_granted = 2;        // Whether vote was granted for this promotion
+  int64 current_epoch = 1;     // Current epoch of the responding server
+  bool vote_granted = 2;       // Whether vote was granted for this promotion
 }
 
 // ServerInfo request
@@ -138,8 +170,8 @@ message ServerInfoRequest {}
 
 // ServerInfo response
 message ServerInfoResponse {
-  int32 server_id = 1;
-  string role = 2;
+  int32 server_id = 1;         // ID of this server
+  string role = 2;             // Current role (leader/follower/candidate)
   int64 current_epoch = 3;     // Current epoch of the server
   string leader_address = 4;   // Address of the current leader if this server is a follower
 }
@@ -154,20 +186,20 @@ message FileAccessRequest {
 message FileAccessResponse {
   Status status = 1;
   string error_message = 2;
-  string actual_content = 3;  // What was actually read from the file
+  string actual_content = 3;    // What was actually read from the file
 }
 
 // Status codes for responses
 enum Status {
-  OK = 0;
-  ERROR = 1;
-  LOCK_HELD = 2;
-  LOCK_NOT_HELD = 3;
-  INVALID_TOKEN = 4;        // Token validation failures
-  PERMISSION_DENIED = 5;    // Permission-related errors
-  SERVER_FENCING = 6;       // Server is in fencing period after promotion
-  SECONDARY_MODE = 7;       // Server is in secondary mode and can't process client requests
-  DUPLICATE_SERVER_ID = 8;  // Server detected duplicate server ID
-  FILESYSTEM_ERROR = 9;     // Error accessing shared filesystem
-  STALE_EPOCH = 10;         // Message has a stale epoch number
+  OK = 0;                       // Operation successful
+  ERROR = 1;                    // General error
+  LOCK_HELD = 2;                // Lock is held by another client
+  LOCK_NOT_HELD = 3;            // Client doesn't hold the lock
+  INVALID_TOKEN = 4;            // Token validation failures
+  PERMISSION_DENIED = 5;        // Permission-related errors
+  SERVER_FENCING = 6;           // Server is in fencing period after promotion
+  SECONDARY_MODE = 7;           // Server is not leader and can't process client requests
+  DUPLICATE_SERVER_ID = 8;      // Server detected duplicate server ID
+  FILESYSTEM_ERROR = 9;         // Error accessing shared filesystem
+  STALE_EPOCH = 10;             // Message has a stale epoch number
 } 

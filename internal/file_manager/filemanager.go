@@ -16,6 +16,15 @@ import (
 	"Distributed-Lock-Manager/internal/wal"
 )
 
+// getDataPath returns the data directory path, taking into account the DATA_DIR environment variable
+func getDataPath() string {
+	dataDir := "data"
+	if envDataDir := os.Getenv("DATA_DIR"); envDataDir != "" {
+		dataDir = filepath.Join(envDataDir, "data")
+	}
+	return dataDir
+}
+
 // FileOperation represents a file operation performed with a specific token
 type FileOperation struct {
 	Filename  string
@@ -71,9 +80,10 @@ func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool, lockManager *lock_
 		tokenOperations:   make(map[string][]FileOperation),
 	}
 
-	// Ensure the data directory exists
-	if err := os.MkdirAll("data", 0755); err != nil {
-		logger.Printf("Warning: Failed to create data directory: %v", err)
+	// Ensure the data directory exists using environment variable if set
+	dataDir := getDataPath()
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		logger.Printf("Warning: Failed to create data directory %s: %v", dataDir, err)
 	}
 
 	// Initialize processed requests log
@@ -100,16 +110,17 @@ func NewFileManagerWithWAL(syncEnabled bool, walEnabled bool, lockManager *lock_
 
 // initProcessedRequestsLog opens the processed requests log file
 func (fm *FileManager) initProcessedRequestsLog() error {
-	// Ensure data directory exists
-	if err := os.MkdirAll("data", 0755); err != nil {
-		return fmt.Errorf("couldn't create data directory: %v", err)
+	// Ensure data directory exists with env variable support
+	dataDir := getDataPath()
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return fmt.Errorf("couldn't create data directory %s: %v", dataDir, err)
 	}
 
-	// Open the processed requests log file
-	processedRequestsPath := filepath.Join("data", "processed_requests.log")
+	// Open the processed requests log file using environment variable if set
+	processedRequestsPath := filepath.Join(dataDir, "processed_requests.log")
 	fp, err := os.OpenFile(processedRequestsPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return fmt.Errorf("couldn't open processed requests log: %v", err)
+		return fmt.Errorf("couldn't open processed requests log %s: %v", processedRequestsPath, err)
 	}
 
 	fm.processedRequestFP = fp
@@ -318,7 +329,8 @@ func (fm *FileManager) AppendToFileWithRequestID(filename string, content []byte
 	}
 
 	// Get the current file size before appending (for potential rollback)
-	fullPath := filepath.Join("data", filename)
+	dataDir := getDataPath()
+	fullPath := filepath.Join(dataDir, filename)
 	var startPos int64 = 0
 
 	if fileInfo, err := os.Stat(fullPath); err == nil {
@@ -373,12 +385,14 @@ func (fm *FileManager) appendToFileInternal(filename string, content []byte, for
 		return fmt.Errorf("invalid file number")
 	}
 
-	// Prepend "data/" to the filename
-	fullPath := filepath.Join("data", filename)
+	// Get data directory path with environment variable support
+	dataDir := getDataPath()
+	// Create full path with correct data directory
+	fullPath := filepath.Join(dataDir, filename)
 
 	// Ensure the data directory exists
-	if err := os.MkdirAll("data", 0755); err != nil {
-		fm.logger.Printf("File append failed: couldn't create data directory: %v", err)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		fm.logger.Printf("File append failed: couldn't create data directory %s: %v", dataDir, err)
 		return err
 	}
 
@@ -428,15 +442,20 @@ func (fm *FileManager) appendToFileInternal(filename string, content []byte, for
 
 // CreateFiles ensures the 100 files exist
 func (fm *FileManager) CreateFiles() {
+	// Get data directory path with environment variable support
+	dataDir := getDataPath()
+
 	// Create data directory if it doesn't exist
-	if err := os.MkdirAll("data", 0755); err != nil {
-		fm.logger.Fatalf("Failed to create data directory: %v", err)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		fm.logger.Fatalf("Failed to create data directory %s: %v", dataDir, err)
 	}
 
 	for i := 0; i < 100; i++ {
 		filename := fmt.Sprintf("file_%d", i)
+		fullPath := filepath.Join(dataDir, filename)
+
 		// Create file only if it doesn't exist
-		if _, err := os.Stat(filepath.Join("data", filename)); os.IsNotExist(err) {
+		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 			// Log the file creation operation if WAL is enabled
 			if fm.wal != nil {
 				requestID := fmt.Sprintf("create_file_%d", i)
@@ -445,9 +464,9 @@ func (fm *FileManager) CreateFiles() {
 				}
 			}
 
-			f, err := os.Create(filepath.Join("data", filename))
+			f, err := os.Create(fullPath)
 			if err != nil {
-				fm.logger.Fatalf("Failed to create file %s: %v", filename, err)
+				fm.logger.Fatalf("Failed to create file %s: %v", fullPath, err)
 			}
 			f.Close()
 
@@ -459,7 +478,7 @@ func (fm *FileManager) CreateFiles() {
 				}
 			}
 
-			fm.logger.Printf("Created file: %s", filename)
+			fm.logger.Printf("Created file: %s", fullPath)
 		}
 	}
 }
@@ -498,11 +517,12 @@ func (fm *FileManager) ReadFile(filename string) ([]byte, error) {
 
 	file, exists := fm.openFiles[filename]
 	if !exists {
-		filepath := filepath.Join("data", filename)
+		dataDir := getDataPath()
+		filepath := filepath.Join(dataDir, filename)
 		var err error
 		file, err = os.Open(filepath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open file %s: %v", filename, err)
+			return nil, fmt.Errorf("failed to open file %s: %v", filepath, err)
 		}
 		fm.openFiles[filename] = file
 	}
@@ -545,16 +565,19 @@ func (fm *FileManager) ClearProcessedRequests() error {
 		}
 	}
 
+	// Get data directory path with environment variable support
+	dataDir := getDataPath()
+
 	// Delete and recreate the file
-	processedRequestsPath := filepath.Join("data", "processed_requests.log")
+	processedRequestsPath := filepath.Join(dataDir, "processed_requests.log")
 	if err := os.Remove(processedRequestsPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove processed requests log: %v", err)
+		return fmt.Errorf("failed to remove processed requests log %s: %v", processedRequestsPath, err)
 	}
 
 	// Reopen the file
 	fp, err := os.OpenFile(processedRequestsPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return fmt.Errorf("couldn't open processed requests log: %v", err)
+		return fmt.Errorf("couldn't open processed requests log %s: %v", processedRequestsPath, err)
 	}
 
 	fm.processedRequestFP = fp
@@ -592,7 +615,8 @@ func (fm *FileManager) RollbackTokenOperations(token string) error {
 
 // rollbackFileOperation truncates a file to remove an appended segment
 func (fm *FileManager) rollbackFileOperation(op FileOperation) error {
-	fullPath := filepath.Join("data", op.Filename)
+	dataDir := getDataPath()
+	fullPath := filepath.Join(dataDir, op.Filename)
 
 	// Open the file for reading and writing
 	file, err := os.OpenFile(fullPath, os.O_RDWR, 0644)

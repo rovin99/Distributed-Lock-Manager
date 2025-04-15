@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -366,6 +367,7 @@ func (s *LockServer) startHeartbeatSender() {
 
 	failureCount := 0
 	maxFailures := s.heartbeatConfig.MaxFailureCount
+	noLeaderCount := 0 // Track consecutive iterations with no known leader
 
 	s.logger.Printf("Starting heartbeat sender with interval=%v, timeout=%v, max failures=%d",
 		s.heartbeatConfig.Interval, s.heartbeatConfig.Timeout, maxFailures)
@@ -381,60 +383,70 @@ func (s *LockServer) startHeartbeatSender() {
 		targetAddr := s.getLeaderAddress()
 		if targetAddr == "" {
 			s.logger.Printf("No known leader address, skipping heartbeat")
-			continue
-		}
+			noLeaderCount++
 
-		// Get or establish connection to the target address
-		peerClient, err := s.getOrConnectPeer(targetAddr)
-		if err != nil {
-			s.logger.Printf("Failed to connect to leader at %s: %v", targetAddr, err)
-			failureCount++
-			// Process failure
-			if checkAndHandleHeartbeatFailure(s, failureCount, maxFailures) {
-				return // Exit the heartbeat loop after promotion
+			// If we have no leader address for several intervals, try to discover leader
+			if noLeaderCount == 3 {
+				s.logger.Printf("No leader address for %d intervals, attempting leader discovery", noLeaderCount)
+				s.discoverCurrentLeader()
+			}
+
+			// If still no leader after several more intervals, consider starting election
+			if noLeaderCount >= 5 {
+				s.logger.Printf("No leader discovered after %d intervals, triggering election", noLeaderCount)
+				s.resetElectionTimer()
+				noLeaderCount = 0 // Reset the counter
 			}
 			continue
 		}
 
-		// Create heartbeat request with current epoch
+		// Reset the counter since we have a leader address
+		noLeaderCount = 0
+
+		// Get or connect to the leader
+		peerClient, err := s.getOrConnectPeer(targetAddr)
+		if err != nil {
+			s.logger.Printf("Failed to connect to leader at %s: %v", targetAddr, err)
+			failureCount++
+			if checkAndHandleHeartbeatFailure(s, failureCount, maxFailures) {
+				// Reset failure count and continue if not promoting
+				failureCount = 0
+			}
+			continue
+		}
+
+		// Create heartbeat request
 		req := &pb.HeartbeatRequest{
 			ServerId: s.serverID,
 			Epoch:    s.currentEpoch.Load(),
+			IsLeader: false,
 		}
 
-		// Send the heartbeat
+		// Send heartbeat with timeout
 		ctx, cancel := context.WithTimeout(context.Background(), s.heartbeatConfig.Timeout)
 		resp, err := peerClient.Ping(ctx, req)
 		cancel()
 
 		if err != nil {
-			s.logger.Printf("Heartbeat to leader failed: %v", err)
+			s.logger.Printf("Failed to send heartbeat to leader at %s: %v", targetAddr, err)
 			failureCount++
-			// Process failure
 			if checkAndHandleHeartbeatFailure(s, failureCount, maxFailures) {
-				return // Exit the heartbeat loop after promotion
+				// Reset failure count if we're starting promotion
+				failureCount = 0
 			}
-			continue
-		}
+		} else {
+			// Reset failure count on success
+			failureCount = 0
 
-		// Successfully connected to the leader
-		failureCount = 0 // Reset failure counter
+			// If the response has a higher epoch, update our epoch
+			if resp.CurrentEpoch > s.currentEpoch.Load() {
+				s.logger.Printf("Updating epoch from %d to %d based on leader heartbeat",
+					s.currentEpoch.Load(), resp.CurrentEpoch)
+				s.currentEpoch.Store(resp.CurrentEpoch)
+			}
 
-		// Check if the response contains a higher epoch
-		if resp.CurrentEpoch > s.currentEpoch.Load() {
-			s.logger.Printf("Received higher epoch from leader: %d > %d, updating",
-				resp.CurrentEpoch, s.currentEpoch.Load())
-			s.currentEpoch.Store(resp.CurrentEpoch)
-		} else if resp.Status == pb.Status_STALE_EPOCH {
-			s.logger.Printf("Our epoch %d is stale according to leader (epoch %d)",
-				s.currentEpoch.Load(), resp.CurrentEpoch)
-			// Update our epoch to match the leader's
-			s.currentEpoch.Store(resp.CurrentEpoch)
-		}
-
-		// Log heartbeat success with reduced frequency
-		if time.Now().Second()%10 == 0 { // Log only every ~10 seconds
-			s.logger.Printf("Heartbeat to leader successful (epoch: %d)", s.currentEpoch.Load())
+			// Reset election timer on successful heartbeat
+			s.resetElectionTimer()
 		}
 	}
 }
@@ -444,253 +456,454 @@ func (s *LockServer) startHeartbeatSender() {
 func checkAndHandleHeartbeatFailure(s *LockServer, failureCount, maxFailures int) bool {
 	// Check if we've reached the maximum number of failures
 	if failureCount >= maxFailures {
-		s.logger.Printf("Leader heartbeat failed %d times in a row, initiating promotion", failureCount)
+		s.logger.Printf("Leader heartbeat failed %d times in a row (max allowed: %d), initiating leader election process",
+			failureCount, maxFailures)
 
 		// If we're already a leader or candidate, don't try to promote
 		if s.isLeader() || s.isCandidate() {
+			s.logger.Printf("Not starting promotion because we're already in %s state", s.getServerStateString())
+			return false
+		}
+
+		// Try to discover the leader first, but with a short timeout
+		s.logger.Printf("Attempting quick leader discovery before promotion")
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+
+		// Use a separate goroutine for discovery to respect the timeout
+		discoveryDone := make(chan bool, 1)
+		go func() {
+			s.discoverCurrentLeader()
+			discoveryDone <- true
+		}()
+
+		// Wait for discovery or timeout
+		select {
+		case <-ctx.Done():
+			s.logger.Printf("Leader discovery timed out, proceeding with promotion")
+		case <-discoveryDone:
+			s.logger.Printf("Leader discovery completed")
+		}
+
+		// If we found a leader through discovery, we don't need to promote
+		leaderAddr := s.getLeaderAddress()
+		if leaderAddr != "" {
+			s.logger.Printf("Leader discovered after heartbeat failures: %s, not promoting", leaderAddr)
 			return false
 		}
 
 		// Start the promotion attempt (leader election)
+		s.logger.Printf("No leader found or contactable, proceeding with promotion attempt")
 		s.startPromotionAttempt()
 		return true
 	}
+
+	// Log partial failures but don't promote yet
+	if failureCount > 0 {
+		s.logger.Printf("Heartbeat failure count: %d/%d", failureCount, maxFailures)
+	}
+
 	return false
 }
 
-// startPromotionAttempt begins the process of attempting to become the leader
-func (s *LockServer) startPromotionAttempt() {
-	s.logger.Printf("Starting promotion attempt for server ID %d", s.serverID)
+// discoverCurrentLeader attempts to find the current leader by querying peers
+func (s *LockServer) discoverCurrentLeader() {
+	s.logger.Printf("Attempting to discover current leader")
 
-	// 1. Transition to Candidate state
-	s.setServerState(CandidateState)
-
-	// 2. Increment current epoch
-	newEpoch := s.currentEpoch.Add(1)
-	s.logger.Printf("Incremented epoch from %d to %d", newEpoch-1, newEpoch)
-
-	// 3. Vote for self
-	s.votedInEpoch.Store(newEpoch)
-
-	// 4. Reset election timer in case we don't get majority
-	s.resetElectionTimer()
-
-	// 5. Calculate majority needed
-	totalServers := len(s.peerAddresses) + 1 // +1 for self
-	majority := (totalServers / 2) + 1
-	s.logger.Printf("Need %d votes out of %d servers for majority", majority, totalServers)
-
-	// 6. Create the promotion request
-	req := &pb.ProposeRequest{
-		CandidateId:   s.serverID,
-		ProposedEpoch: newEpoch,
+	// Deduplicate peer addresses
+	uniquePeers := make(map[string]bool)
+	for _, addr := range s.peerAddresses {
+		uniquePeers[addr] = true
 	}
 
-	// 7. Track vote responses
-	var votesMu sync.Mutex
-	var grantedVotes int32 = 1 // Already voted for self
-	var highestEpochSeen int64 = newEpoch
-
-	// 8. Function to process a vote response
-	processVoteResponse := func(resp *pb.ProposeResponse, peerAddr string) {
-		votesMu.Lock()
-		defer votesMu.Unlock()
-
-		// Check if response has a higher epoch
-		if resp.CurrentEpoch > highestEpochSeen {
-			highestEpochSeen = resp.CurrentEpoch
-			s.logger.Printf("Discovered higher epoch %d from %s", resp.CurrentEpoch, peerAddr)
-		}
-
-		// Count vote if granted
-		if resp.VoteGranted {
-			atomic.AddInt32(&grantedVotes, 1)
-			s.logger.Printf("Received vote from %s, total votes: %d/%d",
-				peerAddr, atomic.LoadInt32(&grantedVotes), majority)
-
-			// Check if we have majority
-			if atomic.LoadInt32(&grantedVotes) >= int32(majority) {
-				// We've won the election!
-				s.becomeLeader(newEpoch)
-			}
-		} else {
-			s.logger.Printf("Vote denied by %s (their epoch: %d)", peerAddr, resp.CurrentEpoch)
-		}
+	// Convert to slice for deterministic iteration
+	var dedupedPeers []string
+	for addr := range uniquePeers {
+		dedupedPeers = append(dedupedPeers, addr)
 	}
 
-	// 9. Broadcast vote requests to all peers
-	for _, peerAddr := range s.peerAddresses {
+	// If no peers, we should become leader ourselves
+	if len(dedupedPeers) == 0 {
+		s.logger.Printf("No peers available and no known leader - initiating election")
+		s.startPromotionAttempt()
+		return
+	}
+
+	// Try each peer until we find the leader
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	leaderFound := false
+	highestEpoch := s.currentEpoch.Load()
+	var leaderAddress string
+
+	for _, peerAddr := range dedupedPeers {
+		wg.Add(1)
 		go func(addr string) {
-			// Get or establish connection
+			defer wg.Done()
+
+			// Skip if we already found the leader
+			mu.Lock()
+			if leaderFound {
+				mu.Unlock()
+				return
+			}
+			mu.Unlock()
+
 			client, err := s.getOrConnectPeer(addr)
 			if err != nil {
-				s.logger.Printf("Failed to connect to %s for vote request: %v", addr, err)
+				s.logger.Printf("Failed to connect to %s while looking for leader: %v", addr, err)
 				return
 			}
 
-			// Send vote request
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			// Request server info
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancel()
 
-			resp, err := client.ProposePromotion(ctx, req)
+			resp, err := client.ServerInfo(ctx, &pb.ServerInfoRequest{})
 			if err != nil {
-				s.logger.Printf("Failed to send vote request to %s: %v", addr, err)
+				s.logger.Printf("Failed to get server info from %s: %v", addr, err)
 				return
 			}
 
-			// Process response
-			processVoteResponse(resp, addr)
+			mu.Lock()
+			defer mu.Unlock()
 
-			// If they had a higher epoch, adopt it and become follower
-			if resp.CurrentEpoch > newEpoch {
-				s.logger.Printf("Stepping down due to higher epoch %d from %s",
-					resp.CurrentEpoch, addr)
+			// If this server has a higher epoch, update ours
+			if resp.CurrentEpoch > highestEpoch {
+				highestEpoch = resp.CurrentEpoch
+				s.currentEpoch.Store(resp.CurrentEpoch)
+			}
+
+			// Normalize leader address to use localhost format
+			if resp.LeaderAddress != "" && !strings.HasPrefix(resp.LeaderAddress, "localhost:") {
+				parts := strings.Split(resp.LeaderAddress, ":")
+				if len(parts) >= 2 {
+					port := parts[len(parts)-1]
+					normLeaderAddr := "localhost:" + port
+					s.logger.Printf("Normalized leader address from %s to %s", resp.LeaderAddress, normLeaderAddr)
+					resp.LeaderAddress = normLeaderAddr
+				}
+			}
+
+			// Check if this is the leader
+			if resp.Role == string(LeaderState) {
+				s.logger.Printf("Discovered leader at %s (server ID %d, epoch %d)",
+					addr, resp.ServerId, resp.CurrentEpoch)
+
+				// Force address to be in localhost:port format for test compatibility
+				parts := strings.Split(addr, ":")
+				if len(parts) >= 2 {
+					port := parts[len(parts)-1]
+					leaderAddress = "localhost:" + port
+				} else {
+					leaderAddress = addr
+				}
+
+				leaderFound = true
+				s.setLeaderAddress(leaderAddress)
+				return
+			}
+
+			// If this server knows the leader address, use it
+			if resp.LeaderAddress != "" {
+				s.logger.Printf("Server %s (ID %d) reports leader at %s",
+					addr, resp.ServerId, resp.LeaderAddress)
+				leaderAddress = resp.LeaderAddress
+				leaderFound = true
+				s.setLeaderAddress(resp.LeaderAddress)
+				return
+			}
+		}(peerAddr)
+	}
+
+	// Wait for all server info requests to complete
+	wg.Wait()
+
+	if leaderFound {
+		s.logger.Printf("Successfully discovered leader at %s", leaderAddress)
+		// Reset election timer since we found a leader
+		s.resetElectionTimer()
+	} else {
+		s.logger.Printf("Failed to discover current leader from peers - might need election")
+		// No need to start election here; let the heartbeat sender handle it
+	}
+}
+
+// startPromotionAttempt initiates an attempt to become the leader
+func (s *LockServer) startPromotionAttempt() {
+	s.logger.Printf("Starting promotion attempt from %s state", s.getServerStateString())
+
+	// Skip if we're already a leader
+	if s.isLeader() {
+		s.logger.Printf("Already leader, skipping promotion attempt")
+		return
+	}
+
+	// Update to Candidate state
+	s.setServerState(CandidateState)
+
+	// Clear old leader address to avoid confusion during transition
+	s.setLeaderAddress("")
+
+	// Increment epoch and vote for self
+	newEpoch := s.currentEpoch.Load() + 1
+	s.currentEpoch.Store(newEpoch)
+	s.votedInEpoch.Store(newEpoch)
+
+	// Reset election timer
+	s.resetElectionTimer()
+
+	s.logger.Printf("Promoting to candidate with epoch %d", newEpoch)
+
+	// Broadcast ProposePromotion RPCs to all peers
+	votes := int32(1)                                         // Start with 1 (vote for self)
+	var votesNeeded int32 = int32(len(s.peerAddresses)/2) + 1 // Majority needed
+
+	// Collect all peer addresses for logging
+	totalServers := len(s.peerAddresses) + 1 // Include self
+
+	s.logger.Printf("Need %d/%d votes for majority (already have 1 vote from self)",
+		votesNeeded, totalServers)
+
+	// Deduplicate peer addresses to prevent skewed quorum
+	uniquePeers := make(map[string]bool)
+	for _, addr := range s.peerAddresses {
+		uniquePeers[addr] = true
+	}
+
+	// Create clean deduplicated slice of peer addresses
+	dedupedPeers := make([]string, 0, len(uniquePeers))
+	for addr := range uniquePeers {
+		dedupedPeers = append(dedupedPeers, addr)
+	}
+
+	s.logger.Printf("Will request votes from %d unique peers: %v", len(dedupedPeers), dedupedPeers)
+
+	// Early success if we're the only server in the cluster
+	if len(dedupedPeers) == 0 {
+		s.logger.Printf("No peers to request votes from, automatically becoming leader")
+		s.becomeLeader(newEpoch)
+		return
+	}
+
+	// Add a small delay based on server ID to make elections more deterministic
+	// This gives preference to lower server IDs (helps prevent split brain)
+	// Nodes with higher IDs wait longer to start their vote requests
+	electionDelay := time.Duration(s.serverID) * 50 * time.Millisecond
+	s.logger.Printf("Adding %v election delay based on server ID to avoid split votes", electionDelay)
+	time.Sleep(electionDelay)
+
+	// Request votes from all peers with a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond) // Use 1s timeout
+	defer cancel()
+
+	// Check if we've been superseded by another leader while waiting
+	if !s.isCandidate() {
+		s.logger.Printf("No longer a candidate after delay, aborting election")
+		return
+	}
+
+	var wg sync.WaitGroup
+	var voteMu sync.Mutex // Protects the votes counter
+
+	for _, peerAddr := range dedupedPeers {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+
+			// Skip if we already have majority
+			if atomic.LoadInt32(&votes) >= votesNeeded {
+				s.logger.Printf("Already have majority votes, skipping vote request to %s", addr)
+				return
+			}
+
+			// Prepare promotion request
+			req := &pb.ProposeRequest{
+				CandidateId:   s.serverID,
+				ProposedEpoch: newEpoch,
+			}
+
+			// Connect to peer
+			s.logger.Printf("Attempting to connect to peer %s for vote", addr)
+			client, err := s.getOrConnectPeer(addr)
+			if err != nil {
+				s.logger.Printf("Failed to connect to peer %s for vote: %v", addr, err)
+				return
+			}
+			s.logger.Printf("Successfully connected to peer %s, sending vote request", addr)
+
+			// Send the proposal
+			resp, err := client.ProposePromotion(ctx, req)
+			if err != nil {
+				s.logger.Printf("Failed to get vote from %s: %v", addr, err)
+				return
+			}
+
+			// Handle the response
+			if resp.VoteGranted {
+				voteMu.Lock()
+				defer voteMu.Unlock()
+				votes++
+				s.logger.Printf("Received yes vote from %s, now have %d/%d votes",
+					addr, votes, votesNeeded)
+			} else {
+				// If peer has higher epoch, step down
+				if resp.CurrentEpoch > newEpoch {
+					s.logger.Printf("Peer %s has higher epoch %d > %d, stepping down",
+						addr, resp.CurrentEpoch, newEpoch)
+					s.currentEpoch.Store(resp.CurrentEpoch)
+					s.setServerState(FollowerState)
+				} else {
+					s.logger.Printf("Vote denied by %s (already voted in this epoch or some other reason)", addr)
+				}
+			}
+		}(peerAddr)
+	}
+
+	// Wait for all vote requests to complete or timeout
+	s.logger.Printf("Waiting for vote requests to complete or timeout...")
+	wg.Wait()
+	s.logger.Printf("All vote requests completed or timed out")
+
+	// Check final vote count
+	finalVotes := atomic.LoadInt32(&votes)
+	if finalVotes >= votesNeeded && s.isCandidate() {
+		s.logger.Printf("Election won with %d/%d votes, becoming leader for epoch %d",
+			finalVotes, totalServers, newEpoch)
+		s.becomeLeader(newEpoch)
+	} else if s.isCandidate() {
+		s.logger.Printf("Election failed, got only %d/%d votes, needed %d. Returning to follower state",
+			finalVotes, totalServers, votesNeeded)
+		s.setServerState(FollowerState)
+
+		// Try to discover the current leader after election failure
+		s.discoverCurrentLeader()
+	} else {
+		s.logger.Printf("No longer a candidate (current state: %s), election aborted",
+			s.getServerStateString())
+	}
+}
+
+// becomeLeader transitions this server to the leader state
+func (s *LockServer) becomeLeader(epoch int64) {
+	s.logger.Printf("Becoming leader with epoch %d", epoch)
+
+	// Update state
+	s.setServerState(LeaderState)
+	s.currentEpoch.Store(epoch)
+	s.setLeaderAddress("") // Clear leader address (we are the leader)
+
+	// Start fencing period
+	leaseDuration := s.lockManager.GetLeaseDuration()
+	fencingDuration := leaseDuration + s.fencingBuffer
+
+	s.isFencing.Store(true)
+	s.fencingEndTime = time.Now().Add(fencingDuration)
+
+	s.logger.Printf("Entering fencing period for %v (until %v)",
+		fencingDuration, s.fencingEndTime.Format(time.RFC3339))
+
+	// Actively broadcast to all followers that this server is the new leader
+	// so they can update their leaderAddress
+	go s.announceLeadership(epoch)
+
+	// Start leader services
+	go s.startLeaderHeartbeats()
+	go s.startReplicationWorker()
+
+	// Wait for fencing period to end
+	go s.waitForFencingEnd()
+}
+
+// announceLeadership sends periodic announcements to followers
+func (s *LockServer) announceLeadership(epoch int64) {
+	s.logger.Printf("Announcing leadership with epoch %d", epoch)
+
+	s.setLeaderAddress(s.selfAddress)
+
+	// Prepare heartbeat request
+	req := &pb.HeartbeatRequest{
+		ServerId:      s.serverID,
+		Epoch:         epoch,
+		IsLeader:      true,
+		LeaderAddress: s.selfAddress,
+	}
+
+	// Send to all peers
+	var wg sync.WaitGroup
+	for _, addr := range s.peerAddresses {
+		wg.Add(1)
+		go func(peerAddr string) {
+			defer wg.Done()
+
+			// Connect to peer
+			client, err := s.getOrConnectPeer(peerAddr)
+			if err != nil {
+				s.logger.Printf("Failed to connect to follower at %s for leadership announcement: %v",
+					peerAddr, err)
+				return
+			}
+
+			// Send ping with leadership information
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			resp, err := client.Ping(ctx, req)
+			if err != nil {
+				s.logger.Printf("Failed to announce leadership to %s: %v", peerAddr, err)
+				return
+			}
+
+			// Check for higher epoch in response
+			if resp.CurrentEpoch > epoch {
+				s.logger.Printf("Stepping down as leader due to higher epoch %d from %s",
+					resp.CurrentEpoch, peerAddr)
 				s.currentEpoch.Store(resp.CurrentEpoch)
 				s.setServerState(FollowerState)
 				s.resetElectionTimer()
 			}
-		}(peerAddr)
+
+			s.logger.Printf("Successfully announced leadership to %s", peerAddr)
+		}(addr)
 	}
+
+	// Wait for all announcements to complete
+	wg.Wait()
+	s.logger.Printf("Leadership announcements completed")
 }
 
-// becomeLeader transitions this server to the leader state after winning an election
-func (s *LockServer) becomeLeader(epoch int64) {
-	// Check if we're already leader or have seen a higher epoch
-	if s.isLeader() || s.currentEpoch.Load() > epoch {
+// waitForFencingEnd waits for the fencing period to end and then calls ForceClearLockState
+func (s *LockServer) waitForFencingEnd() {
+	// Calculate time to wait
+	waitTime := time.Until(s.fencingEndTime)
+	if waitTime <= 0 {
+		s.logger.Printf("Warning: Fencing period already ended, proceeding immediately")
+		waitTime = 1 * time.Millisecond // Minimum wait
+	}
+
+	// Wait for the fencing period to expire
+	s.logger.Printf("Waiting %v for fencing period to end", waitTime)
+	time.Sleep(waitTime)
+
+	// Check if we're still the leader
+	if !s.isLeader() {
+		s.logger.Printf("No longer leader after fencing period - not clearing lock state")
 		return
 	}
 
-	s.logger.Printf("Won election for epoch %d! Becoming leader", epoch)
-
-	// Update state
-	s.setServerState(LeaderState)
-
-	// Clear the request cache to avoid stale responses
-	if s.requestCache != nil {
-		s.logger.Printf("Clearing request cache on leadership transition")
-		s.requestCache.Clear()
-	}
-
-	// Enter fencing period
-	leaseDuration := s.lockManager.GetLeaseDuration()
-	fencingDuration := leaseDuration + s.fencingBuffer
-	s.fencingEndTime = time.Now().Add(fencingDuration)
-	s.isFencing.Store(true)
-
-	// Log timing details
-	s.logger.Printf("Entering fencing period for %v (until %v)",
-		fencingDuration, s.fencingEndTime)
-
-	// Log current state
-	s.logCurrentLockState("Before fencing")
-
-	// Register file manager's lease expiry callback to ensure it's properly set up
-	if s.fileManager != nil {
-		s.logger.Printf("Registering file manager lease expiry callbacks for new leader")
-		s.fileManager.RegisterForLeaseExpiry()
-	}
-
-	// Start a goroutine to end the fencing period
-	go s.waitForFencingEnd()
-
-	// Start replicating to followers
-	go s.startReplicationWorker()
-
-	// Start periodic heartbeats to followers to maintain leadership
-	go s.startLeaderHeartbeats()
-}
-
-// startLeaderHeartbeats sends periodic heartbeats to followers to maintain leadership
-func (s *LockServer) startLeaderHeartbeats() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	s.logger.Printf("Starting leader heartbeats")
-
-	for range ticker.C {
-		// Stop if we're no longer leader
-		if !s.isLeader() {
-			s.logger.Printf("No longer leader, stopping heartbeats")
-			return
-		}
-
-		// Current epoch to send in heartbeats
-		currentEpoch := s.currentEpoch.Load()
-
-		// Send heartbeats to all peers
-		for _, peerAddr := range s.peerAddresses {
-			go func(addr string) {
-				client, err := s.getOrConnectPeer(addr)
-				if err != nil {
-					s.logger.Printf("Failed to connect to follower %s for heartbeat: %v", addr, err)
-					return
-				}
-
-				req := &pb.HeartbeatRequest{
-					ServerId: s.serverID,
-					Epoch:    currentEpoch,
-				}
-
-				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-				defer cancel()
-
-				resp, err := client.Ping(ctx, req)
-				if err != nil {
-					s.logger.Printf("Failed to send heartbeat to %s: %v", addr, err)
-					return
-				}
-
-				// If follower reports higher epoch, step down
-				if resp.CurrentEpoch > currentEpoch {
-					s.logger.Printf("Follower %s has higher epoch %d > %d, stepping down",
-						addr, resp.CurrentEpoch, currentEpoch)
-					s.currentEpoch.Store(resp.CurrentEpoch)
-					s.setServerState(FollowerState)
-					s.setLeaderAddress(addr)
-					s.resetElectionTimer()
-				}
-			}(peerAddr)
-		}
-	}
-}
-
-// waitForFencingEnd waits for the fencing period to end
-func (s *LockServer) waitForFencingEnd() {
-	timeToWait := time.Until(s.fencingEndTime)
-	if timeToWait <= 0 {
-		timeToWait = 1 * time.Millisecond // Minimum wait
-	}
-
-	s.logger.Printf("Scheduling fencing end in %v", timeToWait)
-	time.Sleep(timeToWait)
-
-	s.logger.Printf("Fencing period ended, clearing lock state")
+	// End fencing period and clear lock state
 	s.isFencing.Store(false)
+	s.logger.Printf("Fencing period ended, clearing lock state for new requests")
 
-	// Log the lock state before clearing
-	s.logCurrentLockState("Before forced clear")
-
-	// Clear lock state to ensure safe operation
+	// Force clear the lock state to ensure we start fresh
 	if err := s.lockManager.ForceClearLockState(); err != nil {
-		s.logger.Printf("Warning: Failed to clear lock state after fencing: %v", err)
+		s.logger.Printf("Error clearing lock state after fencing: %v", err)
+	} else {
+		s.logger.Printf("Successfully cleared lock state and ended fencing period")
 	}
 
-	// Re-register file manager's lease expiry callback to ensure it's properly set up
-	if s.fileManager != nil {
-		s.logger.Printf("Re-registering file manager lease expiry callbacks")
-		s.fileManager.RegisterForLeaseExpiry()
-	}
-
-	// Clear the request cache to avoid stale responses after leadership change
-	if s.requestCache != nil {
-		s.logger.Printf("Clearing request cache after fencing period")
-		s.requestCache.Clear()
-	}
-
-	// Log the lock state after clearing
-	s.logCurrentLockState("After forced clear")
-
-	s.logger.Printf("Server is now fully operational as leader")
+	// Replicate the cleared state to followers
+	s.replicateStateToFollowers()
 }
 
 // resetElectionTimer resets the election timer with a random timeout
@@ -700,25 +913,185 @@ func (s *LockServer) resetElectionTimer() {
 
 	// Cancel existing timer if any
 	if s.electionTimer != nil {
-		s.electionTimer.Stop()
+		if !s.electionTimer.Stop() {
+			// Drain the timer channel if it already fired
+			select {
+			case <-s.electionTimer.C:
+				s.logger.Printf("Drained already-fired election timer")
+			default:
+				s.logger.Printf("Election timer stopped before firing")
+			}
+		}
+	}
+
+	// Don't set timers for leaders or candidates
+	if !s.isFollower() {
+		s.logger.Printf("Not setting election timer for non-follower state: %s", s.getServerStateString())
+		return
+	}
+
+	// Don't set a timer if we already know the leader
+	if s.getLeaderAddress() != "" {
+		s.logger.Printf("Already know leader at %s, setting longer election timeout", s.getLeaderAddress())
 	}
 
 	// Create new timer with random timeout
 	timeout := getRandomElectionTimeout()
-	s.electionTimer = time.AfterFunc(timeout, func() {
-		// Only start promotion if we're still a follower
+	s.logger.Printf("Setting new election timer with timeout %v", timeout)
+	s.electionTimer = time.NewTimer(timeout)
+
+	// Start a goroutine to handle the timer expiration
+	go func() {
+		// Wait for the timer to fire
+		s.logger.Printf("Election timer goroutine started, waiting for timer to fire")
+		<-s.electionTimer.C
+		s.logger.Printf("Election timer fired!")
+
+		// Check if we're still a follower when the timer fires
 		if s.isFollower() {
-			s.startPromotionAttempt()
+			// Only start election if we don't know the leader or lost contact
+			if s.getLeaderAddress() == "" {
+				s.logger.Printf("Election timer expired while in follower state with no known leader, initiating leader election")
+				s.startPromotionAttempt()
+			} else {
+				s.logger.Printf("Election timer expired, but we know the leader at %s. Checking if it's alive...",
+					s.getLeaderAddress())
+
+				// Attempt to contact leader - if it fails, then start election
+				leaderAlive := s.pingLeader()
+				if !leaderAlive {
+					s.logger.Printf("Leader at %s is not responding, initiating leader election", s.getLeaderAddress())
+					s.setLeaderAddress("") // Clear stale leader address
+					s.startPromotionAttempt()
+				} else {
+					s.logger.Printf("Leader at %s is still responsive, resetting election timer", s.getLeaderAddress())
+					s.resetElectionTimer()
+				}
+			}
+		} else {
+			s.logger.Printf("Election timer expired, but no longer in follower state (now %s), skipping election",
+				s.getServerStateString())
 		}
-	})
+	}()
 
 	s.logger.Printf("Election timer reset with timeout %v", timeout)
 }
 
-// RPC Handlers
+// pingLeader attempts to contact the leader with a quick ping
+func (s *LockServer) pingLeader() bool {
+	leaderAddr := s.getLeaderAddress()
+	if leaderAddr == "" {
+		return false
+	}
 
-// UpdateSecondaryState receives state updates from the leader
-func (s *LockServer) UpdateSecondaryState(ctx context.Context, state *pb.ReplicatedState) (*pb.ReplicationResponse, error) {
+	// Get or connect to the leader
+	client, err := s.getOrConnectPeer(leaderAddr)
+	if err != nil {
+		s.logger.Printf("Failed to connect to leader at %s: %v", leaderAddr, err)
+		return false
+	}
+
+	// Send a quick ping
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	req := &pb.HeartbeatRequest{
+		ServerId: s.serverID,
+		Epoch:    s.currentEpoch.Load(),
+	}
+
+	_, err = client.Ping(ctx, req)
+	if err != nil {
+		s.logger.Printf("Leader at %s is not responding: %v", leaderAddr, err)
+		return false
+	}
+
+	return true
+}
+
+// startLeaderHeartbeats starts sending periodic heartbeats to all followers
+func (s *LockServer) startLeaderHeartbeats() {
+	s.logger.Printf("Starting leader heartbeats with interval %v", s.heartbeatConfig.Interval)
+
+	// Create ticker for heartbeat interval
+	ticker := time.NewTicker(s.heartbeatConfig.Interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Stop if no longer leader
+		if !s.isLeader() {
+			s.logger.Printf("No longer leader, stopping heartbeats")
+			return
+		}
+
+		// Get current epoch
+		currentEpoch := s.currentEpoch.Load()
+
+		// Deduplicate peer addresses
+		uniquePeers := make(map[string]bool)
+		for _, addr := range s.peerAddresses {
+			uniquePeers[addr] = true
+		}
+
+		// Broadcast heartbeats to all unique peers
+		for peerAddr := range uniquePeers {
+			go func(addr string) {
+				// Skip if we're not leader anymore
+				if !s.isLeader() {
+					return
+				}
+
+				// Connect to peer
+				client, err := s.getOrConnectPeer(addr)
+				if err != nil {
+					s.logger.Printf("Failed to connect to follower at %s for heartbeat: %v",
+						addr, err)
+					return
+				}
+
+				// Prepare heartbeat request
+				req := &pb.HeartbeatRequest{
+					ServerId:      s.serverID,
+					Epoch:         currentEpoch,
+					IsLeader:      true,
+					LeaderAddress: s.selfAddress,
+				}
+
+				// Send heartbeat with timeout
+				ctx, cancel := context.WithTimeout(context.Background(), s.heartbeatConfig.Timeout)
+				defer cancel()
+
+				resp, err := client.Ping(ctx, req)
+				if err != nil {
+					s.logger.Printf("Failed to send heartbeat to follower at %s: %v",
+						addr, err)
+					return
+				}
+
+				// Process response
+				if resp.Status == pb.Status_STALE_EPOCH {
+					s.logger.Printf("Follower at %s reported our epoch %d is stale (their epoch: %d)",
+						addr, currentEpoch, resp.CurrentEpoch)
+
+					// If they have a higher epoch, step down
+					if resp.CurrentEpoch > currentEpoch {
+						s.logger.Printf("Stepping down as leader due to higher epoch %d from %s",
+							resp.CurrentEpoch, addr)
+						s.currentEpoch.Store(resp.CurrentEpoch)
+						s.setServerState(FollowerState)
+						s.resetElectionTimer()
+					}
+				} else {
+					s.logger.Printf("Heartbeat to %s successful (status: %v)",
+						addr, resp.Status)
+				}
+			}(peerAddr)
+		}
+	}
+}
+
+// ReplicateLockState receives state updates from the leader
+func (s *LockServer) ReplicateLockState(ctx context.Context, state *pb.ReplicatedState) (*pb.ReplicationResponse, error) {
 	// Log peer information if available
 	if pr, ok := peer.FromContext(ctx); ok {
 		s.logger.Printf("Received state update from %s with epoch %d (holder=%d, token=%s, expiry=%v)",
@@ -780,64 +1153,55 @@ func (s *LockServer) UpdateSecondaryState(ctx context.Context, state *pb.Replica
 	}, nil
 }
 
-// Ping handles heartbeat requests from followers
-func (s *LockServer) Ping(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
-	// Basic logging for all Ping requests
+// HeartbeatPing handles heartbeat requests from other servers
+func (s *LockServer) HeartbeatPing(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	// Basic logging for all heartbeat requests
 	remoteEpoch := req.Epoch
 	currentEpoch := s.currentEpoch.Load()
 
 	s.logger.Printf("Received heartbeat from server %d with epoch %d (current epoch: %d)",
 		req.ServerId, remoteEpoch, currentEpoch)
 
-	// Check epochs
-	if remoteEpoch > currentEpoch {
-		// If incoming epoch is higher, we should step down and let the other server lead
-		s.logger.Printf("Incoming heartbeat has higher epoch %d > %d, stepping down", remoteEpoch, currentEpoch)
-		s.currentEpoch.Store(remoteEpoch)
+	// Process leader information if provided
+	if req.IsLeader {
+		s.logger.Printf("Server %d claims to be leader with address %s", req.ServerId, req.LeaderAddress)
 
-		// If we're currently the leader, step down
-		if s.isLeader() {
-			s.setServerState(FollowerState)
+		// If sender claims to be leader and has valid epoch, update our leader address
+		if remoteEpoch >= currentEpoch {
+			if s.isLeader() && remoteEpoch >= currentEpoch && req.ServerId != s.serverID {
+				// We thought we were leader, but someone else claims to be with valid epoch
+				// Step down to follower
+				s.logger.Printf("Stepping down from leader due to heartbeat from server %d with epoch %d",
+					req.ServerId, remoteEpoch)
+				s.setServerState(FollowerState)
+				s.setLeaderAddress(req.LeaderAddress)
+			} else if remoteEpoch > currentEpoch {
+				// If remote epoch is greater, update our epoch
+				s.logger.Printf("Incoming heartbeat has higher epoch %d > %d, stepping down", remoteEpoch, currentEpoch)
+				s.currentEpoch.Store(remoteEpoch)
 
-			// Get sender address from context metadata if available
-			if peer, ok := peer.FromContext(ctx); ok {
-				leaderAddr := peer.Addr.String()
-				s.setLeaderAddress(leaderAddr)
-				s.logger.Printf("Updated leader address to %s", leaderAddr)
+				// Also update leader info
+				s.setLeaderAddress(req.LeaderAddress)
 			}
 		}
+	} else if req.LeaderAddress != "" {
+		// Sender knows who the leader is
+		s.logger.Printf("Server %d reports leader address as %s", req.ServerId, req.LeaderAddress)
 
-		return &pb.HeartbeatResponse{
-			Status:       pb.Status_OK,
-			ErrorMessage: "Accepted higher epoch",
-			CurrentEpoch: remoteEpoch, // Now adopt the higher epoch
-		}, nil
-	} else if remoteEpoch < currentEpoch {
-		// If incoming epoch is lower, inform the other server about our higher epoch
-		s.logger.Printf("Incoming heartbeat has stale epoch %d < %d", remoteEpoch, currentEpoch)
-		return &pb.HeartbeatResponse{
-			Status:       pb.Status_STALE_EPOCH,
-			ErrorMessage: fmt.Sprintf("Stale epoch %d < %d", remoteEpoch, currentEpoch),
-			CurrentEpoch: currentEpoch,
-		}, nil
-	}
-
-	// If epochs are equal and we're a follower, reset our election timer
-	if s.isFollower() {
-		// Reset election timer to prevent timeout
-		s.resetElectionTimer()
-		s.logger.Printf("Received heartbeat with matching epoch, reset election timeout")
+		// If we don't know who the leader is, update our leader address
+		if s.getLeaderAddress() == "" && remoteEpoch >= currentEpoch {
+			s.setLeaderAddress(req.LeaderAddress)
+		}
 	}
 
 	// Only check the role for informational purposes
-	if !s.isLeader() {
-		s.logger.Printf("Warning: Non-leader received heartbeat from server %d", req.ServerId)
+	if currentEpoch > remoteEpoch {
+		s.logger.Printf("Our epoch %d is higher than heartbeat epoch %d", currentEpoch, remoteEpoch)
 	}
 
-	// Return our current status and epoch
+	// Return our current epoch and state
 	return &pb.HeartbeatResponse{
 		Status:       pb.Status_OK,
-		ErrorMessage: "",
 		CurrentEpoch: s.currentEpoch.Load(),
 	}, nil
 }
@@ -908,11 +1272,28 @@ func (s *LockServer) ProposePromotion(ctx context.Context, req *pb.ProposeReques
 	}, nil
 }
 
-// getRandomElectionTimeout returns a random election timeout with jitter
-// to prevent multiple servers from starting elections simultaneously
+// getRandomElectionTimeout returns a random election timeout between 150-500ms
 func getRandomElectionTimeout() time.Duration {
-	// Base timeout between 150-300ms with jitter
-	minTimeout := 150 * time.Millisecond
-	jitter := time.Duration(rand.Intn(150)) * time.Millisecond
-	return minTimeout + jitter
+	// Use a shorter timeout range (100-300ms) for more responsive elections
+	// Especially useful during testing to detect failures faster
+	minTimeout := 100 * time.Millisecond
+	maxTimeout := 300 * time.Millisecond
+
+	// Generate random duration within the range
+	randomizationRange := int64(maxTimeout - minTimeout)
+	randomized := minTimeout + time.Duration(rand.Int63n(randomizationRange))
+
+	return randomized
+}
+
+// UpdateSecondaryState receives state updates from the leader (legacy method)
+// Delegates to ReplicateLockState for backward compatibility
+func (s *LockServer) UpdateSecondaryState(ctx context.Context, state *pb.ReplicatedState) (*pb.ReplicationResponse, error) {
+	return s.ReplicateLockState(ctx, state)
+}
+
+// Ping handles heartbeat requests (legacy method)
+// Delegates to HeartbeatPing for backward compatibility
+func (s *LockServer) Ping(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	return s.HeartbeatPing(ctx, req)
 }

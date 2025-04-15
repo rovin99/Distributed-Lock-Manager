@@ -20,9 +20,7 @@ func main() {
 	metricsAddress := flag.String("metrics-address", ":8080", "Address for metrics server (set to empty to disable)")
 
 	// Add replication flags
-	role := flag.String("role", "primary", "Server role: 'primary' or 'secondary'")
 	serverID := flag.Int("id", 1, "Server ID (1 for primary, 2+ for secondaries)")
-	peerAddress := flag.String("peer", "", "Address of peer server (legacy, single peer)")
 	peers := flag.String("peers", "", "Comma-separated list of all peer server addresses (e.g., 'host2:port,host3:port')")
 	skipVerifications := flag.Bool("skip-verifications", false, "Skip ID and filesystem verifications")
 
@@ -39,31 +37,16 @@ func main() {
 	if *peers != "" {
 		peerAddresses = strings.Split(*peers, ",")
 		log.Printf("Configured with %d peers: %v", len(peerAddresses), peerAddresses)
-	} else if *peerAddress != "" {
-		// Legacy mode with single peer
-		peerAddresses = []string{*peerAddress}
-		log.Printf("Legacy mode with single peer: %s", *peerAddress)
 	}
 
-	// Determine server role from flags
+	// Create lock server
 	var lockServer *server.LockServer
-	if *role == "primary" || *role == "secondary" {
-
-
-		// Create replicated server with new configuration function
-		if len(peerAddresses) > 0 {
-			// Multi-peer configuration
-			lockServer = server.NewReplicatedLockServerWithMultiPeers(int32(*serverID), peerAddresses, server.DefaultHeartbeatConfig)
-			log.Printf("Starting as %s server (ID: %d) with %d peers", *role, *serverID, len(peerAddresses))
-		} else {
-			// Legacy with single peer
-			lockServer = server.NewReplicatedLockServer(int32(*serverID), *peerAddress)
-			log.Printf("Starting as %s server (ID: %d) with peer: %s", *role, *serverID, *peerAddress)
-		}
+	if len(peerAddresses) > 0 {
+		log.Printf("Starting replicated lock server with ID %d and peers: %v", *serverID, peerAddresses)
+		lockServer = server.NewReplicatedLockServerWithMultiPeers(int32(*serverID), *address, peerAddresses, server.DefaultHeartbeatConfig)
 	} else {
-		// Create standalone server (backward compatibility)
-		lockServer = server.NewLockServer()
-		log.Printf("Starting as standalone server (invalid role: %s)", *role)
+		log.Printf("Starting standalone lock server with ID %d", *serverID)
+		lockServer = server.NewReplicatedLockServerWithMultiPeers(int32(*serverID), *address, []string{}, server.DefaultHeartbeatConfig)
 	}
 
 	pb.RegisterLockServiceServer(s, lockServer)
@@ -84,7 +67,7 @@ func main() {
 	}
 
 	// Perform verifications if this is a replicated setup
-	if (len(peerAddresses) > 0 || *peerAddress != "") && !*skipVerifications {
+	if len(peerAddresses) > 0 && !*skipVerifications {
 		// Verify server ID uniqueness
 		log.Printf("Verifying server ID uniqueness...")
 		if err := lockServer.VerifyUniqueServerID(); err != nil {

@@ -3,10 +3,14 @@ package server
 import (
 	"Distributed-Lock-Manager/internal/file_manager"
 	"Distributed-Lock-Manager/internal/lock_manager"
-	"Distributed-Lock-Manager/proto"
+	pb "Distributed-Lock-Manager/proto"
 	"context"
+	"io"
 	"log"
+	"net"
 	"os"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -19,6 +23,11 @@ import (
 // C2 releases.
 // C1 re-acquires T3, appends 'A'.
 func TestDuplicatedReleasePacket(t *testing.T) {
+	// Set the data directory environment variable
+	originalDataDir := os.Getenv("DATA_DIR")
+	os.Setenv("DATA_DIR", "data_server_3")
+	defer os.Setenv("DATA_DIR", originalDataDir)
+
 	// Create a test server with a lock manager
 	lm := lock_manager.NewLockManager(nil)
 	fm := file_manager.NewFileManager(false, lm)
@@ -32,32 +41,32 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 	fm.CreateFiles()
 
 	// Clean up existing content to ensure test starts with empty file
-	os.WriteFile("data/"+testFile, []byte(""), 0644)
+	os.WriteFile("data_server_3/data/"+testFile, []byte(""), 0644)
 
 	server := &LockServer{
 		lockManager:  lm,
 		fileManager:  fm,
 		requestCache: NewRequestCache(5 * time.Minute),
 		logger:       logger,
-		
-		metrics:      NewPerformanceMetrics(logger),
+
+		metrics: NewPerformanceMetrics(logger),
 	}
 
 	// Initialize the serverState atomic value
 	server.serverState.Store(LeaderState)
 
 	// Step 1: C1 acquires lock T1
-	acquireResp1, err := server.LockAcquire(context.Background(), &proto.LockArgs{
+	acquireResp1, err := server.LockAcquire(context.Background(), &pb.LockArgs{
 		ClientId:  1,
 		RequestId: "req-acquire-c1",
 	})
-	if err != nil || acquireResp1.Status != proto.Status_OK {
+	if err != nil || acquireResp1.Status != pb.Status_OK {
 		t.Fatalf("C1 failed to acquire lock: %v, status: %v", err, acquireResp1.Status)
 	}
 	tokenT1 := acquireResp1.Token
 
 	// Step 2: C1 appends 'A' to the file
-	_, err = server.FileAppend(context.Background(), &proto.FileArgs{
+	_, err = server.FileAppend(context.Background(), &pb.FileArgs{
 		ClientId:  1,
 		Token:     tokenT1,
 		Filename:  testFile,
@@ -72,27 +81,27 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 	// We simulate this by not actually sending it yet
 
 	// Step 4: C1 retries release with a new request ID (this succeeds)
-	releaseResp1, err := server.LockRelease(context.Background(), &proto.LockArgs{
+	releaseResp1, err := server.LockRelease(context.Background(), &pb.LockArgs{
 		ClientId:  1,
 		Token:     tokenT1,
 		RequestId: "req-release-c1-retry",
 	})
-	if err != nil || releaseResp1.Status != proto.Status_OK {
+	if err != nil || releaseResp1.Status != pb.Status_OK {
 		t.Fatalf("C1 retry release failed: %v, status: %v", err, releaseResp1.Status)
 	}
 
 	// Step 5: C2 acquires lock T2
-	acquireResp2, err := server.LockAcquire(context.Background(), &proto.LockArgs{
+	acquireResp2, err := server.LockAcquire(context.Background(), &pb.LockArgs{
 		ClientId:  2,
 		RequestId: "req-acquire-c2",
 	})
-	if err != nil || acquireResp2.Status != proto.Status_OK {
+	if err != nil || acquireResp2.Status != pb.Status_OK {
 		t.Fatalf("C2 failed to acquire lock: %v, status: %v", err, acquireResp2.Status)
 	}
 	tokenT2 := acquireResp2.Token
 
 	// Step 6: C2 appends 'B' to the file
-	_, err = server.FileAppend(context.Background(), &proto.FileArgs{
+	_, err = server.FileAppend(context.Background(), &pb.FileArgs{
 		ClientId:  2,
 		Token:     tokenT2,
 		Filename:  testFile,
@@ -104,40 +113,40 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 	}
 
 	// Step 7: NOW the delayed release packet from C1 arrives
-	delayedReleaseResp, err := server.LockRelease(context.Background(), &proto.LockArgs{
+	delayedReleaseResp, err := server.LockRelease(context.Background(), &pb.LockArgs{
 		ClientId:  1,
 		Token:     tokenT1,
 		RequestId: "req-release-c1-delayed", // Different request ID from the retry
 	})
 
 	// The duplicate release should be successful (idempotent) even though C1 doesn't hold the lock anymore
-	if err != nil || delayedReleaseResp.Status != proto.Status_OK {
+	if err != nil || delayedReleaseResp.Status != pb.Status_OK {
 		t.Fatalf("Delayed release from C1 should succeed but got: %v, status: %v",
 			err, delayedReleaseResp.Status)
 	}
 
 	// Step 8: C2 releases its lock
-	releaseResp2, err := server.LockRelease(context.Background(), &proto.LockArgs{
+	releaseResp2, err := server.LockRelease(context.Background(), &pb.LockArgs{
 		ClientId:  2,
 		Token:     tokenT2,
 		RequestId: "req-release-c2",
 	})
-	if err != nil || releaseResp2.Status != proto.Status_OK {
+	if err != nil || releaseResp2.Status != pb.Status_OK {
 		t.Fatalf("C2 release failed: %v, status: %v", err, releaseResp2.Status)
 	}
 
 	// Step 9: C1 re-acquires with a new token T3
-	acquireResp3, err := server.LockAcquire(context.Background(), &proto.LockArgs{
+	acquireResp3, err := server.LockAcquire(context.Background(), &pb.LockArgs{
 		ClientId:  1,
 		RequestId: "req-acquire-c1-again",
 	})
-	if err != nil || acquireResp3.Status != proto.Status_OK {
+	if err != nil || acquireResp3.Status != pb.Status_OK {
 		t.Fatalf("C1 failed to re-acquire lock: %v, status: %v", err, acquireResp3.Status)
 	}
 	tokenT3 := acquireResp3.Token
 
 	// Step 10: C1 appends 'A' to the file again
-	_, err = server.FileAppend(context.Background(), &proto.FileArgs{
+	_, err = server.FileAppend(context.Background(), &pb.FileArgs{
 		ClientId:  1,
 		Token:     tokenT3,
 		Filename:  testFile,
@@ -149,7 +158,7 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 	}
 
 	// Step 11: C1 releases the lock
-	_, err = server.LockRelease(context.Background(), &proto.LockArgs{
+	_, err = server.LockRelease(context.Background(), &pb.LockArgs{
 		ClientId:  1,
 		Token:     tokenT3,
 		RequestId: "req-release-c1-final",
@@ -159,7 +168,7 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 	}
 
 	// Verify the file contents
-	content, err := os.ReadFile("data/" + testFile)
+	content, err := os.ReadFile("data_server_3/data/" + testFile)
 	if err != nil {
 		t.Fatalf("Failed to read file: %v", err)
 	}
@@ -172,17 +181,17 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 
 	// Now, let's add one more client to get "ABBA" as expected
 	// C3 acquires lock
-	acquireResp4, err := server.LockAcquire(context.Background(), &proto.LockArgs{
+	acquireResp4, err := server.LockAcquire(context.Background(), &pb.LockArgs{
 		ClientId:  3,
 		RequestId: "req-acquire-c3",
 	})
-	if err != nil || acquireResp4.Status != proto.Status_OK {
+	if err != nil || acquireResp4.Status != pb.Status_OK {
 		t.Fatalf("C3 failed to acquire lock: %v, status: %v", err, acquireResp4.Status)
 	}
 	tokenT4 := acquireResp4.Token
 
 	// C3 appends 'B' to the file
-	_, err = server.FileAppend(context.Background(), &proto.FileArgs{
+	_, err = server.FileAppend(context.Background(), &pb.FileArgs{
 		ClientId:  3,
 		Token:     tokenT4,
 		Filename:  testFile,
@@ -194,7 +203,7 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 	}
 
 	// C3 releases the lock
-	_, err = server.LockRelease(context.Background(), &proto.LockArgs{
+	_, err = server.LockRelease(context.Background(), &pb.LockArgs{
 		ClientId:  3,
 		Token:     tokenT4,
 		RequestId: "req-release-c3",
@@ -204,7 +213,7 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 	}
 
 	// Verify the file contents again
-	content, err = os.ReadFile("data/" + testFile)
+	content, err = os.ReadFile("data_server_3/data/" + testFile)
 	if err != nil {
 		t.Fatalf("Failed to read file: %v", err)
 	}
@@ -217,4 +226,107 @@ func TestDuplicatedReleasePacket(t *testing.T) {
 
 	// Clean up
 	fm.Cleanup()
+}
+
+// TestServerInfo tests the ServerInfo method with different address formats
+func TestServerInfo(t *testing.T) {
+	tests := []struct {
+		name        string
+		serverAddr  string
+		leaderState bool
+		wantHost    bool
+	}{
+		{
+			name:        "Leader with full address",
+			serverAddr:  "example.com:50051",
+			leaderState: true,
+			wantHost:    true,
+		},
+		{
+			name:        "Leader with port-only address",
+			serverAddr:  ":50051",
+			leaderState: true,
+			wantHost:    true,
+		},
+		{
+			name:        "Follower with known leader",
+			serverAddr:  "follower:50052",
+			leaderState: false,
+			wantHost:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a server instance for testing
+			logger := log.New(io.Discard, "[TestServerInfo] ", log.LstdFlags)
+			lm := lock_manager.NewLockManagerWithLeaseDuration(logger, 30*time.Second)
+			fm := file_manager.NewFileManagerWithWAL(false, false, lm)
+
+			s := &LockServer{
+				lockManager:      lm,
+				fileManager:      fm,
+				logger:           logger,
+				selfAddress:      tt.serverAddr,
+				serverID:         1,
+				peerAddresses:    []string{"peer1:50051", "peer2:50052"},
+				currentEpoch:     atomic.Int64{},
+				serverState:      atomic.Value{},
+				replicationQueue: make([]*pb.ReplicatedState, 0),
+				peerClients:      make(map[string]pb.LockServiceClient),
+			}
+
+			// Set the server state
+			if tt.leaderState {
+				s.serverState.Store(LeaderState)
+			} else {
+				s.serverState.Store(FollowerState)
+				// Set a leader address for follower tests
+				s.setLeaderAddress("knownleader:50053")
+			}
+
+			// Call ServerInfo
+			resp, err := s.ServerInfo(context.Background(), &pb.ServerInfoRequest{})
+
+			// Check the response
+			if err != nil {
+				t.Errorf("ServerInfo() error = %v", err)
+				return
+			}
+
+			if resp.ServerId != s.serverID {
+				t.Errorf("ServerInfo() ServerId = %v, want %v", resp.ServerId, s.serverID)
+			}
+
+			if tt.leaderState && resp.Role != string(LeaderState) {
+				t.Errorf("ServerInfo() Role = %v, want %v", resp.Role, LeaderState)
+			}
+
+			if !tt.leaderState && resp.Role != string(FollowerState) {
+				t.Errorf("ServerInfo() Role = %v, want %v", resp.Role, FollowerState)
+			}
+
+			// Check leader address format
+			if resp.LeaderAddress == "" {
+				t.Errorf("ServerInfo() LeaderAddress is empty")
+			}
+
+			if tt.wantHost {
+				if !strings.Contains(resp.LeaderAddress, ":") {
+					t.Errorf("ServerInfo() LeaderAddress = %v, missing host:port format", resp.LeaderAddress)
+				}
+
+				host, _, err := net.SplitHostPort(resp.LeaderAddress)
+				if err != nil {
+					t.Errorf("ServerInfo() LeaderAddress = %v is not valid host:port format: %v", resp.LeaderAddress, err)
+				}
+
+				if tt.leaderState && tt.serverAddr == ":50051" && host == "" {
+					t.Errorf("ServerInfo() LeaderAddress = %v has empty host, expected non-empty host", resp.LeaderAddress)
+				}
+			}
+
+			t.Logf("ServerInfo() returned LeaderAddress = %v", resp.LeaderAddress)
+		})
+	}
 }
