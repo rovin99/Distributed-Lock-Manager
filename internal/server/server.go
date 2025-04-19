@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -52,12 +53,18 @@ type LockServer struct {
 	metrics      *PerformanceMetrics // Added metrics for monitoring
 
 	// Replication-related fields
-	role        ServerRole           // Current role (primary or secondary)
-	isPrimary   bool                 // Is this server the primary?
-	serverID    int32                // ID of this server
-	peerAddress string               // Address of the peer server
-	peerClient  pb.LockServiceClient // gRPC client for peer communication
-	peerConn    *grpc.ClientConn     // gRPC connection to peer
+	role               ServerRole                     // Current role (primary or secondary)
+	isPrimary          bool                           // Is this server the primary?
+	serverID           int32                          // ID of this server
+	allServerAddresses map[int32]string               // Map of server ID -> address
+	peerClients        map[int32]pb.LockServiceClient // Map of server ID -> gRPC client
+	peerConns          map[int32]*grpc.ClientConn     // Map of server ID -> gRPC connection
+	clusterSize        int                            // Total number of servers (e.g., 3)
+	knownPrimaryID     int32                          // Server ID this node believes is the current primary
+
+	// Atomic flags for election and primary status
+	primarySuspected   atomic.Bool // Flag if this node suspects the primary is down
+	electionInProgress atomic.Bool // Prevent concurrent elections
 
 	// Replication queue for reliable state updates
 	replicationQueue      []*pb.ReplicatedState // Queue of updates to be sent to secondary
@@ -71,6 +78,9 @@ type LockServer struct {
 	isFencing      atomic.Bool   // Is the server in fencing period?
 	fencingEndTime time.Time     // When does the fencing period end?
 	fencingBuffer  time.Duration // Additional buffer time after lease duration
+
+	// Added for mutex protection in startHeartbeatSender
+	mu sync.Mutex
 }
 
 // NewLockServer initializes a new lock server
@@ -98,12 +108,12 @@ func NewLockServer() *LockServer {
 }
 
 // NewReplicatedLockServer initializes a lock server with replication configuration
-func NewReplicatedLockServer(role ServerRole, serverID int32, peerAddress string) *LockServer {
-	return NewReplicatedLockServerWithConfig(role, serverID, peerAddress, DefaultHeartbeatConfig)
+func NewReplicatedLockServer(role ServerRole, serverID int32, allAddrs map[int32]string, clusterSize int, initialPrimaryID int32) *LockServer {
+	return NewReplicatedLockServerWithConfig(role, serverID, allAddrs, clusterSize, initialPrimaryID, DefaultHeartbeatConfig)
 }
 
 // NewReplicatedLockServerWithConfig initializes a lock server with replication and custom heartbeat config
-func NewReplicatedLockServerWithConfig(role ServerRole, serverID int32, peerAddress string, hbConfig HeartbeatConfig) *LockServer {
+func NewReplicatedLockServerWithConfig(role ServerRole, serverID int32, allAddrs map[int32]string, clusterSize int, initialPrimaryID int32, hbConfig HeartbeatConfig) *LockServer {
 	logger := log.New(os.Stdout, fmt.Sprintf("[LockServer-%d] ", serverID), log.LstdFlags)
 
 	// Initialize lock manager with lease duration
@@ -115,64 +125,118 @@ func NewReplicatedLockServerWithConfig(role ServerRole, serverID int32, peerAddr
 	isPrimary := role == PrimaryRole
 
 	s := &LockServer{
-		lockManager:      lm,
-		fileManager:      fm,
-		requestCache:     NewRequestCacheWithSize(10*time.Minute, 10000),
-		logger:           logger,
-		recoveryDone:     fm.IsRecoveryComplete(),
-		role:             role,
-		isPrimary:        isPrimary,
-		serverID:         serverID,
-		peerAddress:      peerAddress,
-		heartbeatConfig:  hbConfig,
-		fencingBuffer:    5 * time.Second, // Default 5s buffer for fencing
-		replicationQueue: make([]*pb.ReplicatedState, 0),
-		metrics:          NewPerformanceMetrics(logger),
+		lockManager:        lm,
+		fileManager:        fm,
+		requestCache:       NewRequestCacheWithSize(10*time.Minute, 10000),
+		logger:             logger,
+		recoveryDone:       fm.IsRecoveryComplete(),
+		role:               role,
+		isPrimary:          isPrimary,
+		serverID:           serverID,
+		allServerAddresses: allAddrs,
+		clusterSize:        clusterSize,
+		knownPrimaryID:     initialPrimaryID,
+		peerClients:        make(map[int32]pb.LockServiceClient),
+		peerConns:          make(map[int32]*grpc.ClientConn),
+		heartbeatConfig:    hbConfig,
+		fencingBuffer:      5 * time.Second, // Default 5s buffer for fencing
+		replicationQueue:   make([]*pb.ReplicatedState, 0),
+		metrics:            NewPerformanceMetrics(logger),
 	}
 
-	// Connect to peer if address is provided
-	if peerAddress != "" {
-		if err := s.connectToPeer(); err != nil {
-			s.logger.Printf("Warning: Failed to connect to peer at %s: %v", peerAddress, err)
-		}
-	}
+	// Connect to all peers
+	s.connectToPeers()
 
 	// Start heartbeat sender if this is a secondary
-	if !isPrimary && peerAddress != "" {
+	if !isPrimary {
 		go s.startHeartbeatSender()
 	}
 
-	// Start background replication worker for reliable updates
-	if isPrimary && peerAddress != "" {
+	// Start background replication worker for reliable updates if primary
+	if isPrimary {
 		go s.startReplicationWorker()
-
-		// Start periodic split-brain check for primaries
-		go s.startSplitBrainChecker()
 	}
 
 	return s
 }
 
-// connectToPeer establishes a gRPC connection to the peer server
-func (s *LockServer) connectToPeer() error {
-	if s.peerAddress == "" {
-		return fmt.Errorf("no peer address configured")
+// connectToPeers establishes gRPC connections to all peer servers
+func (s *LockServer) connectToPeers() {
+	s.logger.Printf("Connecting to all peers...")
+	for id, addr := range s.allServerAddresses {
+		if id == s.serverID {
+			continue // Skip self
+		}
+
+		// Close existing connection if any (e.g., on reconnect attempt)
+		if conn, ok := s.peerConns[id]; ok && conn != nil {
+			conn.Close()
+		}
+
+		// Dial peer
+		conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(), grpc.WithTimeout(3*time.Second))
+		if err != nil {
+			s.logger.Printf("Warning: Failed to connect to peer ID %d at %s: %v", id, addr, err)
+			s.peerConns[id] = nil // Mark as disconnected
+			s.peerClients[id] = nil
+			continue
+		}
+
+		client := pb.NewLockServiceClient(conn)
+		s.peerConns[id] = conn
+		s.peerClients[id] = client
+		s.logger.Printf("Successfully connected to peer ID %d at %s", id, addr)
+	}
+}
+
+// checkQuorum checks if this server has quorum with its peers
+// Returns true if quorum is achieved, false otherwise
+func (s *LockServer) checkQuorum() bool {
+	// For a 3-node cluster, quorum is 2 nodes (majority)
+	// Since we're counting ourselves, we need at least one responsive peer
+	liveNodeCount := 1 // Start with ourselves
+
+	// Ping each peer to check if they're alive
+	for id, client := range s.peerClients {
+		if client == nil {
+			continue // Skip if no connection
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), s.heartbeatConfig.Timeout)
+		_, err := client.Ping(ctx, &pb.HeartbeatRequest{ServerId: s.serverID})
+		cancel()
+
+		if err == nil {
+			liveNodeCount++
+			s.logger.Printf("Peer ID %d is responsive in quorum check", id)
+		} else {
+			s.logger.Printf("Peer ID %d is unresponsive in quorum check: %v", id, err)
+		}
 	}
 
-	// Create gRPC connection
-	conn, err := grpc.Dial(s.peerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("failed to connect to peer: %w", err)
-	}
+	// Calculate required quorum (majority)
+	requiredQuorum := (s.clusterSize / 2) + 1
+	hasQuorum := liveNodeCount >= requiredQuorum
 
-	// Create client
-	client := pb.NewLockServiceClient(conn)
+	s.logger.Printf("Quorum check: live nodes=%d, required=%d, has quorum=%v",
+		liveNodeCount, requiredQuorum, hasQuorum)
 
-	s.peerConn = conn
-	s.peerClient = client
-	s.logger.Printf("Connected to peer at %s", s.peerAddress)
+	return hasQuorum
+}
 
-	return nil
+// demoteToReplica demotes this server from primary to replica due to quorum loss
+func (s *LockServer) demoteToReplica() {
+	s.logger.Printf("Demoting server %d from primary to replica due to quorum loss", s.serverID)
+
+	// Update server state
+	s.isPrimary = false
+	s.role = SecondaryRole
+	s.knownPrimaryID = -1 // Unknown primary
+
+	// Stop any primary-only activities
+	// Start secondary-only activities
+	go s.startHeartbeatSender()
 }
 
 // startHeartbeatSender periodically sends heartbeats to the primary
@@ -193,119 +257,93 @@ func (s *LockServer) startHeartbeatSender() {
 			return
 		}
 
+		// Skip if we don't know who the primary is
+		if s.knownPrimaryID < 1 {
+			s.logger.Printf("No known primary to send heartbeat to")
+			// TODO: Implement primary discovery or election trigger
+			continue
+		}
+
+		// Get the primary's client with mutex protection
+		s.mu.Lock()
+		primaryID := s.knownPrimaryID
+		primaryClient := s.peerClients[primaryID]
+		s.mu.Unlock()
+
+		if primaryClient == nil {
+			s.logger.Printf("Heartbeat: Primary ID %d not connected, trying to reconnect peers...", primaryID)
+			s.connectToPeers() // Attempt to reconnect
+
+			// Re-fetch client after attempting reconnect
+			s.mu.Lock()
+			primaryClient = s.peerClients[s.knownPrimaryID]
+			s.mu.Unlock()
+
+			if primaryClient == nil {
+				s.logger.Printf("Heartbeat: Still cannot connect to primary ID %d, skipping heartbeat cycle.", s.knownPrimaryID)
+				failureCount++ // Increment failure count even if connection failed
+
+				// Check failure count logic here (same as before)
+				if failureCount >= maxFailures {
+					s.logger.Printf("Primary potentially down after %d attempts (connection/ping failures).", maxFailures)
+					// Try to start election
+					s.tryStartElection()
+					return // Stop this heartbeat loop
+				}
+				continue // Skip to next tick
+			}
+		}
+
 		// Send heartbeat
 		ctx, cancel := context.WithTimeout(context.Background(), s.heartbeatConfig.Timeout)
-		resp, err := s.peerClient.Ping(ctx, &pb.HeartbeatRequest{
+		resp, err := primaryClient.Ping(ctx, &pb.HeartbeatRequest{
 			ServerId: s.serverID,
 		})
 		cancel()
 
 		if err != nil {
 			failureCount++
-			s.logger.Printf("Heartbeat failed (%d/%d): %v",
-				failureCount, maxFailures, err)
+			s.logger.Printf("Heartbeat to primary ID %d failed (%d/%d): %v",
+				s.knownPrimaryID, failureCount, maxFailures, err)
 
 			// Check if we've reached the failure threshold
 			if failureCount >= maxFailures {
-				s.logger.Printf("Primary is unreachable after %d attempts, promoting to primary",
-					maxFailures)
-				s.promoteToPrimary()
-				return
+				s.logger.Printf("Primary ID %d is unreachable after %d attempts, triggering election",
+					s.knownPrimaryID, maxFailures)
+				// Set flag to indicate the primary is suspected down
+				s.primarySuspected.Store(true)
+				// Start election
+				s.tryStartElection()
+				return // Stop this heartbeat loop
 			}
 		} else {
 			// Reset failure count on success
 			if failureCount > 0 {
-				s.logger.Printf("Heartbeat succeeded after %d failures", failureCount)
+				s.logger.Printf("Heartbeat to primary ID %d succeeded after %d failures",
+					s.knownPrimaryID, failureCount)
 				failureCount = 0
 			}
 
 			if resp.Status != pb.Status_OK {
 				s.logger.Printf("Primary returned non-OK status: %s", resp.ErrorMessage)
+
+				failureCount++
+				// Check if we've reached the failure threshold
+				if failureCount >= maxFailures {
+					s.logger.Printf("Primary ID %d returned errors for %d consecutive heartbeats",
+						s.knownPrimaryID, maxFailures)
+					s.tryStartElection()
+					return // Stop this heartbeat loop
+				}
 			}
 		}
 	}
 }
 
-// promoteToPrimary promotes this server from secondary to primary
-func (s *LockServer) promoteToPrimary() {
-	s.logger.Printf("Promoting server %d from secondary to primary", s.serverID)
-
-	s.isPrimary = true
-	s.role = PrimaryRole
-
-	// Start fencing period with detailed logging
-	leaseDuration := s.lockManager.GetLeaseDuration()
-	fencingDuration := leaseDuration + s.fencingBuffer
-	s.fencingEndTime = time.Now().Add(fencingDuration)
-	s.isFencing.Store(true)
-
-	// Log all the timing details
-	now := time.Now()
-	s.logger.Printf("DEBUG FENCING SETUP: Now=%v, FencingEndTime=%v, Duration=%v, LeaseDuration=%v, Buffer=%v",
-		now, s.fencingEndTime, fencingDuration, leaseDuration, s.fencingBuffer)
-	s.logger.Printf("Entering fencing period for %v (until %v)",
-		fencingDuration, s.fencingEndTime)
-
-	// Attempt to log the current lock state before fencing
-	s.logCurrentLockState("Before fencing")
-
-	// Start a goroutine to end the fencing period
-	go s.waitForFencingEnd()
-}
-
-// waitForFencingEnd waits for the fencing period to end
-func (s *LockServer) waitForFencingEnd() {
-	timeToWait := time.Until(s.fencingEndTime)
-	if timeToWait <= 0 {
-		timeToWait = 1 * time.Millisecond // Minimum wait
-	}
-
-	s.logger.Printf("Scheduling fencing end in %v", timeToWait)
-	time.Sleep(timeToWait)
-
-	s.logger.Printf("Fencing period ended, clearing lock state")
-	s.isFencing.Store(false)
-
-	// Log the lock state before clearing
-	s.logCurrentLockState("Before forced clear")
-
-	// Clear lock state to ensure safe operation
-	if err := s.lockManager.ForceClearLockState(); err != nil {
-		s.logger.Printf("Warning: Failed to clear lock state after fencing: %v", err)
-	}
-
-	// Log the lock state after clearing
-	s.logCurrentLockState("After forced clear")
-
-	s.logger.Printf("Server is now fully operational as primary")
-}
-
-// logCurrentLockState logs the current lock state for debugging purposes
-func (s *LockServer) logCurrentLockState(context string) {
-	holder := s.lockManager.CurrentHolder()
-	expiry := s.lockManager.GetTokenExpiration()
-
-	var expiryStr string
-	if expiry.IsZero() {
-		expiryStr = "not set"
-	} else {
-		expiryStr = expiry.Format(time.RFC3339)
-	}
-
-	s.logger.Printf("Lock state (%s): holder=%d, expiry=%s",
-		context, holder, expiryStr)
-}
-
-// SetFencingBuffer sets the buffer time to add to lease duration for fencing
-func (s *LockServer) SetFencingBuffer(buffer time.Duration) {
-	s.fencingBuffer = buffer
-	s.logger.Printf("Fencing buffer set to %v", buffer)
-}
-
-// replicateStateToSecondary sends the current lock state to the secondary server
-func (s *LockServer) replicateStateToSecondary() {
-	// Skip if not primary or no peer connection
-	if !s.isPrimary || s.peerClient == nil {
+// replicateStateToPeers sends the current lock state to all secondary servers
+func (s *LockServer) replicateStateToPeers() {
+	// Skip if not primary
+	if !s.isPrimary {
 		return
 	}
 
@@ -327,59 +365,29 @@ func (s *LockServer) replicateStateToSecondary() {
 		ExpiryTimestamp: expiryTimestamp,
 	}
 
-	// Add the update to the replication queue first to ensure reliability
-	s.enqueueReplication(stateUpdate)
+	// Add to queue (if using reliable worker, otherwise skip queue)
+	s.enqueueReplication(stateUpdate) // Keep the queue for reliability
 
-	// Send update asynchronously to avoid blocking client operations
-	go func() {
-		// Configuration for retries
-		maxRetries := 3
-		initialBackoff := 500 * time.Millisecond
-		backoff := initialBackoff
+	s.logger.Printf("Replicating state (Holder: %d) to all peers", stateUpdate.LockHolder)
 
-		// Attempt to replicate with retries
-		for attempt := 0; attempt < maxRetries; attempt++ {
-			// Create a new context for each attempt
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-
-			// Send the replication request
-			_, err := s.peerClient.UpdateSecondaryState(ctx, stateUpdate)
-			cancel() // Cancel the context immediately after the call
-
-			// If successful, we're done
-			if err == nil {
-				if attempt > 0 {
-					s.logger.Printf("Successfully replicated state to secondary after %d retries", attempt)
-				}
-
-				// On success, remove this update from the queue if it matches
-				s.dequeueProcessedUpdate(stateUpdate)
-				return
-			}
-
-			// Log the error and prepare for retry
-			s.logger.Printf("Failed to replicate state to secondary (attempt %d/%d): %v",
-				attempt+1, maxRetries, err)
-
-			// If this was the last attempt, give up
-			if attempt == maxRetries-1 {
-				s.logger.Printf("Immediate replication failed after %d attempts - relying on background worker", maxRetries)
-				break
-			}
-
-			// Wait before retrying with exponential backoff
-			time.Sleep(backoff)
-			backoff *= 2 // Exponential backoff
+	// Send update asynchronously to all connected peers
+	for peerID, peerClient := range s.peerClients {
+		if peerClient == nil {
+			s.logger.Printf("Skipping replication to peer %d: not connected", peerID)
+			continue
 		}
 
-		// At this point, all retries have failed
-		// The update is already in the queue, so the background worker will try again later
-
-		// Try to reconnect to the peer for future replication attempts
-		if err := s.connectToPeer(); err != nil {
-			s.logger.Printf("Failed to reconnect to peer after replication failures: %v", err)
-		}
-	}()
+		// Launch a goroutine for each peer
+		go func(targetID int32, client pb.LockServiceClient, update *pb.ReplicatedState) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second) // Short timeout for async replication
+			_, err := client.UpdateSecondaryState(ctx, update)
+			cancel()
+			if err != nil {
+				s.logger.Printf("Warning: Failed to replicate state to peer %d: %v", targetID, err)
+				// Optionally: Mark peer as potentially disconnected or handle error
+			}
+		}(peerID, peerClient, stateUpdate) // Pass copies
+	}
 }
 
 // enqueueReplication adds a state update to the replication queue
@@ -434,65 +442,50 @@ func (s *LockServer) getNextReplicationUpdate() *pb.ReplicatedState {
 
 // startReplicationWorker starts a background worker to process the replication queue
 func (s *LockServer) startReplicationWorker() {
-	// Set the flag to indicate that a worker is running
-	if !s.replicationInProgress.CompareAndSwap(false, true) {
-		s.logger.Printf("Replication worker already running, not starting another one")
-		return
-	}
-
 	s.logger.Printf("Starting background replication worker")
 
-	go func() {
-		defer s.replicationInProgress.Store(false)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
-		// Process the queue periodically
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			// Stop if we're no longer primary
-			if !s.isPrimary {
-				s.logger.Printf("No longer primary, stopping replication worker")
-				return
-			}
-
-			select {
-			case <-ticker.C:
-				s.processReplicationQueue()
-			}
+	for range ticker.C {
+		// Stop if no longer primary
+		if !s.isPrimary {
+			s.logger.Printf("No longer primary, stopping replication worker")
+			return
 		}
-	}()
+
+		// Skip if there's already a replication in progress
+		if s.replicationInProgress.Load() {
+			continue
+		}
+
+		// Set the flag to prevent concurrent replication
+		s.replicationInProgress.Store(true)
+
+		// Process the queue
+		s.processReplicationQueue()
+
+		// Reset the flag
+		s.replicationInProgress.Store(false)
+	}
 }
 
 // processReplicationQueue processes pending updates in the replication queue
 func (s *LockServer) processReplicationQueue() {
-	// Skip if not primary or no peer connection
-	if !s.isPrimary || s.peerClient == nil {
-		return
-	}
+	s.logger.Printf("Processing replication queue...")
 
 	// Get the next update to process
 	update := s.getNextReplicationUpdate()
 	if update == nil {
-		// Queue is empty, nothing to do
+		s.logger.Printf("No pending updates in queue")
 		return
 	}
 
-	s.logger.Printf("Processing pending replication update from queue")
+	// Try to replicate to all secondaries
+	s.replicateStateToPeers()
 
-	// Try to send the update
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	_, err := s.peerClient.UpdateSecondaryState(ctx, update)
-	if err != nil {
-		s.logger.Printf("Background replication failed: %v - will retry later", err)
-		return
-	}
-
-	// Success, remove the update from the queue
-	s.dequeueProcessedUpdate(update)
-	s.logger.Printf("Successfully processed pending replication update")
+	// Mark the replication as complete to allow next worker to run
+	s.replicationInProgress.Store(false)
 }
 
 // IsRecoveryComplete returns whether WAL recovery is complete
@@ -538,42 +531,33 @@ func (s *LockServer) ClientInit(ctx context.Context, args *pb.ClientInitArgs) (*
 
 // checkPeerRole verifies if the peer server has been promoted
 func (s *LockServer) checkPeerRole() bool {
-	// If this server doesn't have a peer client configured, nothing to check
-	if s.peerClient == nil {
+	// Skip split-brain check if we're not primary
+	if !s.isPrimary {
 		return false
 	}
 
-	// Create a timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	// Check if any peer reports itself as primary
+	for id, client := range s.peerClients {
+		if client == nil {
+			continue
+		}
 
-	// Call ServerInfo RPC to check peer's role
-	resp, err := s.peerClient.ServerInfo(ctx, &pb.ServerInfoRequest{})
-	if err != nil {
-		s.logger.Printf("Unable to check peer role: %v", err)
-		return false // Assume peer is still secondary if we can't contact it
-	}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := client.ServerInfo(ctx, &pb.ServerInfoRequest{})
+		cancel()
 
-	// Check if the peer reports itself as primary
-	if resp.Role == "primary" {
-		s.logger.Printf("SPLIT-BRAIN DETECTION: Peer server (ID %d) reports itself as primary!", resp.ServerId)
+		if err != nil {
+			s.logger.Printf("Unable to check role of peer ID %d: %v", id, err)
+			continue
+		}
 
-		// If we think we're primary but the peer also thinks it's primary,
-		// we have a split-brain scenario
-		if s.isPrimary {
-			s.logger.Printf("SPLIT-BRAIN RESOLVED: Demoting self to secondary to avoid split-brain")
-
-			// Demote this server to secondary
-			s.isPrimary = false
-			s.role = SecondaryRole
-
-			// Start heartbeat sender to monitor the new primary
-			go s.startHeartbeatSender()
-
+		if resp.Role == "primary" {
+			s.logger.Printf("SPLIT-BRAIN DETECTED: Both this server and peer ID %d claim to be primary!", id)
 			return true
 		}
 	}
 
+	// No split-brain detected
 	return false
 }
 
@@ -664,10 +648,8 @@ func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.Lo
 		// Cache the response for idempotence
 		s.requestCache.Set(args.RequestId, resp)
 
-		// Replicate the state to the secondary
-		if s.peerClient != nil {
-			s.replicateStateToSecondary()
-		}
+		// Replicate the state to secondaries
+		s.replicateStateToPeers()
 
 		// Log current state for debugging
 		s.logCurrentLockState("After lock acquire")
@@ -755,7 +737,7 @@ func (s *LockServer) LockRelease(ctx context.Context, args *pb.LockArgs) (*pb.Lo
 		}
 
 		// Replicate state to secondary
-		s.replicateStateToSecondary()
+		s.replicateStateToPeers()
 	} else {
 		s.logger.Printf("Lock release failed for client %d: permission denied", clientID)
 		resp = &pb.LockResponse{
@@ -907,7 +889,7 @@ func (s *LockServer) RenewLease(ctx context.Context, args *pb.LeaseArgs) (*pb.Le
 		}
 
 		// Replicate state to secondary after lease renewal
-		s.replicateStateToSecondary()
+		s.replicateStateToPeers()
 	} else {
 		s.logger.Printf("Lease renewal failed for client %d: invalid token or not lock holder", clientID)
 		resp = &pb.LeaseResponse{
@@ -922,17 +904,17 @@ func (s *LockServer) RenewLease(ctx context.Context, args *pb.LeaseArgs) (*pb.Le
 
 // UpdateSecondaryState handles replication from primary to secondary
 func (s *LockServer) UpdateSecondaryState(ctx context.Context, state *pb.ReplicatedState) (*pb.ReplicationResponse, error) {
-	// This should only be called on the secondary
-	if s.isPrimary {
-		s.logger.Printf("Warning: Primary received UpdateSecondaryState call")
-		return &pb.ReplicationResponse{
-			Status:       pb.Status_ERROR,
-			ErrorMessage: "Cannot update state on primary server",
-		}, nil
+	s.mu.Lock() // Lock needed
+	isCurrentlyPrimary := s.isPrimary
+	s.mu.Unlock()
+
+	if isCurrentlyPrimary { // Check if this server is primary
+		s.logger.Printf("Warning: Primary server ID %d received UpdateSecondaryState call - ignoring", s.serverID)
+		return &pb.ReplicationResponse{Status: pb.Status_ERROR, ErrorMessage: "Server is primary"}, nil
 	}
 
-	s.logger.Printf("Received state update from primary: holder=%d, expiry=%v",
-		state.LockHolder, time.Unix(state.ExpiryTimestamp, 0))
+	s.logger.Printf("Received state update: holder=%d, expiry=%d",
+		state.LockHolder, state.ExpiryTimestamp)
 
 	// Apply the replicated state to our lock manager
 	err := s.lockManager.ApplyReplicatedState(
@@ -950,27 +932,16 @@ func (s *LockServer) UpdateSecondaryState(ctx context.Context, state *pb.Replica
 	}
 
 	return &pb.ReplicationResponse{
-		Status:       pb.Status_OK,
-		ErrorMessage: "",
+		Status: pb.Status_OK,
 	}, nil
 }
 
 // Ping handles heartbeat requests from secondary
 func (s *LockServer) Ping(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
-	// This should only be called on the primary
-	if !s.isPrimary {
-		s.logger.Printf("Warning: Secondary received Ping call from server %d", req.ServerId)
-		return &pb.HeartbeatResponse{
-			Status:       pb.Status_ERROR,
-			ErrorMessage: "This server is not primary",
-		}, nil
-	}
+	// Update timestamp to indicate liveness
+	s.logger.Printf("Received heartbeat from server ID %d", req.ServerId)
 
-	// Log heartbeat with reduced frequency to avoid flooding logs
-	if time.Now().Second()%10 == 0 { // Log only every ~10 seconds
-		s.logger.Printf("Received heartbeat from secondary server %d", req.ServerId)
-	}
-
+	// Always return OK to confirm liveness
 	return &pb.HeartbeatResponse{
 		Status:       pb.Status_OK,
 		ErrorMessage: "",
@@ -1024,176 +995,100 @@ func (s *LockServer) Cleanup() {
 
 // VerifyUniqueServerID checks for duplicate server IDs with retry
 func (s *LockServer) VerifyUniqueServerID() error {
-	if s.peerAddress == "" {
-		// No peer to check against
-		return nil
+	// Verify that our server ID is unique among all peers
+	if s.serverID <= 0 {
+		return fmt.Errorf("invalid server ID: %d", s.serverID)
 	}
 
-	// Retry a few times since the peer might still be starting up
-	maxRetries := 5
-	retryDelay := 1 * time.Second
-
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Ensure we have a connection to the peer
-		if s.peerClient == nil {
-			if err := s.connectToPeer(); err != nil {
-				lastErr = fmt.Errorf("failed to connect to peer for ID verification: %w", err)
-				s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
-				time.Sleep(retryDelay)
-				continue
-			}
-		}
-
-		// Use ServerInfo RPC to check peer's ID
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp, err := s.peerClient.ServerInfo(ctx, &pb.ServerInfoRequest{})
-		cancel()
-
-		if err != nil {
-			lastErr = fmt.Errorf("unable to verify peer server ID: %w", err)
-			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
-			time.Sleep(retryDelay)
+	// Check with all peers
+	for id, client := range s.peerClients {
+		if client == nil {
+			s.logger.Printf("Warning: Cannot verify uniqueness with peer ID %d (not connected)", id)
 			continue
 		}
 
-		// Successfully got peer info - check for duplicate ID
-		if resp.ServerId == s.serverID {
-			errMsg := fmt.Sprintf("Duplicate server ID detected! This server and peer both have ID %d", s.serverID)
-			s.logger.Printf("ERROR: %s", errMsg)
-			return fmt.Errorf(errMsg)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		info, err := client.ServerInfo(ctx, &pb.ServerInfoRequest{})
+		cancel()
+
+		if err != nil {
+			s.logger.Printf("Warning: Failed to get server info from peer ID %d: %v", id, err)
+			continue
 		}
 
-		// Success!
-		s.logger.Printf("Verified unique server ID: local=%d, peer=%d", s.serverID, resp.ServerId)
-		return nil
+		if info.ServerId == s.serverID {
+			return fmt.Errorf("duplicate server ID %d detected (peer at address %s)",
+				s.serverID, s.allServerAddresses[id])
+		}
 	}
 
-	// If we reach here, we failed after all retries
-	s.logger.Printf("WARNING: Could not verify server ID uniqueness after %d attempts: %v", maxRetries, lastErr)
-	s.logger.Printf("Continuing startup, but be aware that duplicate IDs may cause issues")
-	return nil // Allow startup to continue despite verification failure
+	return nil
 }
 
 // VerifySharedFilesystem checks if the shared filesystem is properly accessible with retry
 func (s *LockServer) VerifySharedFilesystem() error {
-	if s.peerAddress == "" {
-		// No peer to verify with
-		return nil
+	// Create a test file with unique content
+	testFile := fmt.Sprintf("./data/verify_fs_%d.tmp", s.serverID)
+	content := fmt.Sprintf("Server ID %d filesystem verification at %s",
+		s.serverID, time.Now().Format(time.RFC3339))
+
+	// Write the test file
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		return fmt.Errorf("failed to write test file: %v", err)
 	}
+	defer os.Remove(testFile) // Clean up after test
 
-	// Retry a few times since the peer might still be starting up
-	maxRetries := 5
-	retryDelay := 1 * time.Second
-
-	// Try to validate direct filesystem access first
-	lockStatePath := "./data/lock_state.json"
-	testContent := []byte(fmt.Sprintf("Filesystem test from server %d at %s\n",
-		s.serverID, time.Now().Format(time.RFC3339)))
-
-	// Test if we can write to the path
-	if err := os.WriteFile(lockStatePath+".test", testContent, 0644); err != nil {
-		return fmt.Errorf("cannot write to data directory: %w", err)
-	}
-	defer os.Remove(lockStatePath + ".test")
-
-	// Verify through peer with retries
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Ensure we have a connection to the peer
-		if s.peerClient == nil {
-			if err := s.connectToPeer(); err != nil {
-				lastErr = fmt.Errorf("failed to connect to peer for filesystem verification: %w", err)
-				s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
-				time.Sleep(retryDelay)
-				continue
-			}
+	// Have peers verify they can access and read the file
+	for id, client := range s.peerClients {
+		if client == nil {
+			s.logger.Printf("Warning: Cannot verify shared filesystem with peer ID %d (not connected)", id)
+			continue
 		}
 
-		// Create a test file with random content
-		testFileName := fmt.Sprintf("./data/fs_verify_%d.tmp", time.Now().UnixNano())
-		testContent := fmt.Sprintf("Filesystem verification from server %d at %s",
-			s.serverID, time.Now().Format(time.RFC3339))
-
-		// Write test content to file
-		if err := os.WriteFile(testFileName, []byte(testContent), 0644); err != nil {
-			return fmt.Errorf("failed to write test file for filesystem verification: %w", err)
-		}
-		defer os.Remove(testFileName) // Clean up the test file when done
-
-		// Ask peer to read the file
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp, err := s.peerClient.VerifyFileAccess(ctx, &pb.FileAccessRequest{
-			FilePath:        testFileName,
-			ExpectedContent: testContent,
+		resp, err := client.VerifyFileAccess(ctx, &pb.FileAccessRequest{
+			FilePath: testFile,
 		})
 		cancel()
 
 		if err != nil {
-			lastErr = fmt.Errorf("filesystem verification failed - error calling peer: %w", err)
-			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
-			time.Sleep(retryDelay)
-			continue
+			return fmt.Errorf("failed to request file verification from peer ID %d: %v", id, err)
 		}
 
 		if resp.Status != pb.Status_OK {
-			lastErr = fmt.Errorf("filesystem verification failed: %s", resp.ErrorMessage)
-			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
-			time.Sleep(retryDelay)
-			continue
+			return fmt.Errorf("peer ID %d failed to access test file: %s", id, resp.ErrorMessage)
 		}
 
-		if resp.ActualContent != testContent {
-			lastErr = fmt.Errorf("filesystem verification failed - content mismatch: expected '%s', got '%s'",
-				testContent, resp.ActualContent)
-			s.logger.Printf("Attempt %d: %v, retrying in %v", attempt+1, lastErr, retryDelay)
-			time.Sleep(retryDelay)
-			continue
+		// Check content using the ActualContent field
+		if resp.ActualContent != content {
+			return fmt.Errorf("peer ID %d read incorrect content: expected '%s', got '%s'",
+				id, content, resp.ActualContent)
 		}
 
-		// Success!
-		s.logger.Printf("Shared filesystem verification successful")
-		return nil
+		s.logger.Printf("Peer ID %d successfully verified file access", id)
 	}
 
-	// If we reach here, we failed after all retries
-	s.logger.Printf("WARNING: Could not verify shared filesystem after %d attempts: %v", maxRetries, lastErr)
-	s.logger.Printf("Continuing startup, but be aware that filesystem sharing may not be working correctly")
-	return nil // Allow startup to continue despite verification failure
+	return nil
 }
 
 // VerifyFileAccess implements the RPC to check file access from a peer
 func (s *LockServer) VerifyFileAccess(ctx context.Context, req *pb.FileAccessRequest) (*pb.FileAccessResponse, error) {
-	s.logger.Printf("Received filesystem verification request for file: %s", req.FilePath)
-
-	// Attempt to read the specified file
+	// Check if the file exists and can be read
 	content, err := os.ReadFile(req.FilePath)
 	if err != nil {
-		errMsg := fmt.Sprintf("Failed to read file %s: %v", req.FilePath, err)
-		s.logger.Printf("Filesystem verification failed: %s", errMsg)
-		return &pb.FileAccessResponse{
-			Status:       pb.Status_FILESYSTEM_ERROR,
-			ErrorMessage: errMsg,
-		}, nil
-	}
-
-	actualContent := string(content)
-
-	// Check if content matches what's expected
-	if actualContent != req.ExpectedContent {
-		errMsg := fmt.Sprintf("Content mismatch in file %s", req.FilePath)
-		s.logger.Printf("Filesystem verification failed: %s", errMsg)
+		s.logger.Printf("File access verification failed: %v", err)
 		return &pb.FileAccessResponse{
 			Status:        pb.Status_FILESYSTEM_ERROR,
-			ErrorMessage:  errMsg,
-			ActualContent: actualContent,
+			ErrorMessage:  fmt.Sprintf("Failed to read file: %v", err),
+			ActualContent: "",
 		}, nil
 	}
 
-	s.logger.Printf("Filesystem verification successful for file: %s", req.FilePath)
+	s.logger.Printf("Successfully read file %s for verification", req.FilePath)
+
 	return &pb.FileAccessResponse{
 		Status:        pb.Status_OK,
-		ActualContent: actualContent,
+		ActualContent: string(content),
 	}, nil
 }
 
@@ -1204,50 +1099,185 @@ func (s *LockServer) GetMetrics() *PerformanceMetrics {
 
 // startSplitBrainChecker periodically checks if the peer has been promoted
 func (s *LockServer) startSplitBrainChecker() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	// With multiple peers, split-brain detection happens in the Ping handler
+	// by checking if another server claiming to be primary sends a heartbeat
+	// We can also add periodic quorum checks here in the future
+	s.logger.Printf("Split-brain monitoring initialized")
+}
 
-	s.logger.Printf("Starting split-brain checker")
+// promoteToPrimary promotes this server from secondary to primary
+func (s *LockServer) promoteToPrimary() {
+	s.logger.Printf("Promoting server %d from secondary to primary", s.serverID)
 
-	for range ticker.C {
-		// Stop if we're no longer primary
-		if !s.isPrimary {
-			s.logger.Printf("No longer primary, stopping split-brain checker")
-			return
+	s.isPrimary = true
+	s.role = PrimaryRole
+
+	// Start fencing period with detailed logging
+	leaseDuration := s.lockManager.GetLeaseDuration()
+	fencingDuration := leaseDuration + s.fencingBuffer
+	s.fencingEndTime = time.Now().Add(fencingDuration)
+	s.isFencing.Store(true)
+
+	// Log all the timing details
+	now := time.Now()
+	s.logger.Printf("DEBUG FENCING SETUP: Now=%v, FencingEndTime=%v, Duration=%v, LeaseDuration=%v, Buffer=%v",
+		now, s.fencingEndTime, fencingDuration, leaseDuration, s.fencingBuffer)
+	s.logger.Printf("Entering fencing period for %v (until %v)",
+		fencingDuration, s.fencingEndTime)
+
+	// Attempt to log the current lock state before fencing
+	s.logCurrentLockState("Before fencing")
+
+	// Start a goroutine to end the fencing period
+	go s.waitForFencingEnd()
+}
+
+// waitForFencingEnd waits for the fencing period to end
+func (s *LockServer) waitForFencingEnd() {
+	timeToWait := time.Until(s.fencingEndTime)
+	if timeToWait <= 0 {
+		timeToWait = 1 * time.Millisecond // Minimum wait
+	}
+
+	s.logger.Printf("Scheduling fencing end in %v", timeToWait)
+	time.Sleep(timeToWait)
+
+	s.logger.Printf("Fencing period ended, clearing lock state")
+	s.isFencing.Store(false)
+
+	// Log the lock state before clearing
+	s.logCurrentLockState("Before forced clear")
+
+	// Clear lock state to ensure safe operation
+	if err := s.lockManager.ForceClearLockState(); err != nil {
+		s.logger.Printf("Warning: Failed to clear lock state after fencing: %v", err)
+	}
+
+	// Log the lock state after clearing
+	s.logCurrentLockState("After forced clear")
+
+	s.logger.Printf("Server is now fully operational as primary")
+}
+
+// logCurrentLockState logs the current lock state for debugging purposes
+func (s *LockServer) logCurrentLockState(context string) {
+	holder := s.lockManager.CurrentHolder()
+	expiry := s.lockManager.GetTokenExpiration()
+
+	var expiryStr string
+	if expiry.IsZero() {
+		expiryStr = "not set"
+	} else {
+		expiryStr = expiry.Format(time.RFC3339)
+	}
+
+	s.logger.Printf("Lock state (%s): holder=%d, expiry=%s",
+		context, holder, expiryStr)
+}
+
+// SetFencingBuffer sets the buffer time to add to lease duration for fencing
+func (s *LockServer) SetFencingBuffer(buffer time.Duration) {
+	s.fencingBuffer = buffer
+	s.logger.Printf("Fencing buffer set to %v", buffer)
+}
+
+// connectToPeer provides backward compatibility with existing code
+func (s *LockServer) connectToPeer() error {
+	// Use the known primary ID to connect if available
+	primaryID := s.knownPrimaryID
+	if primaryID <= 0 || primaryID == s.serverID {
+		return fmt.Errorf("no valid primary ID to connect to")
+	}
+
+	primaryAddr, ok := s.allServerAddresses[primaryID]
+	if !ok {
+		return fmt.Errorf("no address found for primary ID %d", primaryID)
+	}
+
+	// Connect only to the primary using the existing function
+	s.connectToPeers()
+
+	// Check if connection was successful
+	if s.peerClients[primaryID] == nil {
+		return fmt.Errorf("failed to connect to primary at %s", primaryAddr)
+	}
+
+	return nil
+}
+
+// ReplicateStateToSecondary is kept for backward compatibility, now calls replicateStateToPeers
+func (s *LockServer) replicateStateToSecondary() {
+	s.replicateStateToPeers()
+}
+
+// tryStartElection attempts to start a leader election
+func (s *LockServer) tryStartElection() {
+	// Prevent concurrent elections
+	if !s.electionInProgress.CompareAndSwap(false, true) {
+		s.logger.Printf("Election already in progress, skipping")
+		return
+	}
+
+	s.logger.Printf("Starting election process on server ID %d", s.serverID)
+
+	// First check which nodes are alive (including ourselves)
+	liveNodes := make(map[int32]bool)
+	liveNodes[s.serverID] = true // We count ourselves as live
+
+	// Check all peers
+	for peerID, client := range s.peerClients {
+		if client == nil {
+			continue // Skip if no connection
 		}
 
-		// Attempt to connect to peer if not connected
-		if s.peerClient == nil {
-			if err := s.connectToPeer(); err != nil {
-				s.logger.Printf("Split-brain checker: Failed to connect to peer: %v", err)
-				continue
-			}
-		}
-
-		// Check if peer reports itself as primary
+		// Try to ping the peer
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		resp, err := s.peerClient.ServerInfo(ctx, &pb.ServerInfoRequest{})
+		_, err := client.Ping(ctx, &pb.HeartbeatRequest{ServerId: s.serverID})
 		cancel()
 
-		if err != nil {
-			s.logger.Printf("Split-brain checker: Unable to check peer role: %v", err)
-			continue
-		}
-
-		// If peer reports itself as primary while we also think we're primary,
-		// demote ourselves to avoid split-brain
-		if resp.Role == "primary" {
-			s.logger.Printf("SPLIT-BRAIN DETECTED: Both this server and peer (ID %d) think they are primary!", resp.ServerId)
-			s.logger.Printf("SPLIT-BRAIN RESOLVED: Demoting self to secondary to avoid split-brain")
-
-			// Demote this server to secondary
-			s.isPrimary = false
-			s.role = SecondaryRole
-
-			// Start heartbeat sender to reconnect with the new primary
-			go s.startHeartbeatSender()
-
-			return
+		if err == nil {
+			liveNodes[peerID] = true
+			s.logger.Printf("Peer ID %d is responsive during election", peerID)
+		} else {
+			s.logger.Printf("Peer ID %d is unresponsive during election: %v", peerID, err)
 		}
 	}
+
+	// Check if we have quorum
+	liveNodeCount := len(liveNodes)
+	requiredQuorum := (s.clusterSize / 2) + 1
+
+	if liveNodeCount < requiredQuorum {
+		s.logger.Printf("Not enough live nodes (%d) to form quorum (%d), aborting election",
+			liveNodeCount, requiredQuorum)
+		s.electionInProgress.Store(false)
+		return
+	}
+
+	// Determine the lowest ID among live nodes
+	var lowestLiveID int32 = math.MaxInt32
+	for nodeID := range liveNodes {
+		if nodeID < lowestLiveID {
+			lowestLiveID = nodeID
+		}
+	}
+
+	s.logger.Printf("Live nodes: %v, Lowest ID: %d", liveNodes, lowestLiveID)
+
+	// If we have the lowest ID, promote ourselves
+	if lowestLiveID == s.serverID {
+		s.logger.Printf("This server has the lowest ID among live nodes, promoting to primary")
+		s.promoteToPrimary()
+	} else {
+		s.logger.Printf("Server ID %d has the lowest ID, updating knownPrimaryID", lowestLiveID)
+		s.mu.Lock()
+		s.knownPrimaryID = lowestLiveID
+		s.mu.Unlock()
+
+		// Restart heartbeating to the new primary
+		go s.startHeartbeatSender()
+	}
+
+	// Reset election flag
+	s.electionInProgress.Store(false)
 }

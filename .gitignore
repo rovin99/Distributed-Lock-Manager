@@ -11,3 +11,9 @@ logs/
 # State files
 state/
 
+.cursor/rules
+
+dlm-client
+dlm-server
+
+test_distributed_phases.sh

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"Distributed-Lock-Manager/internal/server"
@@ -18,10 +19,9 @@ func main() {
 	recoveryTimeout := flag.Duration("recovery-timeout", 30*time.Second, "Timeout for WAL recovery")
 	metricsAddress := flag.String("metrics-address", ":8080", "Address for metrics server (set to empty to disable)")
 
-	// Add replication flags
-	role := flag.String("role", "primary", "Server role: 'primary' or 'secondary'")
-	serverID := flag.Int("id", 1, "Server ID (1 for primary, 2 for secondary)")
-	peerAddress := flag.String("peer", "", "Address of peer server (e.g., 'localhost:50052')")
+	// Add replication flags - Modified for Phase 1
+	serverID := flag.Int("id", 1, "Server ID (1, 2, 3, ...)")
+	servers := flag.String("servers", "localhost:50051,localhost:50052,localhost:50053", "Comma-separated list of all server addresses (ID 1, ID 2, ID 3, ...)")
 	skipVerifications := flag.Bool("skip-verifications", false, "Skip ID and filesystem verifications")
 
 	flag.Parse()
@@ -32,23 +32,39 @@ func main() {
 	// Create gRPC server
 	s := grpc.NewServer()
 
-	// Determine server role from flags
-	var lockServer *server.LockServer
-	if *role == "primary" || *role == "secondary" {
-		// Convert role string to ServerRole type
-		serverRole := server.PrimaryRole
-		if *role == "secondary" {
-			serverRole = server.SecondaryRole
-		}
-
-		// Create replicated server
-		lockServer = server.NewReplicatedLockServer(serverRole, int32(*serverID), *peerAddress)
-		log.Printf("Starting as %s server (ID: %d) with peer: %s", *role, *serverID, *peerAddress)
-	} else {
-		// Create standalone server (backward compatibility)
-		lockServer = server.NewLockServer()
-		log.Printf("Starting as standalone server (invalid role: %s)", *role)
+	// Parse server addresses
+	serverAddressesList := strings.Split(*servers, ",")
+	if len(serverAddressesList) < 3 {
+		log.Fatalf("Error: At least 3 server addresses required in -servers flag")
 	}
+
+	// Create a map of server IDs to addresses
+	allServerAddresses := make(map[int32]string)
+	// Assuming the list order corresponds to IDs 1, 2, 3...
+	for i, addr := range serverAddressesList {
+		allServerAddresses[int32(i+1)] = addr
+	}
+
+	clusterSize := len(allServerAddresses)
+
+	// Determine the initial role based on server ID
+	initialPrimaryID := int32(1) // Assume lowest ID starts as primary
+	initialRole := server.SecondaryRole
+	if int32(*serverID) == initialPrimaryID {
+		initialRole = server.PrimaryRole
+	}
+
+	// Create the replicated lock server with the new parameters
+	lockServer := server.NewReplicatedLockServer(
+		initialRole,
+		int32(*serverID),
+		allServerAddresses, // Pass the map
+		clusterSize,        // Pass the size
+		initialPrimaryID,   // Pass who starts as primary
+	)
+
+	log.Printf("Starting Server ID %d as %s (Initial Primary: %d, Cluster Size: %d)",
+		*serverID, initialRole, initialPrimaryID, clusterSize)
 
 	pb.RegisterLockServiceServer(s, lockServer)
 
@@ -67,21 +83,22 @@ func main() {
 		log.Printf("WAL recovery completed successfully")
 	}
 
-	// Perform verifications if this is a replicated setup
-	if *peerAddress != "" && !*skipVerifications {
-		// Verify server ID uniqueness
+	// Perform verifications if not explicitly skipped
+	if !*skipVerifications {
+		// Run the verification functions that have been updated to work with multiple peers
 		log.Printf("Verifying server ID uniqueness...")
 		if err := lockServer.VerifyUniqueServerID(); err != nil {
 			log.Fatalf("Server ID verification failed: %v", err)
 		}
-		log.Printf("Server ID verification completed")
+		log.Printf("Server ID verification completed successfully")
 
-		// Verify shared filesystem
 		log.Printf("Verifying shared filesystem access...")
 		if err := lockServer.VerifySharedFilesystem(); err != nil {
 			log.Fatalf("Shared filesystem verification failed: %v", err)
 		}
-		log.Printf("Shared filesystem verification completed")
+		log.Printf("Shared filesystem verification completed successfully")
+	} else {
+		log.Printf("Skipping server ID and shared filesystem verifications (use -skip-verifications=false to enable)")
 	}
 
 	// Set up TCP listener using the specified address
