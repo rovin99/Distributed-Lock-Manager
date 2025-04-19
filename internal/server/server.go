@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
+	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -173,70 +173,42 @@ func (s *LockServer) connectToPeers() {
 			conn.Close()
 		}
 
-		// Dial peer
-		conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithBlock(), grpc.WithTimeout(3*time.Second))
-		if err != nil {
-			s.logger.Printf("Warning: Failed to connect to peer ID %d at %s: %v", id, addr, err)
-			s.peerConns[id] = nil // Mark as disconnected
-			s.peerClients[id] = nil
-			continue
-		}
+		// Implement a non-blocking connection to peers
+		// We don't want to block server startup if peers aren't available yet
+		go func(peerID int32, peerAddr string) {
+			// Dial options - no blocking so it doesn't hang server startup
+			opts := []grpc.DialOption{
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				// Don't use WithBlock() - we want non-blocking behavior
+				grpc.WithTimeout(5 * time.Second),
+			}
 
-		client := pb.NewLockServiceClient(conn)
-		s.peerConns[id] = conn
-		s.peerClients[id] = client
-		s.logger.Printf("Successfully connected to peer ID %d at %s", id, addr)
+			s.logger.Printf("Attempting to connect to peer ID %d at %s", peerID, peerAddr)
+			conn, err := grpc.Dial(peerAddr, opts...)
+
+			if err != nil {
+				s.logger.Printf("Warning: Failed to connect to peer ID %d at %s: %v",
+					peerID, peerAddr, err)
+
+				s.mu.Lock()
+				s.peerConns[peerID] = nil
+				s.peerClients[peerID] = nil
+				s.mu.Unlock()
+
+				return
+			}
+
+			// Connection successful
+			client := pb.NewLockServiceClient(conn)
+
+			s.mu.Lock()
+			s.peerConns[peerID] = conn
+			s.peerClients[peerID] = client
+			s.mu.Unlock()
+
+			s.logger.Printf("Successfully connected to peer ID %d at %s", peerID, peerAddr)
+		}(id, addr)
 	}
-}
-
-// checkQuorum checks if this server has quorum with its peers
-// Returns true if quorum is achieved, false otherwise
-func (s *LockServer) checkQuorum() bool {
-	// For a 3-node cluster, quorum is 2 nodes (majority)
-	// Since we're counting ourselves, we need at least one responsive peer
-	liveNodeCount := 1 // Start with ourselves
-
-	// Ping each peer to check if they're alive
-	for id, client := range s.peerClients {
-		if client == nil {
-			continue // Skip if no connection
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), s.heartbeatConfig.Timeout)
-		_, err := client.Ping(ctx, &pb.HeartbeatRequest{ServerId: s.serverID})
-		cancel()
-
-		if err == nil {
-			liveNodeCount++
-			s.logger.Printf("Peer ID %d is responsive in quorum check", id)
-		} else {
-			s.logger.Printf("Peer ID %d is unresponsive in quorum check: %v", id, err)
-		}
-	}
-
-	// Calculate required quorum (majority)
-	requiredQuorum := (s.clusterSize / 2) + 1
-	hasQuorum := liveNodeCount >= requiredQuorum
-
-	s.logger.Printf("Quorum check: live nodes=%d, required=%d, has quorum=%v",
-		liveNodeCount, requiredQuorum, hasQuorum)
-
-	return hasQuorum
-}
-
-// demoteToReplica demotes this server from primary to replica due to quorum loss
-func (s *LockServer) demoteToReplica() {
-	s.logger.Printf("Demoting server %d from primary to replica due to quorum loss", s.serverID)
-
-	// Update server state
-	s.isPrimary = false
-	s.role = SecondaryRole
-	s.knownPrimaryID = -1 // Unknown primary
-
-	// Stop any primary-only activities
-	// Start secondary-only activities
-	go s.startHeartbeatSender()
 }
 
 // startHeartbeatSender periodically sends heartbeats to the primary
@@ -370,23 +342,50 @@ func (s *LockServer) replicateStateToPeers() {
 
 	s.logger.Printf("Replicating state (Holder: %d) to all peers", stateUpdate.LockHolder)
 
-	// Send update asynchronously to all connected peers
+	// Track success/failure of replication attempts
+	var successCount int32
+	var wg sync.WaitGroup
+
+	// Send update to all connected peers
 	for peerID, peerClient := range s.peerClients {
 		if peerClient == nil {
 			s.logger.Printf("Skipping replication to peer %d: not connected", peerID)
 			continue
 		}
 
+		wg.Add(1)
 		// Launch a goroutine for each peer
 		go func(targetID int32, client pb.LockServiceClient, update *pb.ReplicatedState) {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second) // Short timeout for async replication
-			_, err := client.UpdateSecondaryState(ctx, update)
-			cancel()
+			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Increased timeout for replication
+			defer cancel()
+
+			s.logger.Printf("Sending state update to peer %d (LockHolder=%d)", targetID, update.LockHolder)
+			resp, err := client.UpdateSecondaryState(ctx, update)
+
 			if err != nil {
 				s.logger.Printf("Warning: Failed to replicate state to peer %d: %v", targetID, err)
-				// Optionally: Mark peer as potentially disconnected or handle error
+				// Try to reconnect for future updates
+				go func() {
+					s.connectToPeers()
+				}()
+			} else if resp.Status != pb.Status_OK {
+				s.logger.Printf("Warning: Peer %d rejected state update: %s", targetID, resp.ErrorMessage)
+			} else {
+				s.logger.Printf("Successfully replicated state to peer %d", targetID)
+				atomic.AddInt32(&successCount, 1)
 			}
-		}(peerID, peerClient, stateUpdate) // Pass copies
+		}(peerID, peerClient, stateUpdate)
+	}
+
+	// Wait for all replication attempts to complete
+	wg.Wait()
+
+	if successCount > 0 {
+		s.logger.Printf("Replication completed: Successfully replicated to %d peers", successCount)
+	} else {
+		s.logger.Printf("Warning: Failed to replicate to any peers")
 	}
 }
 
@@ -600,6 +599,20 @@ func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.Lo
 
 	s.logger.Printf("DEBUG FENCING CHECK: Proceeding with acquire for client %d", args.ClientId)
 
+	// Add quorum check for primary
+	if s.isPrimary {
+		liveCount, err := s.checkQuorum()
+		if err != nil {
+			s.logger.Printf("Quorum lost before processing %s for client %d. Stepping down.", "LockAcquire", args.ClientId)
+			s.demoteToReplica()
+			return &pb.LockResponse{
+				Status:       pb.Status_SECONDARY_MODE,
+				ErrorMessage: fmt.Sprintf("Primary lost quorum (%d/%d live nodes), stepping down", liveCount, s.clusterSize),
+			}, nil
+		}
+		// Quorum exists, proceed...
+	}
+
 	// Check if request has been processed already
 	if cachedResp, exists := s.requestCache.Get(args.RequestId); exists {
 		s.logger.Printf("Detected repeated request %s from client %d", args.RequestId, args.ClientId)
@@ -648,8 +661,16 @@ func (s *LockServer) LockAcquire(ctx context.Context, args *pb.LockArgs) (*pb.Lo
 		// Cache the response for idempotence
 		s.requestCache.Set(args.RequestId, resp)
 
+		// Log peer connection status before replication
+		s.logger.Printf("DEBUG: Peer connections before replication: Peer1=%v, Peer2=%v, Peer3=%v",
+			s.peerClients[1] != nil,
+			s.peerClients[2] != nil,
+			s.peerClients[3] != nil)
+
 		// Replicate the state to secondaries
+		s.logger.Printf("DEBUG: Starting replication of lock state for client %d to peers", args.ClientId)
 		s.replicateStateToPeers()
+		s.logger.Printf("DEBUG: Completed replication request for client %d", args.ClientId)
 
 		// Log current state for debugging
 		s.logCurrentLockState("After lock acquire")
@@ -691,6 +712,21 @@ func (s *LockServer) LockRelease(ctx context.Context, args *pb.LockArgs) (*pb.Lo
 
 	// For LockRelease, we allow operations during fencing period if token is valid
 	// This helps clients clean up gracefully
+
+	// Add quorum check for primary
+	if s.isPrimary {
+		liveCount, err := s.checkQuorum()
+		if err != nil {
+			s.logger.Printf("Quorum lost before processing %s for client %d. Stepping down.", "LockRelease", args.ClientId)
+			s.demoteToReplica()
+			return &pb.LockResponse{
+				Status:       pb.Status_SECONDARY_MODE,
+				ErrorMessage: fmt.Sprintf("Primary lost quorum (%d/%d live nodes), stepping down", liveCount, s.clusterSize),
+				Token:        "",
+			}, nil
+		}
+		// Quorum exists, proceed...
+	}
 
 	clientID := args.ClientId
 	token := args.Token
@@ -762,17 +798,16 @@ func (s *LockServer) FileAppend(ctx context.Context, args *pb.FileArgs) (*pb.Fil
 		}, nil
 	}
 
-	// Check if we're in fencing period first, before any other checks
-	isFencingNow := s.isFencing.Load()
-	nowTime := time.Now()
-	fencingEnds := s.fencingEndTime
-	isBeforeEnd := nowTime.Before(fencingEnds)
+	// Check if we're in secondary mode
+	if !s.isPrimary {
+		return &pb.FileResponse{
+			Status:       pb.Status_SECONDARY_MODE,
+			ErrorMessage: "Server is in secondary mode and cannot process client requests",
+		}, nil
+	}
 
-	s.logger.Printf("DEBUG FileAppend: ClientID=%d RequestID=%s isFencing=%t Now=%v End=%v IsBeforeEnd=%t",
-		args.ClientId, args.RequestId, isFencingNow, nowTime, fencingEnds, isBeforeEnd)
-
-	// Reject if in fencing period
-	if isFencingNow && isBeforeEnd {
+	// Check if the server is in fencing period
+	if s.isFencing.Load() {
 		s.logger.Printf("FENCING: Rejecting file append from client %d during fencing period", args.ClientId)
 		return &pb.FileResponse{
 			Status:       pb.Status_SERVER_FENCING,
@@ -780,15 +815,21 @@ func (s *LockServer) FileAppend(ctx context.Context, args *pb.FileArgs) (*pb.Fil
 		}, nil
 	}
 
-	// Check if in secondary mode
-	if !s.isPrimary {
-		return &pb.FileResponse{
-			Status:       pb.Status_SECONDARY_MODE,
-			ErrorMessage: "This server is in secondary mode and cannot process file operations",
-		}, nil
+	// Add quorum check for primary
+	if s.isPrimary {
+		liveCount, err := s.checkQuorum()
+		if err != nil {
+			s.logger.Printf("Quorum lost before processing %s for client %d. Stepping down.", "FileAppend", args.ClientId)
+			s.demoteToReplica()
+			return &pb.FileResponse{
+				Status:       pb.Status_SECONDARY_MODE,
+				ErrorMessage: fmt.Sprintf("Primary lost quorum (%d/%d live nodes), stepping down", liveCount, s.clusterSize),
+			}, nil
+		}
+		// Quorum exists, proceed...
 	}
 
-	// Check cache for duplicate request
+	// Check if request has been processed already
 	if cachedResp, exists := s.requestCache.Get(args.RequestId); exists {
 		s.logger.Printf("Found cached response for request %s", args.RequestId)
 		return cachedResp.(*pb.FileResponse), nil
@@ -855,6 +896,20 @@ func (s *LockServer) RenewLease(ctx context.Context, args *pb.LeaseArgs) (*pb.Le
 
 	// For RenewLease, we allow operations during fencing period if token is valid
 	// This helps clients with valid leases maintain their leases during failover
+
+	// Add quorum check for primary
+	if s.isPrimary {
+		liveCount, err := s.checkQuorum()
+		if err != nil {
+			s.logger.Printf("Quorum lost before processing %s for client %d. Stepping down.", "RenewLease", args.ClientId)
+			s.demoteToReplica()
+			return &pb.LeaseResponse{
+				Status:       pb.Status_SECONDARY_MODE,
+				ErrorMessage: fmt.Sprintf("Primary lost quorum (%d/%d live nodes), stepping down", liveCount, s.clusterSize),
+			}, nil
+		}
+		// Quorum exists, proceed...
+	}
 
 	clientID := args.ClientId
 	token := args.Token
@@ -930,6 +985,10 @@ func (s *LockServer) UpdateSecondaryState(ctx context.Context, state *pb.Replica
 			ErrorMessage: err.Error(),
 		}, nil
 	}
+
+	// More detailed logging of success
+	s.logger.Printf("Successfully applied replicated state: holder=%d, token length=%d, expiry timestamp=%d",
+		state.LockHolder, len(state.LockToken), state.ExpiryTimestamp)
 
 	return &pb.ReplicationResponse{
 		Status: pb.Status_OK,
@@ -1105,60 +1164,6 @@ func (s *LockServer) startSplitBrainChecker() {
 	s.logger.Printf("Split-brain monitoring initialized")
 }
 
-// promoteToPrimary promotes this server from secondary to primary
-func (s *LockServer) promoteToPrimary() {
-	s.logger.Printf("Promoting server %d from secondary to primary", s.serverID)
-
-	s.isPrimary = true
-	s.role = PrimaryRole
-
-	// Start fencing period with detailed logging
-	leaseDuration := s.lockManager.GetLeaseDuration()
-	fencingDuration := leaseDuration + s.fencingBuffer
-	s.fencingEndTime = time.Now().Add(fencingDuration)
-	s.isFencing.Store(true)
-
-	// Log all the timing details
-	now := time.Now()
-	s.logger.Printf("DEBUG FENCING SETUP: Now=%v, FencingEndTime=%v, Duration=%v, LeaseDuration=%v, Buffer=%v",
-		now, s.fencingEndTime, fencingDuration, leaseDuration, s.fencingBuffer)
-	s.logger.Printf("Entering fencing period for %v (until %v)",
-		fencingDuration, s.fencingEndTime)
-
-	// Attempt to log the current lock state before fencing
-	s.logCurrentLockState("Before fencing")
-
-	// Start a goroutine to end the fencing period
-	go s.waitForFencingEnd()
-}
-
-// waitForFencingEnd waits for the fencing period to end
-func (s *LockServer) waitForFencingEnd() {
-	timeToWait := time.Until(s.fencingEndTime)
-	if timeToWait <= 0 {
-		timeToWait = 1 * time.Millisecond // Minimum wait
-	}
-
-	s.logger.Printf("Scheduling fencing end in %v", timeToWait)
-	time.Sleep(timeToWait)
-
-	s.logger.Printf("Fencing period ended, clearing lock state")
-	s.isFencing.Store(false)
-
-	// Log the lock state before clearing
-	s.logCurrentLockState("Before forced clear")
-
-	// Clear lock state to ensure safe operation
-	if err := s.lockManager.ForceClearLockState(); err != nil {
-		s.logger.Printf("Warning: Failed to clear lock state after fencing: %v", err)
-	}
-
-	// Log the lock state after clearing
-	s.logCurrentLockState("After forced clear")
-
-	s.logger.Printf("Server is now fully operational as primary")
-}
-
 // logCurrentLockState logs the current lock state for debugging purposes
 func (s *LockServer) logCurrentLockState(context string) {
 	holder := s.lockManager.CurrentHolder()
@@ -1181,103 +1186,33 @@ func (s *LockServer) SetFencingBuffer(buffer time.Duration) {
 	s.logger.Printf("Fencing buffer set to %v", buffer)
 }
 
-// connectToPeer provides backward compatibility with existing code
-func (s *LockServer) connectToPeer() error {
-	// Use the known primary ID to connect if available
-	primaryID := s.knownPrimaryID
-	if primaryID <= 0 || primaryID == s.serverID {
-		return fmt.Errorf("no valid primary ID to connect to")
-	}
-
-	primaryAddr, ok := s.allServerAddresses[primaryID]
-	if !ok {
-		return fmt.Errorf("no address found for primary ID %d", primaryID)
-	}
-
-	// Connect only to the primary using the existing function
+// ReconnectPeers attempts to reconnect to any disconnected peers
+func (s *LockServer) ReconnectPeers() {
+	s.logger.Printf("Explicitly reconnecting to peers...")
 	s.connectToPeers()
-
-	// Check if connection was successful
-	if s.peerClients[primaryID] == nil {
-		return fmt.Errorf("failed to connect to primary at %s", primaryAddr)
-	}
-
-	return nil
 }
 
-// ReplicateStateToSecondary is kept for backward compatibility, now calls replicateStateToPeers
-func (s *LockServer) replicateStateToSecondary() {
-	s.replicateStateToPeers()
-}
+// StartHTTPMonitoring starts an HTTP server for monitoring and control
+func (s *LockServer) StartHTTPMonitoring(port int) {
+	addr := fmt.Sprintf(":%d", port)
+	s.logger.Printf("Starting HTTP monitoring server on %s", addr)
 
-// tryStartElection attempts to start a leader election
-func (s *LockServer) tryStartElection() {
-	// Prevent concurrent elections
-	if !s.electionInProgress.CompareAndSwap(false, true) {
-		s.logger.Printf("Election already in progress, skipping")
-		return
-	}
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		// Return basic status information
+		fmt.Fprintf(w, "Server ID: %d\nRole: %s\nPrimary: %t\n",
+			s.serverID, s.role, s.isPrimary)
+	})
 
-	s.logger.Printf("Starting election process on server ID %d", s.serverID)
+	http.HandleFunc("/reconnect", func(w http.ResponseWriter, r *http.Request) {
+		s.logger.Printf("Received request to reconnect to peers")
+		s.ReconnectPeers()
+		fmt.Fprintf(w, "Reconnection attempt initiated\n")
+	})
 
-	// First check which nodes are alive (including ourselves)
-	liveNodes := make(map[int32]bool)
-	liveNodes[s.serverID] = true // We count ourselves as live
-
-	// Check all peers
-	for peerID, client := range s.peerClients {
-		if client == nil {
-			continue // Skip if no connection
+	// Run HTTP server in a goroutine
+	go func() {
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			s.logger.Printf("HTTP monitoring server error: %v", err)
 		}
-
-		// Try to ping the peer
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err := client.Ping(ctx, &pb.HeartbeatRequest{ServerId: s.serverID})
-		cancel()
-
-		if err == nil {
-			liveNodes[peerID] = true
-			s.logger.Printf("Peer ID %d is responsive during election", peerID)
-		} else {
-			s.logger.Printf("Peer ID %d is unresponsive during election: %v", peerID, err)
-		}
-	}
-
-	// Check if we have quorum
-	liveNodeCount := len(liveNodes)
-	requiredQuorum := (s.clusterSize / 2) + 1
-
-	if liveNodeCount < requiredQuorum {
-		s.logger.Printf("Not enough live nodes (%d) to form quorum (%d), aborting election",
-			liveNodeCount, requiredQuorum)
-		s.electionInProgress.Store(false)
-		return
-	}
-
-	// Determine the lowest ID among live nodes
-	var lowestLiveID int32 = math.MaxInt32
-	for nodeID := range liveNodes {
-		if nodeID < lowestLiveID {
-			lowestLiveID = nodeID
-		}
-	}
-
-	s.logger.Printf("Live nodes: %v, Lowest ID: %d", liveNodes, lowestLiveID)
-
-	// If we have the lowest ID, promote ourselves
-	if lowestLiveID == s.serverID {
-		s.logger.Printf("This server has the lowest ID among live nodes, promoting to primary")
-		s.promoteToPrimary()
-	} else {
-		s.logger.Printf("Server ID %d has the lowest ID, updating knownPrimaryID", lowestLiveID)
-		s.mu.Lock()
-		s.knownPrimaryID = lowestLiveID
-		s.mu.Unlock()
-
-		// Restart heartbeating to the new primary
-		go s.startHeartbeatSender()
-	}
-
-	// Reset election flag
-	s.electionInProgress.Store(false)
+	}()
 }

@@ -769,6 +769,9 @@ func (lm *LockManager) ApplyReplicatedState(holder int32, token string, expiryTi
 	lm.logger.Printf("Applying replicated state: holder=%d, token=%s, expiry=%v",
 		holder, lm.safeTokenForLog(token), time.Unix(expiryTimestamp, 0))
 
+	lm.logger.Printf("Current state before applying: holder=%d, token=%s, expiry=%v",
+		lm.lockHolder, lm.safeTokenForLog(lm.lockToken), lm.leaseExpires)
+
 	// Store original values for rollback if needed
 	originalHolder := lm.lockHolder
 	originalToken := lm.lockToken
@@ -797,6 +800,9 @@ func (lm *LockManager) ApplyReplicatedState(holder int32, token string, expiryTi
 
 	// Signal waiting goroutines in case the replication changed lock state
 	lm.cond.Broadcast()
+
+	lm.logger.Printf("Successfully applied replicated state: holder=%d, token=%s, expiry=%v",
+		holder, lm.safeTokenForLog(token), time.Unix(expiryTimestamp, 0))
 
 	return nil
 }
