@@ -169,6 +169,106 @@ make run-multi-clients
 ```
 This will run a bash file which will spawn multple clients concurrently, each writing to a random file.
 
+## Running Servers and Clients Individually
+
+You can run servers and clients directly using the binary executables for more control over the setup.
+
+### Running Servers
+
+Prerequisites:
+```bash
+# Create required directories
+mkdir -p data logs bin
+
+# Build the binaries
+make build
+```
+
+Start Server 1 (Primary):
+```bash
+./bin/server --address ":50051" --id 1 --servers "localhost:50051,localhost:50052,localhost:50053" --http-port 9081
+```
+
+Start Server 2 (Replica):
+```bash
+./bin/server --address ":50052" --id 2 --servers "localhost:50051,localhost:50052,localhost:50053" --http-port 9082
+```
+
+Start Server 3 (Replica):
+```bash
+./bin/server --address ":50053" --id 3 --servers "localhost:50051,localhost:50052,localhost:50053" --http-port 9083
+```
+
+To run in background with logs:
+```bash
+./bin/server --address ":50051" --id 1 --servers "localhost:50051,localhost:50052,localhost:50053" --http-port 9081 > logs/server1.log 2>&1 &
+```
+
+Server command options:
+```
+-address string        Address to listen on (default ":50051")
+-http-port int         Port for HTTP monitoring (if 0, uses 8081 + server ID)
+-id int                Server ID (1, 2, 3, ...) (default 1)
+-metrics-address       Address for metrics server (set to empty to disable) (default ":8080")
+-recovery-timeout      Timeout for WAL recovery (default 30s)
+-servers string        Comma-separated list of all server addresses (default "localhost:50051,localhost:50052,localhost:50053")
+-skip-verifications    Skip ID and filesystem verifications
+```
+
+### Running Clients
+
+Acquire a lock:
+```bash
+./bin/client --servers "localhost:50051,localhost:50052,localhost:50053" --client-id 101 acquire
+```
+
+Release a lock:
+```bash
+./bin/client --servers "localhost:50051,localhost:50052,localhost:50053" --client-id 101 release
+```
+
+Append to a file:
+```bash
+./bin/client --servers "localhost:50051,localhost:50052,localhost:50053" --client-id 101 --file file_test --content "Test content" append
+```
+
+Hold a lock (will keep it until timeout or interrupt):
+```bash
+./bin/client --servers "localhost:50051,localhost:50052,localhost:50053" --client-id 101 hold
+```
+
+Client command options:
+```
+--servers string       Comma-separated list of server addresses (default "localhost:50051")
+--client-id int        Client ID (default 1)
+--file string          File to append to (default "file_0")
+--content string       Content to append to file (default "test content")
+--timeout duration     Timeout for the operation (default 1m0s)
+--repeat int           Number of times to repeat the operation (default 1)
+--interval duration    Interval between repeated operations (default 5s)
+```
+
+### Monitoring Server Status
+
+You can check server status via the HTTP monitoring endpoint:
+```bash
+curl http://localhost:9081/status
+```
+
+Expected output for primary:
+```
+Server ID: 1
+Role: primary
+Primary: true
+```
+
+Expected output for replicas:
+```
+Server ID: 2
+Role: secondary
+Primary: false
+```
+
 ## Testing
 
 Run the tests for each package:
@@ -182,15 +282,74 @@ go test -v ./internal/file_manager
 # Test client retry handling
 go test -v ./internal/client
 
-#Test wal
+# Test write-ahead logging
 go test -v ./internal/wal
 
+# Test server functionality
+go test -v ./internal/server
 
 # Test retry mechanism and fault tolerance
 go test -v ./internal
+
+# Run all tests in the project
+go test -v ./...
 ```
 
+You can also run tests with race condition detection:
+```bash
+go test -race -v ./...
+```
 
+To run tests with coverage reporting:
+```bash
+go test -cover -v ./...
+```
+
+## Specialized Test Functions
+
+The system includes several specialized test functions to verify distributed behavior and fault tolerance:
+
+### run_enhanced_replication_test
+Tests basic state replication from Primary to Replicas for lock operations.
+- **Scenario**: Start cluster (S1=Primary, S2/S3=Replicas)
+- **Actions**: Client acquires and releases lock via Primary
+- **Verification**: Replicas correctly reflect lock state changes
+- **Purpose**: Ensures Primary properly sends state updates and Replicas apply them
+
+### run_fencing_test
+Tests the fencing mechanism during Primary failover.
+- **Scenario**: Start cluster, kill Primary, promote new Primary
+- **Actions**: Clients attempt operations during and after fencing period
+- **Verification**: Requests rejected during fencing, accepted after fencing ends
+- **Purpose**: Validates promotion triggers fencing, fencing blocks writes, state is cleared post-fencing
+
+### run_expanded_failover_test
+Tests client behavior during Primary failure.
+- **Scenario**: Client holds lock, Primary fails, new Primary is promoted
+- **Actions**: Wait for fencing to end, verify client continuation
+- **Verification**: Client handles failover transparently, new Primary serves requests correctly
+- **Purpose**: Ensures client library properly handles failover and lease renewal works across failures
+
+### run_improved_split_brain_test
+Tests split-brain prevention during network partitions.
+- **Scenario**: Primary isolated from majority, new Primary elected
+- **Actions**: Clients interact with new Primary, network partition healed
+- **Verification**: Old Primary steps down, clients find correct Primary
+- **Purpose**: Ensures majority partition elects new leader, isolated Primary steps down
+
+### run_lease_expiry_test
+Tests lease expiration behavior across failover.
+- **Scenario**: Client acquires lock, Primary fails, new Primary promoted
+- **Actions**: Wait for lease to expire on new Primary
+- **Verification**: New client can acquire lock after original lease expires
+- **Purpose**: Ensures lease expiry works correctly across failures
+
+### run_quorum_loss_test
+Tests system behavior during majority node failure.
+- **Scenario**: Majority of nodes fail, leaving Primary without quorum
+- **Actions**: Clients attempt operations, nodes restored
+- **Verification**: Primary stops serving writes without quorum, resumes when quorum restored
+- **Purpose**: Validates quorum awareness and write availability guarantees
 
 ## How It Works
 
@@ -375,3 +534,5 @@ Responses include:
 - Error message on failure.
 - Lock Token (for successful `LockAcquire`).
 ```
+
+

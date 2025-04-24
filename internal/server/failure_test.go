@@ -707,3 +707,144 @@ func TestClientStuckAfterEditing(t *testing.T) {
 		assert.Equal(t, "ABBAA", actualContent, "File content matches client-retry implementation (no server rollback)")
 	}
 }
+
+// TestDuplicateReleaseFullSequence implements the exact sequence for Test Case 1c:
+// C1 acquires -> C1 appends 'A' -> C1 sends release (ReqID R1, delayed) -> C1 retries release (ReqID R1, processed)
+// -> C2 acquires -> Delayed C1 release (ReqID R1) arrives -> Server ignores duplicate -> C2 appends 'B'
+// -> C2 appends 'B' -> C2 releases -> C1 acquires -> C1 appends 'A' -> C1 appends 'A'
+// Final file content should be "ABBAA"
+func TestDuplicateReleaseFullSequence(t *testing.T) {
+	// Create a LockServer
+	server := NewLockServer()
+	filename := "file_0"
+
+	// Ensure clean test file
+	CreateFiles() // Ensure test files exist
+	filePath := filepath.Join("data", filename)
+	err := os.WriteFile(filePath, []byte(""), 0644)
+	assert.NoError(t, err, "Failed to reset test file")
+
+	// Step 1: Client 1 acquires lock
+	client1ID := int32(1)
+	reqID1Acquire := uuid.New().String()
+	lockResp1, err := server.LockAcquire(context.Background(), &pb.LockArgs{
+		ClientId:  client1ID,
+		RequestId: reqID1Acquire,
+	})
+	assert.NoError(t, err, "LockAcquire failed")
+	assert.Equal(t, pb.Status_OK, lockResp1.Status, "Failed to acquire lock")
+	token1 := lockResp1.Token
+
+	// Step 2: Client 1 appends 'A'
+	fileResp1, err := server.FileAppend(context.Background(), &pb.FileArgs{
+		ClientId:  client1ID,
+		Filename:  filename,
+		Content:   []byte("A"),
+		Token:     token1,
+		RequestId: uuid.New().String(),
+	})
+	assert.NoError(t, err, "FileAppend RPC failed")
+	assert.Equal(t, pb.Status_OK, fileResp1.Status, "Client 1 should be able to append to file")
+
+	// Step 3: Client 1 sends LockRelease (delayed) with RequestID R1
+	reqID1Release := uuid.New().String() // This is R1
+	releaseArgs := &pb.LockArgs{
+		ClientId:  client1ID,
+		Token:     token1,
+		RequestId: reqID1Release,
+	}
+
+	// Step 4: Client 1 retries LockRelease (with same request ID R1) - this one gets processed
+	releaseResp, err := server.LockRelease(context.Background(), releaseArgs)
+	assert.NoError(t, err, "LockRelease RPC failed")
+	assert.Equal(t, pb.Status_OK, releaseResp.Status, "Lock release failed")
+
+	// Step 5: Client 2 acquires the lock
+	client2ID := int32(2)
+	reqID2Acquire := uuid.New().String()
+	lockResp2, err := server.LockAcquire(context.Background(), &pb.LockArgs{
+		ClientId:  client2ID,
+		RequestId: reqID2Acquire,
+	})
+	assert.NoError(t, err, "LockAcquire for client 2 failed")
+	assert.Equal(t, pb.Status_OK, lockResp2.Status, "Client 2 failed to acquire lock")
+	token2 := lockResp2.Token
+
+	// Step 6: Process the delayed/duplicated LockRelease from Client 1 (same RequestID R1)
+	releaseResp2, err := server.LockRelease(context.Background(), releaseArgs)
+	assert.NoError(t, err, "Duplicated LockRelease RPC failed")
+	assert.Equal(t, pb.Status_OK, releaseResp2.Status, "Duplicated lock release should return success from cache")
+
+	// Step 7: Verify Client 2 still holds the lock
+	hasLock := server.lockManager.HasLockWithToken(client2ID, token2)
+	assert.True(t, hasLock, "Client 2 should still hold the lock after duplicate release attempt")
+
+	// Step 8: Client 2 appends 'B' (first time)
+	fileResp2a, err := server.FileAppend(context.Background(), &pb.FileArgs{
+		ClientId:  client2ID,
+		Filename:  filename,
+		Content:   []byte("B"),
+		Token:     token2,
+		RequestId: uuid.New().String(),
+	})
+	assert.NoError(t, err, "FileAppend 'B' (first) RPC failed")
+	assert.Equal(t, pb.Status_OK, fileResp2a.Status, "Client 2 should be able to append 'B'")
+
+	// Step 9: Client 2 appends 'B' (second time)
+	fileResp2b, err := server.FileAppend(context.Background(), &pb.FileArgs{
+		ClientId:  client2ID,
+		Filename:  filename,
+		Content:   []byte("B"),
+		Token:     token2,
+		RequestId: uuid.New().String(),
+	})
+	assert.NoError(t, err, "FileAppend 'B' (second) RPC failed")
+	assert.Equal(t, pb.Status_OK, fileResp2b.Status, "Client 2 should be able to append 'B' again")
+
+	// Step 10: Client 2 releases the lock
+	reqID2Release := uuid.New().String()
+	releaseResp3, err := server.LockRelease(context.Background(), &pb.LockArgs{
+		ClientId:  client2ID,
+		Token:     token2,
+		RequestId: reqID2Release,
+	})
+	assert.NoError(t, err, "LockRelease RPC failed")
+	assert.Equal(t, pb.Status_OK, releaseResp3.Status, "Lock release failed")
+
+	// Step 11: Client 1 acquires the lock again
+	reqID1Acquire2 := uuid.New().String()
+	lockResp3, err := server.LockAcquire(context.Background(), &pb.LockArgs{
+		ClientId:  client1ID,
+		RequestId: reqID1Acquire2,
+	})
+	assert.NoError(t, err, "Second LockAcquire for client 1 failed")
+	assert.Equal(t, pb.Status_OK, lockResp3.Status, "Client 1 failed to reacquire lock")
+	token1New := lockResp3.Token
+
+	// Step 12: Client 1 appends 'A' (second time)
+	fileResp3, err := server.FileAppend(context.Background(), &pb.FileArgs{
+		ClientId:  client1ID,
+		Filename:  filename,
+		Content:   []byte("A"),
+		Token:     token1New,
+		RequestId: uuid.New().String(),
+	})
+	assert.NoError(t, err, "FileAppend 'A' (second) RPC failed")
+	assert.Equal(t, pb.Status_OK, fileResp3.Status, "Client 1 should be able to append 'A' again")
+
+	// Step 13: Client 1 appends 'A' (third time)
+	fileResp4, err := server.FileAppend(context.Background(), &pb.FileArgs{
+		ClientId:  client1ID,
+		Filename:  filename,
+		Content:   []byte("A"),
+		Token:     token1New,
+		RequestId: uuid.New().String(),
+	})
+	assert.NoError(t, err, "FileAppend 'A' (third) RPC failed")
+	assert.Equal(t, pb.Status_OK, fileResp4.Status, "Client 1 should be able to append 'A' third time")
+
+	// Step 14: Verify the file content is exactly "ABBAA"
+	content, err := server.fileManager.ReadFile(filename)
+	assert.NoError(t, err, "Failed to read file content")
+	assert.Equal(t, "ABBAA", string(content), "File should contain exactly 'ABBAA'")
+}

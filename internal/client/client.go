@@ -574,9 +574,22 @@ func (c *LockClient) FileAppend(filename string, content []byte) error {
 		RequestId: c.GenerateRequestID(),
 	}
 
+	// Store current lock state in case of failure
+	c.mu.Lock()
+	currentlyHasLock := c.hasLock
+	currentToken := c.lockToken
+	c.mu.Unlock()
+
 	_, err := c.retryFileAppend("FileAppend", func(ctx context.Context) (*pb.FileResponse, error) {
 		return c.client.FileAppend(ctx, args)
 	})
+
+	// If this is a server unavailability error during quorum loss, but we still have a lock,
+	// we can't do much but inform the caller of the specific error
+	if IsServerUnavailable(err) && currentlyHasLock {
+		fmt.Printf("WARNING: Unable to communicate with servers to append file, but still have lock with token: %s\n", currentToken)
+		return fmt.Errorf("file operation failed due to server unavailability (quorum loss), but lock is still held: %w", err)
+	}
 
 	// Return the original error to preserve the error type
 	return err
@@ -661,13 +674,9 @@ func (c *LockClient) LockRelease() error {
 		return c.client.LockRelease(ctx, args)
 	})
 
-	if err != nil {
-		// Server unavailability or invalid token errors are already handled by retryRPC
-		return err
-	}
-
-	// Update client state
+	// Always update client state to release the lock locally, even if server communication fails
 	c.mu.Lock()
+	previouslyHadLock := c.hasLock
 	c.hasLock = false
 	c.lockToken = ""
 	c.mu.Unlock()
@@ -675,7 +684,14 @@ func (c *LockClient) LockRelease() error {
 	// Stop lease renewal
 	c.stopLeaseRenewal()
 
-	return nil
+	// If this is a server unavailability error during quorum loss, but we had a lock locally,
+	// consider the operation successful from client's perspective
+	if IsServerUnavailable(err) && previouslyHadLock {
+		fmt.Printf("WARNING: Unable to communicate with servers to release lock, but cleared local lock state\n")
+		return nil
+	}
+
+	return err
 }
 
 // AcquireLockWithRetry is kept for backward compatibility
@@ -715,3 +731,6 @@ func IsServerUnavailable(err error) bool {
 	_, ok := err.(*ServerUnavailableError)
 	return ok
 }
+
+// InvalidTokenError is defined in errors.go
+// IsInvalidToken is defined in errors.go

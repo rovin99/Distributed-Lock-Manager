@@ -551,8 +551,30 @@ func (s *LockServer) checkPeerRole() bool {
 		}
 
 		if resp.Role == "primary" {
-			s.logger.Printf("SPLIT-BRAIN DETECTED: Both this server and peer ID %d claim to be primary!", id)
-			return true
+			// Another server claims to be primary
+			if id != s.serverID {
+				// This is very likely a split-brain situation
+				s.logger.Printf("SPLIT-BRAIN DETECTED: Both this server (ID %d) and peer ID %d claim to be primary!",
+					s.serverID, id)
+
+				// In split-brain, the server with the higher ID should step down to resolve the conflict
+				if s.serverID > id {
+					s.logger.Printf("This server has higher ID, demoting self to resolve split-brain")
+					s.demoteToReplica()
+					return true
+				} else {
+					s.logger.Printf("This server has lower ID, but should step down if it was a reconnection...")
+					// If we were disconnected and reconnected, the peer might be a newer primary elected during our absence
+					// Check if we have a clock reference for our primary status
+					if time.Since(s.fencingEndTime) > 60*time.Second {
+						// We've been primary for some time, but a split-brain still occurred
+						// This suggests a network partition healed. Let's be safe and step down
+						s.logger.Printf("Detected newer primary (ID %d) after potential partition, stepping down", id)
+						s.demoteToReplica()
+						return true
+					}
+				}
+			}
 		}
 	}
 

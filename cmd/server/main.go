@@ -91,6 +91,8 @@ func main() {
 	initialPrimaryID := int32(1) // Default assumption
 	if existingPrimaryID != -1 {
 		initialPrimaryID = existingPrimaryID
+		// Always start as a secondary if we detected an existing primary
+		log.Printf("Starting as replica with role=Secondary because server ID %d is already primary", existingPrimaryID)
 	}
 
 	initialRole := server.SecondaryRole

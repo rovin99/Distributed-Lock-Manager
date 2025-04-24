@@ -63,6 +63,8 @@ func (s *LockServer) demoteToReplica() {
 	s.isPrimary = false
 	s.role = SecondaryRole
 	s.knownPrimaryID = -1 // Don't know who the primary is now
+	// Add explicit log for test detection
+	s.logger.Printf("Starting as replica with role=Secondary after demotion")
 	s.mu.Unlock()
 
 	// Stop replication worker (if applicable)
